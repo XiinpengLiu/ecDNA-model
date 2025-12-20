@@ -35,8 +35,8 @@ def _channel_rates(entry: Dict[str, Any]) -> Tuple[float, float, float, float, f
 
 def _division_draw(params: ModelParameters, parent: CellState, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray]:
     amp = params.sample_amplification(parent, rng)
-    k_tilde = 2 * parent.k + amp
-    k1 = np.array([rng.binomial(int(k_tilde[j]), 0.5) for j in range(len(k_tilde))])
+    k_tilde = params.division_copy_factor * parent.k + amp
+    k1 = np.array([rng.binomial(int(k_tilde[j]), params.segregation_prob) for j in range(len(k_tilde))])
     k2 = k_tilde - k1
     daughters = []
     for k_r in (k1, k2):
@@ -278,8 +278,10 @@ def plot_segregation_distribution(
     bins = np.arange(0, max(draws + [0]) + 2) - 0.5
     ax.hist(draws, bins=bins, density=True, alpha=0.7, label="simulated")
     k_parent = int(parent_state.k[0])
-    x_vals = np.arange(0, 2 * k_parent + 1)
-    pmf = [np.math.comb(2 * k_parent, x) * (0.5 ** (2 * k_parent)) for x in x_vals]
+    n_trials = int(params.division_copy_factor * k_parent)
+    x_vals = np.arange(0, n_trials + 1)
+    p = params.segregation_prob
+    pmf = [np.math.comb(n_trials, x) * (p ** x) * ((1 - p) ** (n_trials - x)) for x in x_vals]
     ax.plot(x_vals, pmf, marker="o", linestyle="--", label="binomial ref")
     ax.set_xlabel("Daughter copy count")
     ax.set_ylabel("Density")

@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+import config as global_config
+
 
 # =============================================================================
 # Core data structures
@@ -25,15 +27,44 @@ def _logistic(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
 
 
+def _default_cell_k() -> np.ndarray:
+    return global_config.CELL_DEFAULTS["k"].copy()
+
+
+def _default_cell_y() -> np.ndarray:
+    return global_config.CELL_DEFAULTS["y"].copy()
+
+
+def _default_ou_params() -> "OUParameters":
+    return OUParameters(
+        mean=global_config.OU_DEFAULTS["mean"].copy(),
+        rate=global_config.OU_DEFAULTS["rate"].copy(),
+        diffusion=global_config.OU_DEFAULTS["diffusion"].copy(),
+    )
+
+
+def _default_k_max() -> np.ndarray:
+    return global_config.MODEL_DEFAULTS["k_max"].copy()
+
+
+def _default_fitness_weights() -> Optional[np.ndarray]:
+    weights = global_config.MODEL_DEFAULTS["fitness_weights"]
+    if weights is None:
+        return None
+    if isinstance(weights, np.ndarray):
+        return weights.copy()
+    return np.array(weights, dtype=float, copy=True)
+
+
 @dataclass
 class CellState:
     """Single cell state at time t."""
 
-    e: int = 0
-    m: int = 0
-    k: np.ndarray = field(default_factory=lambda: np.array([0], dtype=int))
-    y: np.ndarray = field(default_factory=lambda: np.array([0.0]))
-    a: float = 0.0
+    e: int = global_config.CELL_DEFAULTS["e"]
+    m: int = global_config.CELL_DEFAULTS["m"]
+    k: np.ndarray = field(default_factory=_default_cell_k)
+    y: np.ndarray = field(default_factory=_default_cell_y)
+    a: float = global_config.CELL_DEFAULTS["a"]
 
     def copy(self) -> "CellState":
         return CellState(e=self.e, m=self.m, k=self.k.copy(), y=self.y.copy(), a=self.a)
@@ -59,12 +90,12 @@ def _serialize_state(state: Optional[CellState]) -> Optional[Dict[str, Any]]:
 class SimulationConfig:
     """Configuration for simulation."""
 
-    t_max: float = 100.0
-    seed: Optional[int] = None
-    max_cells: Optional[int] = None  # if set, exceeding this raises an error
-    record_interval: float = 1.0
-    check_bounds: bool = False
-    bound_tolerance: float = 1e-9
+    t_max: float = global_config.SIM_DEFAULTS["t_max"]
+    seed: Optional[int] = global_config.SIM_DEFAULTS["seed"]
+    max_cells: Optional[int] = global_config.SIM_DEFAULTS["max_cells"]  # if set, exceeding this raises an error
+    record_interval: float = global_config.SIM_DEFAULTS["record_interval"]
+    check_bounds: bool = global_config.SIM_DEFAULTS["check_bounds"]
+    bound_tolerance: float = global_config.SIM_DEFAULTS["bound_tolerance"]
 
 
 # =============================================================================
@@ -96,34 +127,54 @@ class ModelParameters:
     ensuring global upper bounds. ecDNA copy numbers are truncated to K_max.
     """
 
-    n_env: int = 1
-    n_reg: int = 1
-    n_ecdna: int = 1
-    ou_params: OUParameters = field(default_factory=lambda: OUParameters(mean=np.zeros(1), rate=np.ones(1), diffusion=np.zeros(1)))
-    k_max: np.ndarray = field(default_factory=lambda: np.array([50], dtype=int))
-    div_rate_max: float = 0.1
-    death_rate_max: float = 0.05
-    gain_rate_max: float = 0.01
-    loss_rate_max: float = 0.01
-    reg_switch_max: float = 0.02
-    env_switch_max: float = 0.0
+    n_env: int = global_config.MODEL_DEFAULTS["n_env"]
+    n_reg: int = global_config.MODEL_DEFAULTS["n_reg"]
+    n_ecdna: int = global_config.MODEL_DEFAULTS["n_ecdna"]
+    ou_params: OUParameters = field(default_factory=_default_ou_params)
+    k_max: np.ndarray = field(default_factory=_default_k_max)
+    div_rate_max: float = global_config.MODEL_DEFAULTS["div_rate_max"]
+    death_rate_max: float = global_config.MODEL_DEFAULTS["death_rate_max"]
+    gain_rate_max: float = global_config.MODEL_DEFAULTS["gain_rate_max"]
+    loss_rate_max: float = global_config.MODEL_DEFAULTS["loss_rate_max"]
+    reg_switch_max: float = global_config.MODEL_DEFAULTS["reg_switch_max"]
+    env_switch_max: float = global_config.MODEL_DEFAULTS["env_switch_max"]
 
-    def _score(self, state: CellState) -> float:
-        return float(np.sum(state.k)) - float(np.sum(self.k_max) * 0.25)
+    fitness_k_star: float = global_config.MODEL_DEFAULTS["fitness_k_star"]
+    fitness_alpha: float = global_config.MODEL_DEFAULTS["fitness_alpha"]
+    fitness_beta: float = global_config.MODEL_DEFAULTS["fitness_beta"]
+    fitness_weights: Optional[np.ndarray] = field(default_factory=_default_fitness_weights)
+    age_effect_rate: float = global_config.MODEL_DEFAULTS["age_effect_rate"]
+    reg_switch_slope: float = global_config.MODEL_DEFAULTS["reg_switch_slope"]
+    env_switch_bias: float = global_config.MODEL_DEFAULTS["env_switch_bias"]
+    amplification_scale: float = global_config.MODEL_DEFAULTS["amplification_scale"]
+    division_copy_factor: int = global_config.MODEL_DEFAULTS["division_copy_factor"]
+    segregation_prob: float = global_config.MODEL_DEFAULTS["segregation_prob"]
+    post_segregation_loss_cap: float = global_config.MODEL_DEFAULTS["post_segregation_loss_cap"]
+    post_segregation_loss_slope: float = global_config.MODEL_DEFAULTS["post_segregation_loss_slope"]
+    post_segregation_loss_offset: float = global_config.MODEL_DEFAULTS["post_segregation_loss_offset"]
+    daughter_y_noise_std: float = global_config.MODEL_DEFAULTS["daughter_y_noise_std"]
+
+    def fitness_score(self, state: CellState) -> float:
+        weights = self.fitness_weights
+        if weights is None:
+            weights = np.ones_like(state.k, dtype=float)
+        K = float(np.dot(weights, state.k))
+        delta = K - self.fitness_k_star
+        return self.fitness_alpha * delta - self.fitness_beta * (delta ** 2)
 
     def lambda_div(self, state: CellState) -> float:
-        age_effect = 1.0 - math.exp(-0.2 * state.a)
-        return self.div_rate_max * _logistic(self._score(state)) * age_effect
+        age_effect = 1.0 - math.exp(-self.age_effect_rate * state.a)
+        return self.div_rate_max * _logistic(self.fitness_score(state)) * age_effect
 
     def lambda_death(self, state: CellState) -> float:
-        return self.death_rate_max * _logistic(-self._score(state))
+        return self.death_rate_max * _logistic(-self.fitness_score(state))
 
     def q_m_rates(self, state: CellState) -> np.ndarray:
         rates = np.zeros(self.n_reg)
         for m_new in range(self.n_reg):
             if m_new == state.m:
                 continue
-            rates[m_new] = self.reg_switch_max * _logistic(0.5 * (m_new - state.m))
+            rates[m_new] = self.reg_switch_max * _logistic(self.reg_switch_slope * (m_new - state.m))
         return rates
 
     def omega_e_rates(self, state: CellState) -> np.ndarray:
@@ -131,27 +182,30 @@ class ModelParameters:
         for e_new in range(self.n_env):
             if e_new == state.e:
                 continue
-            rates[e_new] = self.env_switch_max * _logistic(0.0)
+            rates[e_new] = self.env_switch_max * _logistic(self.env_switch_bias)
         return rates
 
     def mu_gain(self, state: CellState, j: int) -> float:
-        return self.gain_rate_max * _logistic(self._score(state))
+        return self.gain_rate_max
 
     def mu_loss(self, state: CellState, j: int) -> float:
-        return self.loss_rate_max * _logistic(-self._score(state))
+        return self.loss_rate_max
 
     # Division kernel pieces -------------------------------------------------
     def sample_amplification(self, state: CellState, rng: np.random.Generator) -> np.ndarray:
-        return rng.poisson(0.1 * state.k)
+        return rng.poisson(self.amplification_scale * state.k)
 
     def post_segregation_loss_prob(self, state: CellState, j: int, k_daughter_j: int) -> float:
-        return min(0.5, 0.01 * (k_daughter_j + 1))
+        return min(
+            self.post_segregation_loss_cap,
+            self.post_segregation_loss_slope * (k_daughter_j + self.post_segregation_loss_offset),
+        )
 
     def sample_daughter_m(self, parent: CellState, k_daughter: np.ndarray, rng: np.random.Generator) -> int:
         return rng.integers(0, self.n_reg)
 
     def sample_daughter_y(self, parent: CellState, m_daughter: int, k_daughter: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-        noise = rng.normal(0.0, 0.05, size=parent.y.shape)
+        noise = rng.normal(0.0, self.daughter_y_noise_std, size=parent.y.shape)
         return parent.y + noise
 
     # Exact phenotype propagation -------------------------------------------
@@ -266,9 +320,11 @@ class EcDNASimulator:
 
     def _divide_cell(self, parent: CellState) -> Tuple[CellState, CellState]:
         amp = self.params.sample_amplification(parent, self.rng)
-        k_tilde = 2 * parent.k + amp
+        k_tilde = self.params.division_copy_factor * parent.k + amp
 
-        k1 = np.array([self.rng.binomial(int(k_tilde[j]), 0.5) for j in range(len(k_tilde))])
+        k1 = np.array(
+            [self.rng.binomial(int(k_tilde[j]), self.params.segregation_prob) for j in range(len(k_tilde))]
+        )
         k2 = k_tilde - k1
 
         daughters_k = []
@@ -662,7 +718,10 @@ class ParameterSweep:
 # =============================================================================
 
 
-def compute_growth_rate(history: Dict[str, Any], start_frac: float = 0.2) -> float:
+def compute_growth_rate(
+    history: Dict[str, Any],
+    start_frac: float = global_config.ANALYSIS_DEFAULTS["growth_start_frac"],
+) -> float:
     times = np.array(history["times"])
     pop = np.array(history["population_size"])
     start_idx = int(len(times) * start_frac)
@@ -754,7 +813,10 @@ def compute_survival_curve(summary: Dict[str, Any]) -> Tuple[np.ndarray, np.ndar
     return np.array(times), np.array(survival)
 
 
-def compute_extinction_probability_ci(histories: List[Dict[str, Any]], alpha: float = 0.05) -> Tuple[float, Tuple[float, float]]:
+def compute_extinction_probability_ci(
+    histories: List[Dict[str, Any]],
+    alpha: float = global_config.ANALYSIS_DEFAULTS["extinction_alpha"],
+) -> Tuple[float, Tuple[float, float]]:
     n = len(histories)
     if n == 0:
         return 0.0, (0.0, 1.0)
@@ -769,8 +831,13 @@ def compute_extinction_probability_ci(histories: List[Dict[str, Any]], alpha: fl
 
 if __name__ == "__main__":
     params = ModelParameters()
-    config = SimulationConfig(t_max=5.0, seed=123, record_interval=1.0)
+    run_cfg = global_config.RUN_DEFAULTS
+    config = SimulationConfig(
+        t_max=run_cfg["t_max"],
+        seed=run_cfg["seed"],
+        record_interval=run_cfg["record_interval"],
+    )
     sim = EcDNASimulator(params, config)
-    initial = [CellState(k=np.array([5])) for _ in range(5)]
+    initial = [CellState(k=run_cfg["initial_k"].copy()) for _ in range(run_cfg["initial_count"])]
     history = sim.simulate_population(initial)
     print(f"Final population: {history['population_size'][-1] if history['population_size'] else 0}")
