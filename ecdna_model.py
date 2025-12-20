@@ -214,6 +214,11 @@ class EcDNASimulator:
     def _truncate_k(self, k: np.ndarray) -> np.ndarray:
         return np.minimum(k, self.params.k_max)
 
+    def _sanitize_state(self, state: CellState) -> CellState:
+        clean = state.copy()
+        clean.k = self._truncate_k(clean.k)
+        return clean
+
     def _compute_rates(self, state: CellState) -> Dict[str, Any]:
         rates = {
             "div": self.params.lambda_div(state),
@@ -285,6 +290,8 @@ class EcDNASimulator:
     def _next_true_event(
         self, state: CellState, t_current: float
     ) -> Tuple[float, Optional[str], Optional[List[CellState]], Dict[str, Any]]:
+        state_work = state.copy()
+        t_work = t_current
         n_proposed = 0
         n_reject = 0
         max_ratio = 0.0
@@ -293,7 +300,7 @@ class EcDNASimulator:
         last_rates: Optional[Dict[str, Any]] = None
         last_bounds: Optional[Dict[str, Any]] = None
         while True:
-            bar_r, bounds = self.bounder.bounds(state)
+            bar_r, bounds = self.bounder.bounds(state_work)
             if bar_r <= 0:
                 return math.inf, None, None, {
                     "n_proposed": n_proposed,
@@ -301,8 +308,8 @@ class EcDNASimulator:
                     "max_ratio": max_ratio,
                     "bar_r": bar_r,
                     "total_rate": 0.0,
-                    "m_prev": state.m,
-                    "e_prev": state.e,
+                    "m_prev": state_work.m,
+                    "e_prev": state_work.e,
                     "accept_prob": last_ratio,
                     "delta_last": last_delta,
                     "rates": last_rates,
@@ -310,10 +317,10 @@ class EcDNASimulator:
                 }
             delta = self.rng.exponential(1.0 / bar_r)
             last_delta = delta
-            t_candidate = t_current + delta
-            state.y = self.params.propagate_y_exact(state, delta, self.rng)
-            state.a += delta
-            rates = self._compute_rates(state)
+            t_candidate = t_work + delta
+            state_work.y = self.params.propagate_y_exact(state_work, delta, self.rng)
+            state_work.a += delta
+            rates = self._compute_rates(state_work)
             last_rates = rates
             last_bounds = bounds
             if rates["total"] <= 0:
@@ -323,8 +330,8 @@ class EcDNASimulator:
                     "max_ratio": max_ratio,
                     "bar_r": bar_r,
                     "total_rate": rates["total"],
-                    "m_prev": state.m,
-                    "e_prev": state.e,
+                    "m_prev": state_work.m,
+                    "e_prev": state_work.e,
                     "accept_prob": last_ratio,
                     "delta_last": last_delta,
                     "rates": last_rates,
@@ -339,28 +346,28 @@ class EcDNASimulator:
             if self.rng.random() < ratio:
                 event = self._choose_event(rates)
                 daughters: Optional[List[CellState]] = None
-                state_pre = state.copy()
+                state_pre = state_work.copy()
                 state_post: Optional[Any] = None
                 if event == "div":
-                    d1, d2 = self._divide_cell(state)
+                    d1, d2 = self._divide_cell(state_pre)
                     daughters = [d1, d2]
                     state_post = {"parent": state_pre.copy(), "daughters": [d1.copy(), d2.copy()]}
                 elif event == "death":
                     state_post = None
                 elif event.startswith("m_switch_"):
-                    state.m = int(event.split("_")[-1])
-                    state_post = state.copy()
+                    state_work.m = int(event.split("_")[-1])
+                    state_post = state_work.copy()
                 elif event.startswith("e_switch_"):
-                    state.e = int(event.split("_")[-1])
-                    state_post = state.copy()
+                    state_work.e = int(event.split("_")[-1])
+                    state_post = state_work.copy()
                 elif event.startswith("k_gain_"):
                     j = int(event.split("_")[-1])
-                    state.k[j] = min(state.k[j] + 1, self.params.k_max[j])
-                    state_post = state.copy()
+                    state_work.k[j] = min(state_work.k[j] + 1, self.params.k_max[j])
+                    state_post = state_work.copy()
                 elif event.startswith("k_loss_"):
                     j = int(event.split("_")[-1])
-                    state.k[j] = max(0, state.k[j] - 1)
-                    state_post = state.copy()
+                    state_work.k[j] = max(0, state_work.k[j] - 1)
+                    state_post = state_work.copy()
                 return t_candidate, event, daughters, {
                     "n_proposed": n_proposed,
                     "n_reject": n_reject,
@@ -375,15 +382,15 @@ class EcDNASimulator:
                     "state_post": state_post,
                 }
             n_reject += 1
-            t_current = t_candidate
+            t_work = t_candidate
 
     # --- public APIs -------------------------------------------------------
     def simulate_single_cell_lineage(self, initial: CellState, daughter_rule: str = "random") -> List[Dict[str, Any]]:
         t = 0.0
-        state = initial.copy()
+        state = self._sanitize_state(initial)
         traj = [{"t": t, "state": state.copy()}]
         while t < self.config.t_max:
-            t_event, event, daughters, _ = self._next_true_event(state, t)
+            t_event, event, daughters, diag = self._next_true_event(state, t)
             if t_event == math.inf or t_event > self.config.t_max:
                 break
             t = t_event
@@ -395,12 +402,16 @@ class EcDNASimulator:
                 state = daughters[chosen]
                 traj.append({"t": t, "state": state.copy(), "event": "division"})
                 continue
+            state_post = diag.get("state_post")
+            if isinstance(state_post, CellState):
+                state = state_post
             traj.append({"t": t, "state": state.copy(), "event": event})
         return traj
 
     def simulate_population(self, initial_cells: List[CellState]) -> Dict[str, Any]:
-        cells: Dict[int, CellState] = {i: c.copy() for i, c in enumerate(initial_cells)}
+        cells: Dict[int, CellState] = {i: self._sanitize_state(c) for i, c in enumerate(initial_cells)}
         heap: List[Tuple[float, int]] = []
+        scheduled: Dict[int, Dict[str, Any]] = {}
         current_time = 0.0
         next_record = 0.0
         cell_counter = len(cells)
@@ -422,8 +433,20 @@ class EcDNASimulator:
             "y_values": [],
         }
 
-        for cid in cells:
-            heapq.heappush(heap, (0.0, cid))
+        def schedule_event(cid: int, state: CellState, t_now: float) -> None:
+            t_event, event, daughters, diag = self._next_true_event(state, t_now)
+            if t_event == math.inf or event is None:
+                return
+            scheduled[cid] = {
+                "t": t_event,
+                "event": event,
+                "daughters": daughters,
+                "diag": diag,
+            }
+            heapq.heappush(heap, (t_event, cid))
+
+        for cid, state in cells.items():
+            schedule_event(cid, state, current_time)
 
         def record_snapshot(time_now: float):
             history["times"].append(time_now)
@@ -469,28 +492,36 @@ class EcDNASimulator:
         next_record += self.config.record_interval
 
         while heap:
-            t_candidate, cid = heapq.heappop(heap)
-            if t_candidate > self.config.t_max:
+            t_event, cid = heapq.heappop(heap)
+            if t_event > self.config.t_max:
                 break
             if cid not in cells:
                 continue
-            current_time = t_candidate
-            state = cells[cid]
-            t_event, event, daughters, diag = self._next_true_event(state, current_time)
-            if t_event == math.inf or t_event > self.config.t_max:
+            scheduled_event = scheduled.get(cid)
+            if scheduled_event is None or scheduled_event["t"] != t_event:
                 continue
+            current_time = t_event
+            event = scheduled_event["event"]
+            daughters = scheduled_event["daughters"]
+            diag = scheduled_event["diag"]
+            scheduled.pop(cid, None)
             current_time = t_event
             if event == "death":
                 del cells[cid]
             elif event == "div" and daughters is not None:
                 del cells[cid]
                 for d in daughters:
-                    cells[cell_counter] = d
-                    heapq.heappush(heap, (current_time, cell_counter))
+                    clean = self._sanitize_state(d)
+                    cells[cell_counter] = clean
+                    schedule_event(cell_counter, clean, current_time)
                     cell_counter += 1
             else:
-                cells[cid] = state
-                heapq.heappush(heap, (current_time, cid))
+                state_post = diag.get("state_post")
+                if isinstance(state_post, CellState):
+                    cells[cid] = state_post
+                    schedule_event(cid, state_post, current_time)
+                else:
+                    schedule_event(cid, cells[cid], current_time)
 
             state_pre = _serialize_state(diag.get("state_pre"))
             state_post_raw = diag.get("state_post")

@@ -319,11 +319,19 @@ def plot_population_fan_chart(histories: List[Dict], ax: Optional[plt.Axes] = No
         _, ax = plt.subplots()
     if not histories:
         return ax
-    times = np.array(histories[0]["times"])
-    pops = np.array([h["population_size"] for h in histories])
-    mean_pop = np.mean(pops, axis=0)
-    lower = np.quantile(pops, (1 - ci) / 2.0, axis=0)
-    upper = np.quantile(pops, 1 - (1 - ci) / 2.0, axis=0)
+    max_len = max(len(h["times"]) for h in histories)
+    # Use the time grid from the longest trajectory (record intervals are shared).
+    longest_history = max(histories, key=lambda h: len(h["times"]))
+    times = np.array(longest_history["times"])
+
+    pops = np.full((len(histories), max_len), np.nan)
+    for i, h in enumerate(histories):
+        pop = np.asarray(h["population_size"], dtype=float)
+        pops[i, : len(pop)] = pop
+
+    mean_pop = np.nanmean(pops, axis=0)
+    lower = np.nanquantile(pops, (1 - ci) / 2.0, axis=0)
+    upper = np.nanquantile(pops, 1 - (1 - ci) / 2.0, axis=0)
     ax.fill_between(times, lower, upper, color=color, alpha=0.25, label=f"{int(ci*100)}% band")
     ax.plot(times, mean_pop, color=color, lw=2, label="Mean")
     ax.set_xlabel("Time")

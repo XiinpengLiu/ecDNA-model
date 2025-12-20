@@ -277,16 +277,10 @@ def plot_segregation_distribution(
         draws.append(int(k1[0]))
     bins = np.arange(0, max(draws + [0]) + 2) - 0.5
     ax.hist(draws, bins=bins, density=True, alpha=0.7, label="simulated")
-    ax.plot(
-        bins[:-1] + 0.5,
-        [
-            (np.math.comb(parent_state.k[0] + i, i) * (0.5 ** (parent_state.k[0] + i)))
-            for i in range(len(bins) - 1)
-        ],
-        marker="o",
-        linestyle="--",
-        label="binomial ref",
-    )
+    k_parent = int(parent_state.k[0])
+    x_vals = np.arange(0, 2 * k_parent + 1)
+    pmf = [np.math.comb(2 * k_parent, x) * (0.5 ** (2 * k_parent)) for x in x_vals]
+    ax.plot(x_vals, pmf, marker="o", linestyle="--", label="binomial ref")
     ax.set_xlabel("Daughter copy count")
     ax.set_ylabel("Density")
     ax.set_title("Segregation distribution")
