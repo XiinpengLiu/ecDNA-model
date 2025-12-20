@@ -10,6 +10,7 @@ import heapq
 import math
 import warnings
 from dataclasses import dataclass, field
+from statistics import NormalDist
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -50,6 +51,8 @@ class SimulationConfig:
     seed: Optional[int] = None
     max_cells: Optional[int] = None  # if set, exceeding this raises an error
     record_interval: float = 1.0
+    check_bounds: bool = False
+    bound_tolerance: float = 1e-9
 
 
 # =============================================================================
@@ -160,7 +163,13 @@ class Bounder:
         b_div = self.params.div_rate_max
         b_death = self.params.death_rate_max
         b_m = np.zeros(self.params.n_reg)
+        if self.params.n_reg > 1 and self.params.reg_switch_max > 0:
+            b_m.fill(self.params.reg_switch_max)
+            b_m[state.m] = 0.0
         b_e = np.zeros(self.params.n_env)
+        if self.params.n_env > 1 and self.params.env_switch_max > 0:
+            b_e.fill(self.params.env_switch_max)
+            b_e[state.e] = 0.0
         b_gain = np.full(self.params.n_ecdna, self.params.gain_rate_max)
         b_loss = self.params.loss_rate_max * self.params.k_max
 
@@ -263,21 +272,49 @@ class EcDNASimulator:
         return daughters[0], daughters[1]
 
     # --- thinning loop for one cell ----------------------------------------
-    def _next_true_event(self, state: CellState, t_current: float) -> Tuple[float, Optional[str], Optional[List[CellState]]]:
+    def _next_true_event(
+        self, state: CellState, t_current: float
+    ) -> Tuple[float, Optional[str], Optional[List[CellState]], Dict[str, Any]]:
+        n_proposed = 0
+        n_reject = 0
+        max_ratio = 0.0
         while True:
             bar_r, _ = self.bounder.bounds(state)
             if bar_r <= 0:
-                return math.inf, None, None
+                return math.inf, None, None, {
+                    "n_proposed": n_proposed,
+                    "n_reject": n_reject,
+                    "max_ratio": max_ratio,
+                    "bar_r": bar_r,
+                    "total_rate": 0.0,
+                    "m_prev": state.m,
+                    "e_prev": state.e,
+                }
             delta = self.rng.exponential(1.0 / bar_r)
             t_candidate = t_current + delta
             state.y = self.params.propagate_y_exact(state, delta, self.rng)
             state.a += delta
             rates = self._compute_rates(state)
             if rates["total"] <= 0:
-                return math.inf, None, None
-            if self.rng.random() < rates["total"] / bar_r:
+                return math.inf, None, None, {
+                    "n_proposed": n_proposed,
+                    "n_reject": n_reject,
+                    "max_ratio": max_ratio,
+                    "bar_r": bar_r,
+                    "total_rate": rates["total"],
+                    "m_prev": state.m,
+                    "e_prev": state.e,
+                }
+            ratio = rates["total"] / bar_r
+            max_ratio = max(max_ratio, ratio)
+            n_proposed += 1
+            if self.config.check_bounds and ratio > 1.0 + self.config.bound_tolerance:
+                raise RuntimeError(f"Invalid bound: r_total/bar_r={ratio:.6f} at t={t_candidate:.3f}")
+            if self.rng.random() < ratio:
                 event = self._choose_event(rates)
                 daughters = None
+                m_prev = state.m
+                e_prev = state.e
                 if event == "div":
                     d1, d2 = self._divide_cell(state)
                     daughters = [d1, d2]
@@ -293,7 +330,16 @@ class EcDNASimulator:
                 elif event.startswith("k_loss_"):
                     j = int(event.split("_")[-1])
                     state.k[j] = max(0, state.k[j] - 1)
-                return t_candidate, event, daughters
+                return t_candidate, event, daughters, {
+                    "n_proposed": n_proposed,
+                    "n_reject": n_reject,
+                    "max_ratio": max_ratio,
+                    "bar_r": bar_r,
+                    "total_rate": rates["total"],
+                    "m_prev": m_prev,
+                    "e_prev": e_prev,
+                }
+            n_reject += 1
             t_current = t_candidate
 
     # --- public APIs -------------------------------------------------------
@@ -302,7 +348,7 @@ class EcDNASimulator:
         state = initial.copy()
         traj = [{"t": t, "state": state.copy()}]
         while t < self.config.t_max:
-            t_event, event, daughters = self._next_true_event(state, t)
+            t_event, event, daughters, _ = self._next_true_event(state, t)
             if t_event == math.inf or t_event > self.config.t_max:
                 break
             t = t_event
@@ -328,29 +374,61 @@ class EcDNASimulator:
             "population_size": [],
             "mean_k": [],
             "std_k": [],
+            "mean_k_species": [],
+            "std_k_species": [],
             "mean_age": [],
             "mean_y": [],
             "k_distribution": [],
+            "k_matrix": [],
             "m_distribution": [],
+            "e_distribution": [],
+            "m_values": [],
+            "e_values": [],
+            "y_values": [],
         }
 
         for cid in cells:
             heapq.heappush(heap, (0.0, cid))
 
         def record_snapshot(time_now: float):
-            if not cells:
-                return
             history["times"].append(time_now)
+            if not cells:
+                history["population_size"].append(0)
+                history["mean_k"].append(0.0)
+                history["std_k"].append(0.0)
+                history["mean_k_species"].append(np.zeros(self.params.n_ecdna))
+                history["std_k_species"].append(np.zeros(self.params.n_ecdna))
+                history["mean_age"].append(0.0)
+                history["mean_y"].append(np.zeros_like(self.params.ou_params.mean))
+                history["k_distribution"].append(np.array([], dtype=int))
+                history["k_matrix"].append(np.zeros((0, self.params.n_ecdna), dtype=int))
+                history["m_distribution"].append(np.zeros(self.params.n_reg))
+                history["e_distribution"].append(np.zeros(self.params.n_env))
+                history["m_values"].append(np.array([], dtype=int))
+                history["e_values"].append(np.array([], dtype=int))
+                history["y_values"].append(np.zeros((0, self.params.ou_params.mean.size)))
+                return
             history["population_size"].append(len(cells))
-            k_vals = np.array([np.sum(c.k) for c in cells.values()])
+            k_matrix = np.array([c.k for c in cells.values()])
+            k_vals = np.sum(k_matrix, axis=1)
             history["mean_k"].append(float(np.mean(k_vals)))
             history["std_k"].append(float(np.std(k_vals)))
+            history["mean_k_species"].append(np.mean(k_matrix, axis=0))
+            history["std_k_species"].append(np.std(k_matrix, axis=0))
             history["mean_age"].append(float(np.mean([c.a for c in cells.values()])))
             y_vals = np.array([c.y for c in cells.values()])
             history["mean_y"].append(np.mean(y_vals, axis=0))
             history["k_distribution"].append(k_vals.copy())
-            m_counts = np.bincount([c.m for c in cells.values()], minlength=self.params.n_reg)
+            history["k_matrix"].append(k_matrix.copy())
+            m_vals = np.array([c.m for c in cells.values()])
+            e_vals = np.array([c.e for c in cells.values()])
+            m_counts = np.bincount(m_vals, minlength=self.params.n_reg)
+            e_counts = np.bincount(e_vals, minlength=self.params.n_env)
             history["m_distribution"].append(m_counts / len(cells))
+            history["e_distribution"].append(e_counts / len(cells))
+            history["m_values"].append(m_vals.copy())
+            history["e_values"].append(e_vals.copy())
+            history["y_values"].append(y_vals.copy())
 
         record_snapshot(current_time)
         next_record += self.config.record_interval
@@ -363,7 +441,7 @@ class EcDNASimulator:
                 continue
             current_time = t_candidate
             state = cells[cid]
-            t_event, event, daughters = self._next_true_event(state, current_time)
+            t_event, event, daughters, diag = self._next_true_event(state, current_time)
             if t_event == math.inf or t_event > self.config.t_max:
                 continue
             current_time = t_event
@@ -379,7 +457,21 @@ class EcDNASimulator:
                 cells[cid] = state
                 heapq.heappush(heap, (current_time, cid))
 
-            self.event_log.append({"t": current_time, "cell_id": cid, "event": event, "state": state.copy()})
+            self.event_log.append(
+                {
+                    "t": current_time,
+                    "cell_id": cid,
+                    "event": event,
+                    "state": state.copy(),
+                    "n_proposed": diag.get("n_proposed", 0),
+                    "n_reject": diag.get("n_reject", 0),
+                    "bound_ratio": diag.get("max_ratio", 0.0),
+                    "bar_r": diag.get("bar_r", 0.0),
+                    "total_rate": diag.get("total_rate", 0.0),
+                    "m_prev": diag.get("m_prev", state.m),
+                    "e_prev": diag.get("e_prev", state.e),
+                }
+            )
 
             if self.config.max_cells is not None and len(cells) > self.config.max_cells:
                 raise RuntimeError(f"Population exceeded max_cells={self.config.max_cells}")
@@ -504,8 +596,89 @@ def compute_growth_rate(history: Dict[str, Any], start_frac: float = 0.2) -> flo
 
 
 def compute_extinction_probability(histories: List[Dict[str, Any]]) -> float:
-    n_extinct = sum(1 for h in histories if h["population_size"] and h["population_size"][-1] == 0)
+    n_extinct = sum(1 for h in histories if any(n == 0 for n in h.get("population_size", [])))
     return n_extinct / len(histories)
+
+
+def compute_time_to_threshold(history: Dict[str, Any], threshold: float, key: str = "population_size") -> Optional[float]:
+    values = history.get(key, [])
+    times = history.get("times", [])
+    for t, v in zip(times, values):
+        if v >= threshold:
+            return float(t)
+    return None
+
+
+def compute_extinction_summary(histories: List[Dict[str, Any]]) -> Dict[str, Any]:
+    extinct = []
+    t_extinction = []
+    last_k = []
+    last_m = []
+    for h in histories:
+        times = np.array(h.get("times", []))
+        pop = np.array(h.get("population_size", []))
+        idx = np.where(pop == 0)[0]
+        if len(idx) > 0:
+            ext_idx = int(idx[0])
+            extinct.append(True)
+            t_extinction.append(float(times[ext_idx]) if len(times) > ext_idx else 0.0)
+            alive_idx = np.where(pop > 0)[0]
+            if len(alive_idx) > 0:
+                last_idx = int(alive_idx[-1])
+                last_k.append(h.get("k_distribution", [])[last_idx])
+                last_m.append(h.get("m_distribution", [])[last_idx])
+            else:
+                last_k.append(np.array([], dtype=int))
+                last_m.append(np.array([]))
+        else:
+            extinct.append(False)
+            t_extinction.append(None)
+            last_k.append(np.array([], dtype=int))
+            last_m.append(np.array([]))
+    t_max = max((h.get("times") or [0.0])[-1] for h in histories) if histories else 0.0
+    return {
+        "extinct": extinct,
+        "t_extinction": t_extinction,
+        "t_max": t_max,
+        "last_k": last_k,
+        "last_m": last_m,
+    }
+
+
+def compute_survival_curve(summary: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
+    ext_times = [t for t in summary["t_extinction"] if t is not None]
+    n_total = len(summary["t_extinction"])
+    if n_total == 0:
+        return np.array([0.0]), np.array([1.0])
+    censor_times = [summary["t_max"]] * (n_total - len(ext_times))
+    times = sorted(set(ext_times + censor_times))
+    n_at_risk = n_total
+    survival = []
+    s = 1.0
+    for t in times:
+        d = sum(1 for et in ext_times if et == t)
+        c = sum(1 for ct in censor_times if ct == t)
+        if n_at_risk > 0:
+            s *= 1.0 - d / n_at_risk
+        survival.append(s)
+        n_at_risk -= d + c
+    if not times or times[0] != 0.0:
+        times = [0.0] + times
+        survival = [1.0] + survival
+    return np.array(times), np.array(survival)
+
+
+def compute_extinction_probability_ci(histories: List[Dict[str, Any]], alpha: float = 0.05) -> Tuple[float, Tuple[float, float]]:
+    n = len(histories)
+    if n == 0:
+        return 0.0, (0.0, 1.0)
+    k = sum(1 for h in histories if any(nv == 0 for nv in h.get("population_size", [])))
+    p = k / n
+    z = NormalDist().inv_cdf(1.0 - alpha / 2.0)
+    denom = 1.0 + (z * z) / n
+    center = (p + (z * z) / (2 * n)) / denom
+    half = (z * math.sqrt(p * (1 - p) / n + (z * z) / (4 * n * n))) / denom
+    return p, (max(0.0, center - half), min(1.0, center + half))
 
 
 if __name__ == "__main__":

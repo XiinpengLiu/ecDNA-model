@@ -14,9 +14,27 @@ from ecdna_model import (
     ParameterSweep,
     compute_growth_rate,
     compute_extinction_probability,
+    compute_extinction_probability_ci,
+    compute_extinction_summary,
+    compute_survival_curve,
+    compute_time_to_threshold,
     OUParameters,
 )
-from visualization import plot_simulation_summary
+from visualization import (
+    plot_simulation_summary,
+    plot_thinning_acceptance_rate,
+    plot_event_channel_composition,
+    plot_bound_ratio_over_time,
+    plot_survival_curve,
+    plot_extinction_time_hist,
+    plot_extinction_probability_ci,
+    plot_population_fan_chart,
+    plot_sweep_1d,
+    plot_sweep_2d,
+    plot_mean_ecdna_by_species,
+    plot_ecdna_heatmaps_by_species,
+    plot_k_species_joint,
+)
 
 OUTPUT_DIR = Path("figures")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -26,12 +44,20 @@ def make_default_model() -> ModelParameters:
     ou = OUParameters(mean=np.zeros(1), rate=np.ones(1) * 0.5, diffusion=np.ones(1) * 0.2)
     return ModelParameters(ou_params=ou, k_max=np.array([40]), div_rate_max=0.15, death_rate_max=0.05)
 
+def sample_initial_cells(sim: EcDNASimulator, n_cells: int, k_means: np.ndarray):
+    k_means = np.atleast_1d(k_means)
+    cells = []
+    for _ in range(n_cells):
+        k = np.array([sim.rng.poisson(mu) for mu in k_means], dtype=int)
+        cells.append(CellState(k=k))
+    return cells
+
 
 def example_population():
     params = make_default_model()
     config = SimulationConfig(t_max=30.0, seed=123, record_interval=1.0)
-    initial_cells = [CellState(k=np.array([np.random.poisson(8)])) for _ in range(20)]
     sim = EcDNASimulator(params, config)
+    initial_cells = sample_initial_cells(sim, 20, np.array([8]))
     history = sim.simulate_population(initial_cells)
     fig = plot_simulation_summary(history)
     fig.suptitle("Event-driven ecDNA population", y=1.02)
@@ -65,7 +91,8 @@ def example_lineage():
 def example_sweep():
     params = make_default_model()
     config = SimulationConfig(t_max=10.0, seed=21, record_interval=1.0)
-    initial_cells = [CellState(k=np.array([5])) for _ in range(5)]
+    sim = EcDNASimulator(params, config)
+    initial_cells = sample_initial_cells(sim, 5, np.array([5]))
     sweep = ParameterSweep.sweep_1d(
         param_name="div_rate_max",
         param_values=np.linspace(0.05, 0.2, 4),
@@ -73,15 +100,198 @@ def example_sweep():
         param_class=ModelParameters,
         initial_cells=initial_cells,
         config=config,
-        n_replicates=2,
-        metric_fn=lambda h: h["population_size"][-1] if h["population_size"] else 0,
+        n_replicates=3,
+        metric_fn=compute_growth_rate,
     )
-    print("Sweep means:", sweep["metrics_mean"])
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_sweep_1d(sweep, ax=ax, ylabel="Growth Rate")
+    fig.savefig(OUTPUT_DIR / "example_sweep_growth.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    sweep_ext = ParameterSweep.sweep_1d(
+        param_name="div_rate_max",
+        param_values=np.linspace(0.05, 0.2, 4),
+        base_params=params.__dict__,
+        param_class=ModelParameters,
+        initial_cells=initial_cells,
+        config=config,
+        n_replicates=5,
+        metric_fn=lambda h: 1.0 if any(n == 0 for n in h.get("population_size", [])) else 0.0,
+    )
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_sweep_1d(sweep_ext, ax=ax, ylabel="Extinction Probability")
+    fig.savefig(OUTPUT_DIR / "example_sweep_extinction.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    sweep_k = ParameterSweep.sweep_1d(
+        param_name="div_rate_max",
+        param_values=np.linspace(0.05, 0.2, 4),
+        base_params=params.__dict__,
+        param_class=ModelParameters,
+        initial_cells=initial_cells,
+        config=config,
+        n_replicates=3,
+        metric_fn=lambda h: h["mean_k"][-1] if h.get("mean_k") else 0.0,
+    )
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_sweep_1d(sweep_k, ax=ax, ylabel="Final Mean ecDNA")
+    fig.savefig(OUTPUT_DIR / "example_sweep_mean_k.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    sweep_2d = ParameterSweep.sweep_2d(
+        param1_name="div_rate_max",
+        param1_values=np.linspace(0.08, 0.2, 4),
+        param2_name="death_rate_max",
+        param2_values=np.linspace(0.03, 0.12, 4),
+        base_params=params.__dict__,
+        param_class=ModelParameters,
+        initial_cells=initial_cells,
+        config=config,
+        n_replicates=3,
+        metric_fn=compute_growth_rate,
+    )
+    fig, ax = plt.subplots(figsize=(5, 4))
+    plot_sweep_2d(sweep_2d, ax=ax, log_scale=False)
+    fig.savefig(OUTPUT_DIR / "example_sweep_2d_growth.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    threshold = 40
+    sweep_t = ParameterSweep.sweep_1d(
+        param_name="div_rate_max",
+        param_values=np.linspace(0.05, 0.2, 4),
+        base_params=params.__dict__,
+        param_class=ModelParameters,
+        initial_cells=initial_cells,
+        config=config,
+        n_replicates=3,
+        metric_fn=lambda h: compute_time_to_threshold(h, threshold) or config.t_max,
+    )
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_sweep_1d(sweep_t, ax=ax, ylabel=f"Time to Pop>={threshold}")
+    fig.savefig(OUTPUT_DIR / "example_sweep_time_to_threshold.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
     return sweep
+
+
+def example_thinning_diagnostics():
+    ou = OUParameters(mean=np.zeros(1), rate=np.ones(1) * 0.4, diffusion=np.ones(1) * 0.2)
+    params = ModelParameters(
+        ou_params=ou,
+        k_max=np.array([40]),
+        div_rate_max=0.12,
+        death_rate_max=0.05,
+        n_reg=3,
+        n_env=2,
+        reg_switch_max=0.05,
+        env_switch_max=0.03,
+    )
+    config = SimulationConfig(t_max=20.0, seed=33, record_interval=1.0, check_bounds=True)
+    sim = EcDNASimulator(params, config)
+    initial_cells = sample_initial_cells(sim, 20, np.array([6]))
+    history = sim.simulate_population(initial_cells)
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 3))
+    plot_thinning_acceptance_rate(sim.event_log, ax=axes[0])
+    plot_event_channel_composition(sim.event_log, ax=axes[1])
+    plot_bound_ratio_over_time(sim.event_log, ax=axes[2])
+    fig.tight_layout()
+    fig.savefig(OUTPUT_DIR / "example_thinning_diagnostics.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return history, sim.event_log
+
+
+def example_extinction_analysis():
+    params = make_default_model()
+    params.death_rate_max = 0.2
+    config = SimulationConfig(t_max=25.0, seed=101, record_interval=1.0)
+    histories = []
+    for rep in range(20):
+        rep_config = SimulationConfig(
+            t_max=config.t_max,
+            record_interval=config.record_interval,
+            seed=(config.seed + rep) if config.seed is not None else None,
+            max_cells=config.max_cells,
+        )
+        sim = EcDNASimulator(params, rep_config)
+        initial_cells = sample_initial_cells(sim, 10, np.array([4]))
+        histories.append(sim.simulate_population(initial_cells))
+
+    summary = compute_extinction_summary(histories)
+    times, survival = compute_survival_curve(summary)
+    p, ci = compute_extinction_probability_ci(histories)
+    ext_times = [t for t in summary["t_extinction"] if t is not None]
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 3))
+    plot_survival_curve(times, survival, ax=axes[0])
+    plot_extinction_time_hist(ext_times, ax=axes[1])
+    plot_extinction_probability_ci(p, ci, ax=axes[2])
+    fig.tight_layout()
+    fig.savefig(OUTPUT_DIR / "example_extinction_analysis.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Extinction probability: {p:.2f} (CI: {ci[0]:.2f}-{ci[1]:.2f})")
+    return histories
+
+
+def example_replicate_variability():
+    params = make_default_model()
+    config = SimulationConfig(t_max=20.0, seed=202, record_interval=1.0)
+    histories = []
+    for rep in range(15):
+        rep_config = SimulationConfig(
+            t_max=config.t_max,
+            record_interval=config.record_interval,
+            seed=(config.seed + rep) if config.seed is not None else None,
+            max_cells=config.max_cells,
+        )
+        sim = EcDNASimulator(params, rep_config)
+        initial_cells = sample_initial_cells(sim, 10, np.array([6]))
+        histories.append(sim.simulate_population(initial_cells))
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_population_fan_chart(histories, ax=ax, ci=0.8)
+    fig.savefig(OUTPUT_DIR / "example_replicate_variability.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return histories
+
+
+def example_multi_ecdna():
+    ou = OUParameters(mean=np.zeros(1), rate=np.ones(1) * 0.4, diffusion=np.ones(1) * 0.2)
+    params = ModelParameters(
+        ou_params=ou,
+        n_ecdna=2,
+        k_max=np.array([30, 20]),
+        div_rate_max=0.12,
+        death_rate_max=0.04,
+        gain_rate_max=0.015,
+        loss_rate_max=0.02,
+    )
+    config = SimulationConfig(t_max=20.0, seed=77, record_interval=1.0)
+    sim = EcDNASimulator(params, config)
+    initial_cells = sample_initial_cells(sim, 20, np.array([6, 3]))
+    history = sim.simulate_population(initial_cells)
+
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_mean_ecdna_by_species(history, ax=ax, show_std=True)
+    fig.savefig(OUTPUT_DIR / "example_multi_ecdna_mean.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    fig = plot_ecdna_heatmaps_by_species(history, max_k=25, time_resolution=40)
+    if fig is not None:
+        fig.savefig(OUTPUT_DIR / "example_multi_ecdna_heatmaps.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(4, 3))
+    plot_k_species_joint(history, species=(0, 1), ax=ax)
+    fig.savefig(OUTPUT_DIR / "example_multi_ecdna_joint.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return history
 
 
 if __name__ == "__main__":
     setup = example_population()
     example_lineage()
     example_sweep()
-    print("Extinction prob placeholder: ", compute_extinction_probability([setup]))
+    example_thinning_diagnostics()
+    example_extinction_analysis()
+    example_replicate_variability()
+    example_multi_ecdna()
+    print("Extinction prob: ", compute_extinction_probability([setup]))
