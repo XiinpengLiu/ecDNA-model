@@ -55,7 +55,6 @@ from model_atlas import (
 OUTPUT_DIR = Path(global_config.EXAMPLES["output_dir"])
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-
 def make_default_model() -> ModelParameters:
     cfg = global_config.EXAMPLES["default_model"]
     ou = OUParameters(mean=cfg["ou_mean"].copy(), rate=cfg["ou_rate"].copy(), diffusion=cfg["ou_diffusion"].copy())
