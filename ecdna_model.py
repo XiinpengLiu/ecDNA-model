@@ -43,6 +43,18 @@ class CellState:
         return (self.e, self.m, tuple(int(v) for v in self.k))
 
 
+def _serialize_state(state: Optional[CellState]) -> Optional[Dict[str, Any]]:
+    if state is None:
+        return None
+    return {
+        "e": int(state.e),
+        "m": int(state.m),
+        "k": state.k.astype(int).copy(),
+        "y": state.y.astype(float).copy(),
+        "a": float(state.a),
+    }
+
+
 @dataclass
 class SimulationConfig:
     """Configuration for simulation."""
@@ -162,13 +174,11 @@ class Bounder:
         # channel upper bounds using maxima and k_max
         b_div = self.params.div_rate_max
         b_death = self.params.death_rate_max
-        b_m = np.zeros(self.params.n_reg)
-        if self.params.n_reg > 1 and self.params.reg_switch_max > 0:
-            b_m.fill(self.params.reg_switch_max)
+        b_m = np.full(self.params.n_reg, self.params.reg_switch_max)
+        if b_m.size > 0:
             b_m[state.m] = 0.0
-        b_e = np.zeros(self.params.n_env)
-        if self.params.n_env > 1 and self.params.env_switch_max > 0:
-            b_e.fill(self.params.env_switch_max)
+        b_e = np.full(self.params.n_env, self.params.env_switch_max)
+        if b_e.size > 0:
             b_e[state.e] = 0.0
         b_gain = np.full(self.params.n_ecdna, self.params.gain_rate_max)
         b_loss = self.params.loss_rate_max * self.params.k_max
@@ -278,8 +288,12 @@ class EcDNASimulator:
         n_proposed = 0
         n_reject = 0
         max_ratio = 0.0
+        last_delta = 0.0
+        last_ratio = 0.0
+        last_rates: Optional[Dict[str, Any]] = None
+        last_bounds: Optional[Dict[str, Any]] = None
         while True:
-            bar_r, _ = self.bounder.bounds(state)
+            bar_r, bounds = self.bounder.bounds(state)
             if bar_r <= 0:
                 return math.inf, None, None, {
                     "n_proposed": n_proposed,
@@ -289,12 +303,19 @@ class EcDNASimulator:
                     "total_rate": 0.0,
                     "m_prev": state.m,
                     "e_prev": state.e,
+                    "accept_prob": last_ratio,
+                    "delta_last": last_delta,
+                    "rates": last_rates,
+                    "bounds": bounds,
                 }
             delta = self.rng.exponential(1.0 / bar_r)
+            last_delta = delta
             t_candidate = t_current + delta
             state.y = self.params.propagate_y_exact(state, delta, self.rng)
             state.a += delta
             rates = self._compute_rates(state)
+            last_rates = rates
+            last_bounds = bounds
             if rates["total"] <= 0:
                 return math.inf, None, None, {
                     "n_proposed": n_proposed,
@@ -304,40 +325,54 @@ class EcDNASimulator:
                     "total_rate": rates["total"],
                     "m_prev": state.m,
                     "e_prev": state.e,
+                    "accept_prob": last_ratio,
+                    "delta_last": last_delta,
+                    "rates": last_rates,
+                    "bounds": last_bounds,
                 }
             ratio = rates["total"] / bar_r
+            last_ratio = ratio
             max_ratio = max(max_ratio, ratio)
             n_proposed += 1
             if self.config.check_bounds and ratio > 1.0 + self.config.bound_tolerance:
                 raise RuntimeError(f"Invalid bound: r_total/bar_r={ratio:.6f} at t={t_candidate:.3f}")
             if self.rng.random() < ratio:
                 event = self._choose_event(rates)
-                daughters = None
-                m_prev = state.m
-                e_prev = state.e
+                daughters: Optional[List[CellState]] = None
+                state_pre = state.copy()
+                state_post: Optional[Any] = None
                 if event == "div":
                     d1, d2 = self._divide_cell(state)
                     daughters = [d1, d2]
+                    state_post = {"parent": state_pre.copy(), "daughters": [d1.copy(), d2.copy()]}
                 elif event == "death":
-                    pass
+                    state_post = None
                 elif event.startswith("m_switch_"):
                     state.m = int(event.split("_")[-1])
+                    state_post = state.copy()
                 elif event.startswith("e_switch_"):
                     state.e = int(event.split("_")[-1])
+                    state_post = state.copy()
                 elif event.startswith("k_gain_"):
                     j = int(event.split("_")[-1])
                     state.k[j] = min(state.k[j] + 1, self.params.k_max[j])
+                    state_post = state.copy()
                 elif event.startswith("k_loss_"):
                     j = int(event.split("_")[-1])
                     state.k[j] = max(0, state.k[j] - 1)
+                    state_post = state.copy()
                 return t_candidate, event, daughters, {
                     "n_proposed": n_proposed,
                     "n_reject": n_reject,
                     "max_ratio": max_ratio,
                     "bar_r": bar_r,
                     "total_rate": rates["total"],
-                    "m_prev": m_prev,
-                    "e_prev": e_prev,
+                    "accept_prob": ratio,
+                    "delta_last": delta,
+                    "rates": rates,
+                    "bounds": bounds,
+                    "state_pre": state_pre,
+                    "state_post": state_post,
                 }
             n_reject += 1
             t_current = t_candidate
@@ -457,19 +492,39 @@ class EcDNASimulator:
                 cells[cid] = state
                 heapq.heappush(heap, (current_time, cid))
 
+            state_pre = _serialize_state(diag.get("state_pre"))
+            state_post_raw = diag.get("state_post")
+            if isinstance(state_post_raw, dict):
+                state_post = {
+                    "parent": _serialize_state(state_post_raw.get("parent")),
+                    "daughters": [
+                        _serialize_state(d) for d in state_post_raw.get("daughters", [])
+                    ],
+                }
+            else:
+                state_post = _serialize_state(state_post_raw)
+            rates = diag.get("rates") or {}
+            bounds = diag.get("bounds") or {}
             self.event_log.append(
                 {
                     "t": current_time,
                     "cell_id": cid,
                     "event": event,
-                    "state": state.copy(),
-                    "n_proposed": diag.get("n_proposed", 0),
+                    "state_pre": state_pre,
+                    "state_post": state_post,
+                    "rates_at_event": {
+                        k: (v.copy() if hasattr(v, "copy") else v) for k, v in rates.items()
+                    },
+                    "bounds_at_event": {
+                        k: (v.copy() if hasattr(v, "copy") else v) for k, v in bounds.items()
+                    },
+                    "bound_total": diag.get("bar_r", 0.0),
+                    "n_proposals": diag.get("n_proposed", 0),
                     "n_reject": diag.get("n_reject", 0),
+                    "accept_prob": diag.get("accept_prob", 0.0),
+                    "delta_last": diag.get("delta_last", 0.0),
                     "bound_ratio": diag.get("max_ratio", 0.0),
-                    "bar_r": diag.get("bar_r", 0.0),
                     "total_rate": diag.get("total_rate", 0.0),
-                    "m_prev": diag.get("m_prev", state.m),
-                    "e_prev": diag.get("e_prev", state.e),
                 }
             )
 
