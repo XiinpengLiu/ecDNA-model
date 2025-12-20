@@ -35,6 +35,20 @@ from visualization import (
     plot_ecdna_heatmaps_by_species,
     plot_k_species_joint,
 )
+from model_atlas import (
+    plot_event_raster,
+    plot_channel_stack,
+    plot_acceptance_history,
+    plot_proposal_histogram,
+    plot_waiting_time_hist,
+    plot_hazard_vs_age,
+    plot_hazard_vs_k,
+    plot_hazard_heatmap,
+    plot_gain_loss_hazard,
+    plot_amplification_distribution,
+    plot_segregation_distribution,
+    plot_daughter_scatter,
+)
 
 OUTPUT_DIR = Path("figures")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -286,6 +300,87 @@ def example_multi_ecdna():
     return history
 
 
+def example_model_atlas():
+    params = make_default_model()
+    params.n_reg = 3
+    params.n_env = 2
+    params.reg_switch_max = 0.05
+    params.env_switch_max = 0.03
+    params.gain_rate_max = 0.015
+    params.loss_rate_max = 0.02
+    config = SimulationConfig(t_max=12.0, seed=301, record_interval=1.0, check_bounds=True)
+    sim = EcDNASimulator(params, config)
+    initial_cells = sample_initial_cells(sim, 15, np.array([6]))
+    sim.simulate_population(initial_cells)
+    event_log = sim.event_log
+
+    fig, ax = plt.subplots(figsize=(7, 2.5))
+    plot_event_raster(event_log, ax=ax)
+    fig.savefig(OUTPUT_DIR / "atlas_event_raster.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(6, 3))
+    plot_channel_stack(event_log, ax=ax)
+    fig.savefig(OUTPUT_DIR / "atlas_channel_stack.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(6, 3))
+    plot_acceptance_history(event_log, ax=ax)
+    fig.savefig(OUTPUT_DIR / "atlas_acceptance_history.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_proposal_histogram(event_log, ax=ax)
+    fig.savefig(OUTPUT_DIR / "atlas_proposal_hist.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_waiting_time_hist(event_log, ax=ax, bins=20)
+    fig.savefig(OUTPUT_DIR / "atlas_waiting_time_hist.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_hazard_vs_age(params, k_value=[10], ax=ax)
+    fig.savefig(OUTPUT_DIR / "atlas_hazard_vs_age.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_hazard_vs_k(params, k_range=np.arange(0, 41), ax=ax)
+    fig.savefig(OUTPUT_DIR / "atlas_hazard_vs_k.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_hazard_heatmap(params, k_range=np.arange(0, 41), a_grid=np.linspace(0, 5, 40), kind="div", ax=ax)
+    fig.savefig(OUTPUT_DIR / "atlas_hazard_heatmap_div.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_hazard_heatmap(params, k_range=np.arange(0, 41), a_grid=np.linspace(0, 5, 40), kind="death", ax=ax)
+    fig.savefig(OUTPUT_DIR / "atlas_hazard_heatmap_death.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_gain_loss_hazard(params, k_range=np.arange(0, 41), ax=ax)
+    fig.savefig(OUTPUT_DIR / "atlas_gain_loss_hazard.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    parent = CellState(k=np.array([10]), y=params.ou_params.mean.copy())
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_amplification_distribution(params, parent, n_samples=250, ax=ax)
+    fig.savefig(OUTPUT_DIR / "atlas_amplification_dist.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_segregation_distribution(params, parent, n_samples=250, ax=ax)
+    fig.savefig(OUTPUT_DIR / "atlas_segregation_dist.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(4, 3))
+    plot_daughter_scatter(params, parent, n_samples=250, ax=ax)
+    fig.savefig(OUTPUT_DIR / "atlas_daughter_scatter.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 if __name__ == "__main__":
     setup = example_population()
     example_lineage()
@@ -294,4 +389,5 @@ if __name__ == "__main__":
     example_extinction_analysis()
     example_replicate_variability()
     example_multi_ecdna()
+    example_model_atlas()
     print("Extinction prob: ", compute_extinction_probability([setup]))
