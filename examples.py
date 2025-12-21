@@ -5,6 +5,7 @@ Examples for the event-driven ecDNA simulator.
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 import config as global_config
 
@@ -55,15 +56,68 @@ from model_atlas import (
 OUTPUT_DIR = Path(global_config.EXAMPLES["output_dir"])
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+_MODEL_PARAM_KEYS = (
+    "n_env",
+    "n_reg",
+    "div_rate_max",
+    "death_rate_max",
+    "gain_rate_max",
+    "loss_rate_max",
+    "reg_switch_max",
+    "env_switch_max",
+    "fitness_k_star",
+    "fitness_alpha",
+    "fitness_beta",
+    "fitness_weights",
+    "age_effect_rate",
+    "reg_switch_slope",
+    "env_switch_bias",
+    "amplification_scale",
+    "division_copy_factor",
+    "segregation_prob",
+    "post_segregation_loss_cap",
+    "post_segregation_loss_slope",
+    "post_segregation_loss_offset",
+    "daughter_y_noise_std",
+)
+
+
+def _copy_value(value):
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    return value
+
+
+def make_model_from_config(cfg: Dict[str, Any], base_cfg: Optional[Dict[str, Any]] = None) -> ModelParameters:
+    merged: Dict[str, Any] = {}
+    if base_cfg:
+        merged.update(base_cfg)
+    merged.update(cfg)
+
+    kwargs: Dict[str, Any] = {}
+    if {"ou_mean", "ou_rate", "ou_diffusion"}.issubset(merged):
+        kwargs["ou_params"] = OUParameters(
+            mean=np.array(merged["ou_mean"], copy=True),
+            rate=np.array(merged["ou_rate"], copy=True),
+            diffusion=np.array(merged["ou_diffusion"], copy=True),
+        )
+
+    if "k_max" in merged:
+        k_max = np.array(merged["k_max"], copy=True)
+        kwargs["k_max"] = k_max
+        kwargs["n_ecdna"] = int(np.asarray(k_max).size)
+    elif "n_ecdna" in merged:
+        kwargs["n_ecdna"] = int(merged["n_ecdna"])
+
+    for key in _MODEL_PARAM_KEYS:
+        if key in merged:
+            kwargs[key] = _copy_value(merged[key])
+
+    return ModelParameters(**kwargs)
+
+
 def make_default_model() -> ModelParameters:
-    cfg = global_config.EXAMPLES["default_model"]
-    ou = OUParameters(mean=cfg["ou_mean"].copy(), rate=cfg["ou_rate"].copy(), diffusion=cfg["ou_diffusion"].copy())
-    return ModelParameters(
-        ou_params=ou,
-        k_max=cfg["k_max"].copy(),
-        div_rate_max=cfg["div_rate_max"],
-        death_rate_max=cfg["death_rate_max"],
-    )
+    return make_model_from_config(global_config.EXAMPLES["default_model"])
 
 def sample_initial_cells(sim: EcDNASimulator, n_cells: int, k_means: np.ndarray):
     k_means = np.atleast_1d(k_means)
@@ -207,17 +261,7 @@ def example_sweep():
 def example_thinning_diagnostics():
     cfg = global_config.EXAMPLES["thinning"]
     plot_cfg = global_config.PLOT_DEFAULTS
-    ou = OUParameters(mean=cfg["ou_mean"].copy(), rate=cfg["ou_rate"].copy(), diffusion=cfg["ou_diffusion"].copy())
-    params = ModelParameters(
-        ou_params=ou,
-        k_max=cfg["k_max"].copy(),
-        div_rate_max=cfg["div_rate_max"],
-        death_rate_max=cfg["death_rate_max"],
-        n_reg=cfg["n_reg"],
-        n_env=cfg["n_env"],
-        reg_switch_max=cfg["reg_switch_max"],
-        env_switch_max=cfg["env_switch_max"],
-    )
+    params = make_model_from_config(cfg)
     config = SimulationConfig(
         t_max=cfg["t_max"],
         seed=cfg["seed"],
@@ -245,8 +289,7 @@ def example_thinning_diagnostics():
 def example_extinction_analysis():
     cfg = global_config.EXAMPLES["extinction"]
     plot_cfg = global_config.PLOT_DEFAULTS
-    params = make_default_model()
-    params.death_rate_max = cfg["death_rate_max"]
+    params = make_model_from_config(cfg, base_cfg=global_config.EXAMPLES["default_model"])
     config = SimulationConfig(t_max=cfg["t_max"], seed=cfg["seed"], record_interval=cfg["record_interval"])
     histories = []
     for rep in range(cfg["n_replicates"]):
@@ -310,16 +353,7 @@ def example_replicate_variability():
 def example_multi_ecdna():
     cfg = global_config.EXAMPLES["multi_ecdna"]
     plot_cfg = global_config.PLOT_DEFAULTS
-    ou = OUParameters(mean=cfg["ou_mean"].copy(), rate=cfg["ou_rate"].copy(), diffusion=cfg["ou_diffusion"].copy())
-    params = ModelParameters(
-        ou_params=ou,
-        n_ecdna=cfg["n_ecdna"],
-        k_max=cfg["k_max"].copy(),
-        div_rate_max=cfg["div_rate_max"],
-        death_rate_max=cfg["death_rate_max"],
-        gain_rate_max=cfg["gain_rate_max"],
-        loss_rate_max=cfg["loss_rate_max"],
-    )
+    params = make_model_from_config(cfg)
     config = SimulationConfig(t_max=cfg["t_max"], seed=cfg["seed"], record_interval=cfg["record_interval"])
     sim = EcDNASimulator(params, config)
     initial_cells = sample_initial_cells(sim, cfg["n_cells"], cfg["k_means"])
@@ -361,13 +395,7 @@ def example_multi_ecdna():
 def example_model_atlas():
     cfg = global_config.EXAMPLES["atlas"]
     plot_cfg = global_config.PLOT_DEFAULTS
-    params = make_default_model()
-    params.n_reg = cfg["n_reg"]
-    params.n_env = cfg["n_env"]
-    params.reg_switch_max = cfg["reg_switch_max"]
-    params.env_switch_max = cfg["env_switch_max"]
-    params.gain_rate_max = cfg["gain_rate_max"]
-    params.loss_rate_max = cfg["loss_rate_max"]
+    params = make_model_from_config(cfg, base_cfg=global_config.EXAMPLES["default_model"])
     config = SimulationConfig(
         t_max=cfg["t_max"],
         seed=cfg["seed"],
