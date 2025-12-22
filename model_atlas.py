@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import math
+
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -281,7 +283,7 @@ def plot_segregation_distribution(
     n_trials = int(params.division_copy_factor * k_parent)
     x_vals = np.arange(0, n_trials + 1)
     p = params.segregation_prob
-    pmf = [np.math.comb(n_trials, x) * (p ** x) * ((1 - p) ** (n_trials - x)) for x in x_vals]
+    pmf = [math.comb(n_trials, x) * (p ** x) * ((1 - p) ** (n_trials - x)) for x in x_vals]
     ax.plot(x_vals, pmf, marker="o", linestyle="--", label="binomial ref")
     ax.set_xlabel("Daughter copy count")
     ax.set_ylabel("Density")

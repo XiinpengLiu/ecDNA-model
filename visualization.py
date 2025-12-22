@@ -811,6 +811,10 @@ def plot_extinction_probability_ci(p: float, ci: Tuple[float, float],
     if ax is None:
         _, ax = plt.subplots()
     lower, upper = ci
+    if lower > upper:
+        lower, upper = upper, lower
+    lower = min(lower, p)
+    upper = max(upper, p)
     ax.errorbar([0], [p], yerr=[[p - lower], [upper - p]], fmt="o", capsize=4)
     ax.set_xlim(-0.5, 0.5)
     ax.set_xticks([])
