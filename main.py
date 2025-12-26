@@ -124,6 +124,10 @@ def main():
     print("ecDNA Copy-Number Kinetics Model")
     print("=" * 60)
     
+    # 创建输出目录
+    output_dir = Path("results")
+    output_dir.mkdir(exist_ok=True)
+    
     # -------------------------------------------------------------------------
     # Example 1: Single untreated simulation
     # -------------------------------------------------------------------------
@@ -149,8 +153,9 @@ def main():
     print(f"  Sister correlation: {sister_stats['sister_corr_mean']:.3f} ± {sister_stats['sister_corr_std']:.3f}")
     print(f"  Total divisions: {sister_stats['n_divisions']}")
     
-    # Plot
-    plot_results(result, title="Untreated Simulation")
+    # Plot and save
+    plot_results(result, title="Untreated Simulation", 
+                 save_path=output_dir / "untreated_simulation.png")
     
     # -------------------------------------------------------------------------
     # Example 2: Treatment comparison
@@ -177,13 +182,13 @@ def main():
         print(f"  Final pop: {summary.get('final_pop_mean', 0):.1f} ± {summary.get('final_pop_std', 0):.1f}")
         print(f"  Final ecDNA: {summary.get('final_ecdna_mean', 0):.2f} ± {summary.get('final_ecdna_std', 0):.2f}")
     
-    # Compare plots
-    compare_treatments(results_dict)
+    # Compare plots and save
+    compare_treatments(results_dict, save_path=output_dir / "treatment_comparison.png")
     
     print("\n" + "=" * 60)
     print("Simulation complete!")
+    print(f"Figures saved to: {output_dir.absolute()}")
     print("=" * 60)
-
 
 if __name__ == "__main__":
     main()
