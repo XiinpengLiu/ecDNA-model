@@ -1,223 +1,264 @@
-from __future__ import annotations
+"""
+ecDNA Copy-Number Kinetics Model - Configuration Parameters
+============================================================
+All tunable parameters are centralized here for convenient modification.
+"""
 
 import numpy as np
 
-CELL_DEFAULTS = {
-    "e": 0,
-    "m": 0,
-    "k": np.array([0, 0], dtype=int),
-    "y": np.array([0.0], dtype=float),
-    "a": 0.0,
+# =============================================================================
+# 1. STATE SPACE DEFINITIONS
+# =============================================================================
+
+# Environment stages E ∈ {0: baseline, 1: treatment}
+ENV_STATES = [0, 1]
+ENV_NAMES = {0: "baseline", 1: "treatment"}
+
+# Cell-cycle phases C ∈ {0: G0, 1: G1, 2: S, 3: G2M}
+CYCLE_STATES = [0, 1, 2, 3]
+CYCLE_NAMES = {0: "G0", 1: "G1", 2: "S", 3: "G2M"}
+
+# Senescence status S ∈ {0: normal, 1: pre-senescent, 2: senescent}
+SEN_STATES = [0, 1, 2]
+SEN_NAMES = {0: "normal", 1: "pre-sen", 2: "senescent"}
+
+# Expression program X ∈ {0: basal, 1: EMT, 2: MYC, 3: stress, 4: persister}
+EXPR_STATES = [0, 1, 2, 3, 4]
+EXPR_NAMES = {0: "basal", 1: "EMT", 2: "MYC", 3: "stress", 4: "persister"}
+
+# Number of ecDNA species
+J_ECDNA = 1
+
+# Truncation bounds K_max,j for each ecDNA species
+K_MAX = np.array([100])  # shape: (J,)
+
+# Phenomic state dimension P
+P_DIM = 2
+
+# =============================================================================
+# 2. PHENOMIC DYNAMICS (OU Process Parameters)
+# =============================================================================
+
+# Attractor μ_{e,m} for each (env, cycle, sen, expr) combination
+# Shape: (n_env, n_cycle, n_sen, n_expr, P)
+# Simplified: use default attractors based on expression program
+def get_mu(e, c, s, x):
+    """State-dependent phenomic attractor."""
+    base = np.array([0.0, 0.0])
+    # Expression program shifts attractor
+    expr_shift = {
+        0: np.array([0.0, 0.0]),    # basal
+        1: np.array([1.0, -0.5]),   # EMT
+        2: np.array([0.5, 1.0]),    # MYC
+        3: np.array([-0.5, 0.5]),   # stress
+        4: np.array([-1.0, -1.0]),  # persister
+    }
+    # Senescence shifts
+    sen_shift = {0: 0.0, 1: 0.2, 2: 0.5}
+    return base + expr_shift[x] + np.array([sen_shift[s], 0])
+
+# Mean-reversion matrix B_{e,m} (relaxation rate)
+# For simplicity, use scalar * identity (isotropic relaxation)
+B_RELAX_RATE = 0.5  # eigenvalue magnitude
+def get_B(e, c, s, x):
+    """State-dependent relaxation matrix."""
+    return B_RELAX_RATE * np.eye(P_DIM)
+
+# =============================================================================
+# 3. CTMC SWITCHING RATES (Baseline, without drug)
+# =============================================================================
+
+# Maximum switching rates (used for bounded parameterization)
+Q_MAX_CYCLE = 1.0      # cell-cycle transitions
+Q_MAX_SEN = 0.1        # senescence transitions
+Q_MAX_EXPR = 0.05      # expression program switches
+
+# Cell-cycle transition baseline rates (G0 <-> G1 -> S -> G2M -> G1)
+CYCLE_RATES = {
+    (0, 1): 0.2,   # G0 -> G1
+    (1, 0): 0.05,  # G1 -> G0 (quiescence entry)
+    (1, 2): 0.3,   # G1 -> S
+    (2, 3): 0.4,   # S -> G2M
+    # G2M -> G1 handled by division
 }
 
-OU_DEFAULTS = {
-    "mean": np.zeros(1),
-    "rate": np.ones(1),
-    "diffusion": np.zeros(1),
+# Senescence progression rates (normal -> pre-sen -> senescent)
+SEN_RATES = {
+    (0, 1): 0.01,  # normal -> pre-senescent
+    (1, 2): 0.05,  # pre-senescent -> senescent
 }
 
-# 2) 模型层：两种 ecDNA；k_max 维度=2；并把 fitness_k_star 调到初始 K=4 附近
-MODEL_DEFAULTS = {
-    "n_env": 1,
-    "n_reg": 1,
-    "n_ecdna": 1,
-
-    # 计算效率与上界(thinning bound)相关：过大的 k_max 会让上界变松、提案变密、变慢
-    "k_max": np.array([50, 50], dtype=int),
-
-    # 让系统具有正增长倾向（你也可以按需要再校准）
-    "div_rate_max": 0.18,
-    "death_rate_max": 0.03,
-
-    # gain/loss 对上界也有影响；想先把群体推到 1e4，建议先设小一些，后续再做敏感性分析
-    "gain_rate_max": 0.002,
-    "loss_rate_max": 0.002,
-
-    "reg_switch_max": 0.02,
-    "env_switch_max": 0.0,
-
-    # 关键：初始每细胞 k=[2,2]，若 weights=None 则 K=4
-    "fitness_k_star": 4.0,
-    "fitness_alpha": 1.0,
-    "fitness_beta": 0.02,
-    "fitness_weights": None,
-
-    "age_effect_rate": 0.2,
-    "reg_switch_slope": 0.5,
-    "env_switch_bias": 0.0,
-
-    # ecDNA 分裂核（保持你原模型思想，但别设太大，否则 k 容易爆、事件也会变多）
-    "amplification_scale": 0.05,
-    "division_copy_factor": 2,
-    "segregation_prob": 0.5,
-
-    "post_segregation_loss_cap": 0.5,
-    "post_segregation_loss_slope": 0.01,
-    "post_segregation_loss_offset": 1.0,
-    "daughter_y_noise_std": 0.05,
+# Expression program switch rates (sparse, biology-constrained)
+EXPR_RATES = {
+    (0, 1): 0.01,  # basal -> EMT
+    (0, 2): 0.02,  # basal -> MYC
+    (0, 3): 0.005, # basal -> stress
+    (1, 0): 0.01,  # EMT -> basal
+    (2, 0): 0.015, # MYC -> basal
+    (3, 0): 0.02,  # stress -> basal
+    (3, 4): 0.01,  # stress -> persister
+    (4, 3): 0.005, # persister -> stress
 }
 
-# 3) 仿真层：给 max_cells 一个保险上限；record_interval 建议放大以减小 history 体积
-SIM_DEFAULTS = {
-    "t_max": 100.0,
-    "seed": 42,
-    "max_cells": 100000,      # 超过会直接抛错（保护内存/时间）
-    "record_interval": 5.0,   # 记录快照越密，history(k_matrix 等)越大
-    "check_bounds": False,
-    "bound_tolerance": 1e-9,
+# =============================================================================
+# 4. DIVISION AND DEATH HAZARDS
+# =============================================================================
+
+# Maximum hazard rates (for bounded sigmoid parameterization)
+LAMBDA_DIV_MAX = 0.5   # max division rate per unit time
+LAMBDA_DEATH_MAX = 0.2 # max death rate per unit time
+
+# Division hazard parameters (depends on cycle phase)
+# Only G2M phase can divide
+DIV_HAZARD_BY_CYCLE = {
+    0: 0.0,   # G0: no division
+    1: 0.0,   # G1: no division
+    2: 0.0,   # S: no division
+    3: 0.8,   # G2M: high division competence
 }
 
-# 4) 运行入口：从 100 个细胞开始，每个细胞 k=[2,2]；跑到 1e4 量级（t_max 取 100 常够用）
-RUN_DEFAULTS = {
-    "t_max": 100.0,
-    "seed": 42,
-    "record_interval": 5.0,
-    "initial_k": np.array([2, 2], dtype=int),
-    "initial_count": 100,
+# Death hazard parameters (baseline + senescence effect)
+DEATH_HAZARD_BASE = 0.01
+DEATH_HAZARD_SEN_MULT = {0: 1.0, 1: 1.5, 2: 3.0}  # senescence multiplier
+
+# Age-dependence for hazards (Gompertz-like or constant)
+USE_AGE_DEPENDENT_HAZARD = True
+AGE_HAZARD_SCALE = 0.1  # how strongly age affects hazard
+
+# =============================================================================
+# 5. ecDNA DYNAMICS PARAMETERS
+# =============================================================================
+
+# Inter-division gain/loss (optional, can be disabled)
+ENABLE_INTERDIV_ECDNA = True
+
+# Gain rate (per unit time)
+MU_GAIN_BASE = 0.001  # baseline gain rate per copy
+
+# Loss rate (per copy, per unit time)
+MU_LOSS_BASE = 0.002  # baseline loss rate per copy
+
+# ecDNA effect on fitness (optional)
+ECDNA_FITNESS_EFFECT = 0.01  # per-copy fitness advantage
+
+# =============================================================================
+# 6. DIVISION KERNEL PARAMETERS
+# =============================================================================
+
+# Amplification distribution g^amp: A_j ~ Poisson(lambda_amp * k_j)
+# or A_j ~ NegBin, etc.
+AMP_LAMBDA_PER_COPY = 0.1  # mean extra copies per existing copy
+
+# Post-segregation loss probability
+LOSS_PROB_POST_SEG = 0.02  # probability each copy is lost after segregation
+
+# Daughter phenotype initialization
+# Y_daughter ~ N(Y_parent, sigma^2 * I)
+DAUGHTER_Y_NOISE_STD = 0.1
+
+# Daughter cycle phase reset probabilities (from G2M -> new phase)
+DAUGHTER_CYCLE_PROBS = {1: 0.95, 0: 0.05}  # mostly G1, small chance G0
+
+# =============================================================================
+# 7. TREATMENT / DRUG PARAMETERS
+# =============================================================================
+
+# Drug effect parameterization: Hill/Emax form
+# r_c(z;u) = r_{c,0}(z) * (1 - Emax * u^n / (EC50^n + u^n))
+
+class DrugParams:
+    """Parameters for a single drug affecting specific channels."""
+    def __init__(self, name, emax, ec50, hill_n, targets):
+        self.name = name
+        self.emax = emax      # maximum effect (0-1 for inhibition)
+        self.ec50 = ec50      # half-maximal concentration
+        self.hill_n = hill_n  # Hill coefficient
+        self.targets = targets  # dict: {channel: effect_type}
+
+# Example drugs
+DRUGS = {
+    "cell_cycle_inhibitor": DrugParams(
+        name="CDK_inhibitor",
+        emax=0.9,
+        ec50=1.0,
+        hill_n=2,
+        targets={"div": "inhibit", "cycle_G1S": "inhibit"}
+    ),
+    "senolytic": DrugParams(
+        name="Senolytic",
+        emax=0.8,
+        ec50=0.5,
+        hill_n=1.5,
+        targets={"death_sen": "activate"}
+    ),
+    "ecdna_destabilizer": DrugParams(
+        name="ecDNA_destab",
+        emax=0.7,
+        ec50=1.0,
+        hill_n=2,
+        targets={"amp": "inhibit", "loss": "activate"}
+    ),
 }
 
-ANALYSIS_DEFAULTS = {
-    "growth_start_frac": 0.2,
-    "extinction_alpha": 0.05,
+# Default drug concentration schedule
+DRUG_SCHEDULE = {
+    "cell_cycle_inhibitor": lambda t: 0.0,  # no drug by default
+    "senolytic": lambda t: 0.0,
+    "ecdna_destabilizer": lambda t: 0.0,
 }
 
-PLOT_DEFAULTS = {
-    "dpi": 150,
-    "bbox_tight": "tight",
-}
+# =============================================================================
+# 8. SIMULATION PARAMETERS
+# =============================================================================
 
-EXAMPLES = {
-    "output_dir": "figures",
-    "default_model": {
-        "ou_mean": np.zeros(1),
-        "ou_rate": np.ones(1) * 0.5,
-        "ou_diffusion": np.ones(1) * 0.2,
-        "k_max": np.array([40], dtype=int),
-        "div_rate_max": 0.15,
-        "death_rate_max": 0.05,
-    },
-    "population": {
-        "t_max": 30.0,
-        "seed": 42,
-        "record_interval": 1.0,
-        "n_cells": 20,
-        "k_means": np.array([8]),
-        "summary_title_y": 1.02,
-    },
-    "lineage": {
-        "t_max": 15.0,
-        "seed": 42,
-        "record_interval": 1.0,
-        "initial_k": np.array([10]),
-        "figsize": (6, 3),
-    },
-    "sweep": {
-        "t_max": 10.0,
-        "seed": 42,
-        "record_interval": 1.0,
-        "n_cells": 5,
-        "k_means": np.array([5]),
-        "param_values": np.linspace(0.05, 0.2, 4),
-        "param1_values": np.linspace(0.08, 0.2, 4),
-        "param2_values": np.linspace(0.03, 0.12, 4),
-        "n_replicates_growth": 3,
-        "n_replicates_extinction": 5,
-        "n_replicates_k": 3,
-        "n_replicates_2d": 3,
-        "n_replicates_threshold": 3,
-        "threshold": 40,
-        "figsize_1d": (5, 3),
-        "figsize_2d": (5, 4),
-    },
-    "thinning": {
-        "ou_mean": np.zeros(1),
-        "ou_rate": np.ones(1) * 0.4,
-        "ou_diffusion": np.ones(1) * 0.2,
-        "k_max": np.array([40]),
-        "div_rate_max": 0.12,
-        "death_rate_max": 0.05,
-        "n_reg": 3,
-        "n_env": 2,
-        "reg_switch_max": 0.05,
-        "env_switch_max": 0.03,
-        "t_max": 20.0,
-        "seed": 42,
-        "record_interval": 1.0,
-        "check_bounds": True,
-        "n_cells": 20,
-        "k_means": np.array([6]),
-        "figsize": (12, 3),
-    },
-    "extinction": {
-        "death_rate_max": 0.2,
-        "t_max": 25.0,
-        "seed": 42,
-        "record_interval": 1.0,
-        "n_replicates": 20,
-        "n_cells": 10,
-        "k_means": np.array([4]),
-        "figsize": (12, 3),
-    },
-    "replicate": {
-        "t_max": 20.0,
-        "seed": 42,
-        "record_interval": 1.0,
-        "n_replicates": 15,
-        "n_cells": 10,
-        "k_means": np.array([6]),
-        "figsize": (5, 3),
-        "ci": 0.8,
-    },
-    "multi_ecdna": {
-        "ou_mean": np.zeros(1),
-        "ou_rate": np.ones(1) * 0.4,
-        "ou_diffusion": np.ones(1) * 0.2,
-        "n_ecdna": 2,
-        "k_max": np.array([30, 20], dtype=int),
-        "div_rate_max": 0.12,
-        "death_rate_max": 0.04,
-        "gain_rate_max": 0.015,
-        "loss_rate_max": 0.02,
-        "t_max": 20.0,
-        "seed": 42,
-        "record_interval": 1.0,
-        "n_cells": 20,
-        "k_means": np.array([6, 3]),
-        "figsize_mean": (5, 3),
-        "figsize_joint": (4, 3),
-        "heatmap_max_k": 25,
-        "heatmap_time_resolution": 40,
-    },
-    "atlas": {
-        "n_reg": 3,
-        "n_env": 2,
-        "reg_switch_max": 0.05,
-        "env_switch_max": 0.03,
-        "gain_rate_max": 0.015,
-        "loss_rate_max": 0.02,
-        "t_max": 12.0,
-        "seed": 42,
-        "record_interval": 1.0,
-        "check_bounds": True,
-        "n_cells": 15,
-        "k_means": np.array([6]),
-        "figsize_event_raster": (7, 2.5),
-        "figsize_channel_stack": (6, 3),
-        "figsize_acceptance_history": (6, 3),
-        "figsize_proposal_hist": (5, 3),
-        "figsize_waiting_time": (5, 3),
-        "figsize_hazard_vs_age": (5, 3),
-        "figsize_hazard_vs_k": (5, 3),
-        "figsize_hazard_heatmap": (5, 3),
-        "figsize_gain_loss": (5, 3),
-        "figsize_amplification": (5, 3),
-        "figsize_segregation": (5, 3),
-        "figsize_daughter_scatter": (4, 3),
-        "waiting_time_bins": 20,
-        "hazard_k_range": np.arange(0, 41),
-        "hazard_age_grid": np.linspace(0, 5, 40),
-        "hazard_k_value": [10],
-        "parent_k": np.array([10]),
-        "draw_samples": 250,
-    },
-}
+# Random seed for reproducibility
+RANDOM_SEED = 42
+
+# Simulation time
+T_MAX = 100.0  # total simulation time
+
+# Initial population
+N_INIT = 100   # initial number of cells
+
+# Initial state distribution
+def sample_initial_state(rng):
+    """Sample initial state for a single cell."""
+    e = 0  # baseline environment
+    c = rng.choice([1, 2, 3], p=[0.5, 0.3, 0.2])  # mostly G1
+    s = 0  # normal (not senescent)
+    x = rng.choice([0, 1, 2], p=[0.7, 0.15, 0.15])  # mostly basal
+    k = rng.poisson(5, size=J_ECDNA)  # Poisson-distributed ecDNA
+    k = np.clip(k, 0, K_MAX)
+    a = rng.exponential(5)  # age from last division
+    y = rng.normal(0, 0.5, size=P_DIM)  # phenotype
+    return e, c, s, x, k, a, y
+
+# Maximum population size (for memory management)
+MAX_POP_SIZE = 100000
+
+# Recording interval for time series
+RECORD_INTERVAL = 1.0
+
+# =============================================================================
+# 9. DERIVED QUANTITIES (computed from above)
+# =============================================================================
+
+# Total number of discrete cell states M
+N_CYCLE = len(CYCLE_STATES)
+N_SEN = len(SEN_STATES)
+N_EXPR = len(EXPR_STATES)
+N_M = N_CYCLE * N_SEN * N_EXPR
+
+# Total number of types (without ecDNA)
+N_ENV = len(ENV_STATES)
+
+def m_to_tuple(m_idx):
+    """Convert flat M index to (c, s, x) tuple."""
+    x = m_idx % N_EXPR
+    s = (m_idx // N_EXPR) % N_SEN
+    c = m_idx // (N_EXPR * N_SEN)
+    return c, s, x
+
+def tuple_to_m(c, s, x):
+    """Convert (c, s, x) tuple to flat M index."""
+    return c * (N_SEN * N_EXPR) + s * N_EXPR + x
