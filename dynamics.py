@@ -5,6 +5,7 @@ Implements the flow (φ), jump intensities (λ), and transition kernel (Q).
 """
 
 import numpy as np
+from numba import jit
 from scipy.linalg import expm
 from typing import Tuple, Dict, List
 from cell import Cell
@@ -91,9 +92,15 @@ def batch_lazy_apply_flow(cells: list, target_time: float) -> None:
 # SECTION 4.2: Jump Channel Intensities
 # =============================================================================
 
+@jit(nopython=True, cache=True)
 def sigmoid(x: float) -> float:
     """Sigmoid function σ(x) = 1/(1+exp(-x))."""
-    return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+    # Manual clamp to keep numba nopython-friendly on scalars.
+    if x < -500.0:
+        x = -500.0
+    elif x > 500.0:
+        x = 500.0
+    return 1.0 / (1.0 + np.exp(-x))
 
 
 def drug_effect(u: float, drug: cfg.DrugParams, effect_type: str) -> float:
