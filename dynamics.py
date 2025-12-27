@@ -58,6 +58,35 @@ def apply_flow(cell: Cell, delta: float) -> None:
     cell.y = flow_phenotype(cell.y, cell.e, cell.c, cell.s, cell.x, delta)
 
 
+def lazy_apply_flow(cell: Cell, target_time: float) -> None:
+    """
+    Lazily apply deterministic PDMP flow to cell in-place.
+    Only applies flow if target_time > cell.last_update_time.
+    Updates cell.last_update_time after applying flow.
+    
+    Args:
+        cell: Cell to update
+        target_time: Target time to advance to
+    """
+    delta = target_time - cell.last_update_time
+    if delta > 1e-12:  # Only apply if meaningful time has passed
+        apply_flow(cell, delta)
+        cell.last_update_time = target_time
+
+
+def batch_lazy_apply_flow(cells: list, target_time: float) -> None:
+    """
+    Lazily apply flow to all cells, advancing each to target_time.
+    Used at record times when all cell states must be synchronized.
+    
+    Args:
+        cells: List of Cell objects
+        target_time: Target time to advance all cells to
+    """
+    for cell in cells:
+        lazy_apply_flow(cell, target_time)
+
+
 # =============================================================================
 # SECTION 4.2: Jump Channel Intensities
 # =============================================================================

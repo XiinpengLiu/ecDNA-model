@@ -9,7 +9,7 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
 from cell import Cell, CellPopulation
-from dynamics import JumpIntensities, apply_flow, apply_transition
+from dynamics import JumpIntensities, apply_flow, apply_transition, lazy_apply_flow, batch_lazy_apply_flow
 from division import DivisionKernel
 import config as cfg
 
@@ -64,14 +64,22 @@ class OgataThinningSimulator:
     # Section 7.3: Ogata Thinning for Single Cell
     # -------------------------------------------------------------------------
     
-    def sample_next_event(self, cell: Cell, t: float, t_max: float) -> Tuple[Optional[float], Optional[str], Optional[dict]]:
+    def sample_next_event(self, cell: Cell, t_start: float, t_max: float) -> Tuple[Optional[float], Optional[str], Optional[dict]]:
         """
         Sample next event time and type for a single cell using Ogata thinning.
+        
+        Note: This method works on a COPY of the cell to simulate flow propagation
+        without modifying the original cell's state.
+        
+        Args:
+            cell: Cell to sample event for (will not be modified)
+            t_start: Start time for sampling (should match cell.last_update_time)
+            t_max: Maximum time horizon
         
         Returns:
             (event_time, channel_type, params) or (None, None, None) if no event before t_max
         """
-        current_t = t
+        current_t = t_start
         temp_cell = cell.copy()  # work on copy for flow propagation
         
         while current_t < t_max:
@@ -83,7 +91,7 @@ class OgataThinningSimulator:
                 # No event before t_max
                 return None, None, None
             
-            # Step 3: Propagate along deterministic flow
+            # Step 3: Propagate temp_cell along deterministic flow
             apply_flow(temp_cell, delta)
             
             # Step 4: Evaluate true intensity
@@ -107,7 +115,7 @@ class OgataThinningSimulator:
         return None, None, None
     
     # -------------------------------------------------------------------------
-    # Section 7.4: Population Simulation
+    # Section 7.4: Population Simulation with Lazy Flow
     # -------------------------------------------------------------------------
     
     def simulate(self, 
@@ -117,7 +125,11 @@ class OgataThinningSimulator:
                  max_pop: int = None,
                  verbose: bool = True) -> SimulationResult:
         """
-        Run population simulation.
+        Run population simulation with lazy flow updates.
+        
+        Key optimization: Cells are only updated (flow applied) when:
+        1. Their event is about to be processed
+        2. A record time is reached (all cells synchronized)
         
         Args:
             population: Initial population (created if None)
@@ -139,10 +151,14 @@ class OgataThinningSimulator:
             population = CellPopulation(self.rng)
             population.initialize(cfg.N_INIT)
         
+        # Initialize last_update_time for all cells
+        for cell in population.cells:
+            cell.last_update_time = 0.0
+        
         # Results container
         result = SimulationResult()
         
-        # Current time
+        # Current simulation time (logical clock)
         t = 0.0
         next_record = record_interval  # First record after interval (t=0 recorded below)
         last_env = None
@@ -159,26 +175,28 @@ class OgataThinningSimulator:
         if verbose:
             print(f"Starting simulation: {population.size()} cells, t_max={t_max}")
         
-        # Prepare event heap
+        # Prepare event heap: (event_time, cell_id, channel, params, version)
         event_heap: List[Tuple[float, int, str, dict, int]] = []
         cell_versions: Dict[int, int] = {}
         cell_lookup: Dict[int, Cell] = {cell.cell_id: cell for cell in population.cells}
         
-        def schedule_cell_event(cell: Cell):
+        def schedule_cell_event(cell: Cell, from_time: float):
+            """Schedule next event for a cell starting from from_time."""
             cell_id = cell.cell_id
-            event_t, channel, params = self.sample_next_event(cell, t, t_max)
+            event_t, channel, params = self.sample_next_event(cell, from_time, t_max)
             version = cell_versions.get(cell_id, 0) + 1
             cell_versions[cell_id] = version
             if event_t is not None:
                 heapq.heappush(event_heap, (event_t, cell_id, channel, params, version))
         
-        def resample_all_events():
+        def resample_all_events(from_time: float):
+            """Resample events for all cells from given time."""
             event_heap.clear()
             for cell in population.cells:
-                schedule_cell_event(cell)
+                schedule_cell_event(cell, from_time)
         
         # Initialize heap with all cells
-        resample_all_events()
+        resample_all_events(t)
         
         # Main simulation loop
         event_count = 0
@@ -190,7 +208,7 @@ class OgataThinningSimulator:
                     print(f"Population limit reached at t={t:.2f}")
                 break
             
-            # Find next event across all cached cells
+            # Find next valid event
             next_event_t = np.inf
             next_cell = None
             next_channel = None
@@ -199,10 +217,10 @@ class OgataThinningSimulator:
             while event_heap:
                 event_t, cell_id, channel, params, version = heapq.heappop(event_heap)
                 if cell_versions.get(cell_id) != version:
-                    continue
+                    continue  # Stale event, skip
                 cell = cell_lookup.get(cell_id)
                 if cell is None:
-                    continue
+                    continue  # Cell removed, skip
                 next_event_t = event_t
                 next_cell = cell
                 next_channel = channel
@@ -210,56 +228,60 @@ class OgataThinningSimulator:
                 break
             
             if next_cell is None:
-                # No more events before t_max, advance to t_max for final records
+                # No more events before t_max
                 next_event_t = t_max
             
-            # Record at scheduled times BEFORE advancing to event
-            # (advance to each record time, record, then continue)
-            resample_due_to_env = False
-            while next_record <= next_event_t and next_record <= t_max:
-                delta_to_record = next_record - t
-                if delta_to_record > 0:
-                    for cell in population.cells:
-                        apply_flow(cell, delta_to_record)
-                    # Update environment at record time
-                    if self.env_schedule is not None:
-                        e_new = self.env_schedule(next_record)
+            # Handle record times before the next event
+            env_changed = False
+            while next_record <= min(next_event_t, t_max):
+                # Synchronize all cells to record time (lazy update)
+                batch_lazy_apply_flow(population.cells, next_record)
+                
+                # Update environment at record time
+                if self.env_schedule is not None:
+                    e_new = self.env_schedule(next_record)
+                    if e_new != last_env:
                         for cell in population.cells:
                             cell.e = e_new
-                        if e_new != last_env:
-                            last_env = e_new
-                            resample_due_to_env = True
-                    t = next_record
+                        last_env = e_new
+                        env_changed = True
+                
+                # Update logical time
+                t = next_record
+                
+                # Record state
                 self._record_state(result, next_record, population)
                 next_record += record_interval
-                if resample_due_to_env:
+                
+                if env_changed:
+                    # Environment changed: resample all events from current time
+                    resample_all_events(t)
                     break
             
-            if resample_due_to_env:
-                resample_all_events()
-                continue
+            if env_changed:
+                continue  # Restart loop with new events
             
             if next_cell is None:
-                # No event, we've advanced to t_max
+                # No event, we've recorded up to t_max
                 break
             
-            # Advance all cells from current t to event time
-            delta = next_event_t - t
-            if delta > 0:
-                for cell in population.cells:
-                    apply_flow(cell, delta)
+            # Process the event
+            # Only update the cell that has the event (lazy flow)
+            lazy_apply_flow(next_cell, next_event_t)
             
-            t = next_event_t
-            
-            # Update environment at event time
-            env_changed = False
+            # Update environment at event time if needed
             if self.env_schedule is not None:
-                e_new = self.env_schedule(t)
-                for cell in population.cells:
-                    cell.e = e_new
+                e_new = self.env_schedule(next_event_t)
                 if e_new != last_env:
+                    # Environment change at event time
+                    # Update all cells' environment (but not their flow state)
+                    for cell in population.cells:
+                        cell.e = e_new
                     last_env = e_new
                     env_changed = True
+            
+            # Update logical time
+            t = next_event_t
             
             # Process event
             self._process_event(population, next_cell, next_channel, next_params, t, result)
@@ -267,34 +289,44 @@ class OgataThinningSimulator:
             
             # Update lookup/cache after event
             if next_channel == "division":
+                # Parent removed, two daughters added
                 cell_lookup.pop(next_cell.cell_id, None)
                 cell_versions.pop(next_cell.cell_id, None)
+                # Get new daughters (last two added)
                 new_cells = population.cells[-2:]
                 for new_cell in new_cells:
                     cell_lookup[new_cell.cell_id] = new_cell
+                    new_cell.last_update_time = t  # Daughters start at current time
             elif next_channel == "death":
+                # Cell removed
                 cell_lookup.pop(next_cell.cell_id, None)
                 cell_versions.pop(next_cell.cell_id, None)
             else:
+                # Cell state changed, update lookup
                 cell_lookup[next_cell.cell_id] = next_cell
             
+            # Reschedule events
             if env_changed:
-                resample_all_events()
+                # Environment changed: resample all events
+                resample_all_events(t)
             else:
                 if next_channel == "division":
+                    # Schedule events for new daughters
                     for new_cell in population.cells[-2:]:
-                        schedule_cell_event(new_cell)
+                        schedule_cell_event(new_cell, t)
                 elif next_channel == "death":
-                    pass
+                    pass  # Cell is gone, no new event
                 else:
-                    schedule_cell_event(next_cell)
+                    # Reschedule for the cell that just had an event
+                    schedule_cell_event(next_cell, t)
             
             # Progress update
             if verbose and event_count % 1000 == 0:
                 print(f"t={t:.2f}, pop={population.size()}, events={event_count}")
         
         # Final recording if not already at a record time
-        if not result.times or result.times[-1] < t:
+        if result.times and result.times[-1] < t:
+            batch_lazy_apply_flow(population.cells, t)
             self._record_state(result, t, population)
         
         if verbose:

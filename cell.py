@@ -25,6 +25,7 @@ class Cell:
         y: Continuous phenotype (shape: P,)
         cell_id: Unique identifier
         parent_id: Parent cell ID (None for initial cells)
+        last_update_time: Time of last state update (for lazy flow)
     """
     e: int
     c: int
@@ -35,6 +36,7 @@ class Cell:
     y: np.ndarray
     cell_id: int = 0
     parent_id: int = None
+    last_update_time: float = 0.0
     
     def __eq__(self, other):
         """Compare cells by cell_id only."""
@@ -60,7 +62,8 @@ class Cell:
         return Cell(
             e=self.e, c=self.c, s=self.s, x=self.x,
             k=self.k.copy(), a=self.a, y=self.y.copy(),
-            cell_id=self.cell_id, parent_id=self.parent_id
+            cell_id=self.cell_id, parent_id=self.parent_id,
+            last_update_time=self.last_update_time
         )
     
     def total_ecdna(self) -> int:
