@@ -4,6 +4,7 @@ ecDNA Copy-Number Kinetics Model - Ogata Thinning Simulation
 Implements Section 7: Exact event-driven simulation with bounded intensities.
 """
 
+import heapq
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
@@ -144,18 +145,40 @@ class OgataThinningSimulator:
         # Current time
         t = 0.0
         next_record = record_interval  # First record after interval (t=0 recorded below)
+        last_env = None
         
         # Apply initial env_schedule if provided
         if self.env_schedule is not None:
-            e_new = self.env_schedule(t)
+            last_env = self.env_schedule(t)
             for cell in population.cells:
-                cell.e = e_new
+                cell.e = last_env
         
         # Record initial state at t=0
         self._record_state(result, t, population)
         
         if verbose:
             print(f"Starting simulation: {population.size()} cells, t_max={t_max}")
+        
+        # Prepare event heap
+        event_heap: List[Tuple[float, int, str, dict, int]] = []
+        cell_versions: Dict[int, int] = {}
+        cell_lookup: Dict[int, Cell] = {cell.cell_id: cell for cell in population.cells}
+        
+        def schedule_cell_event(cell: Cell):
+            cell_id = cell.cell_id
+            event_t, channel, params = self.sample_next_event(cell, t, t_max)
+            version = cell_versions.get(cell_id, 0) + 1
+            cell_versions[cell_id] = version
+            if event_t is not None:
+                heapq.heappush(event_heap, (event_t, cell_id, channel, params, version))
+        
+        def resample_all_events():
+            event_heap.clear()
+            for cell in population.cells:
+                schedule_cell_event(cell)
+        
+        # Initialize heap with all cells
+        resample_all_events()
         
         # Main simulation loop
         event_count = 0
@@ -167,19 +190,24 @@ class OgataThinningSimulator:
                     print(f"Population limit reached at t={t:.2f}")
                 break
             
-            # Find next event across all cells
+            # Find next event across all cached cells
             next_event_t = np.inf
             next_cell = None
             next_channel = None
             next_params = None
             
-            for cell in population.cells:
-                event_t, channel, params = self.sample_next_event(cell, t, t_max)
-                if event_t is not None and event_t < next_event_t:
-                    next_event_t = event_t
-                    next_cell = cell
-                    next_channel = channel
-                    next_params = params
+            while event_heap:
+                event_t, cell_id, channel, params, version = heapq.heappop(event_heap)
+                if cell_versions.get(cell_id) != version:
+                    continue
+                cell = cell_lookup.get(cell_id)
+                if cell is None:
+                    continue
+                next_event_t = event_t
+                next_cell = cell
+                next_channel = channel
+                next_params = params
+                break
             
             if next_cell is None:
                 # No more events before t_max, advance to t_max for final records
@@ -187,6 +215,7 @@ class OgataThinningSimulator:
             
             # Record at scheduled times BEFORE advancing to event
             # (advance to each record time, record, then continue)
+            resample_due_to_env = False
             while next_record <= next_event_t and next_record <= t_max:
                 delta_to_record = next_record - t
                 if delta_to_record > 0:
@@ -197,9 +226,18 @@ class OgataThinningSimulator:
                         e_new = self.env_schedule(next_record)
                         for cell in population.cells:
                             cell.e = e_new
+                        if e_new != last_env:
+                            last_env = e_new
+                            resample_due_to_env = True
                     t = next_record
                 self._record_state(result, next_record, population)
                 next_record += record_interval
+                if resample_due_to_env:
+                    break
+            
+            if resample_due_to_env:
+                resample_all_events()
+                continue
             
             if next_cell is None:
                 # No event, we've advanced to t_max
@@ -214,14 +252,42 @@ class OgataThinningSimulator:
             t = next_event_t
             
             # Update environment at event time
+            env_changed = False
             if self.env_schedule is not None:
                 e_new = self.env_schedule(t)
                 for cell in population.cells:
                     cell.e = e_new
+                if e_new != last_env:
+                    last_env = e_new
+                    env_changed = True
             
             # Process event
             self._process_event(population, next_cell, next_channel, next_params, t, result)
             event_count += 1
+            
+            # Update lookup/cache after event
+            if next_channel == "division":
+                cell_lookup.pop(next_cell.cell_id, None)
+                cell_versions.pop(next_cell.cell_id, None)
+                new_cells = population.cells[-2:]
+                for new_cell in new_cells:
+                    cell_lookup[new_cell.cell_id] = new_cell
+            elif next_channel == "death":
+                cell_lookup.pop(next_cell.cell_id, None)
+                cell_versions.pop(next_cell.cell_id, None)
+            else:
+                cell_lookup[next_cell.cell_id] = next_cell
+            
+            if env_changed:
+                resample_all_events()
+            else:
+                if next_channel == "division":
+                    for new_cell in population.cells[-2:]:
+                        schedule_cell_event(new_cell)
+                elif next_channel == "death":
+                    pass
+                else:
+                    schedule_cell_event(next_cell)
             
             # Progress update
             if verbose and event_count % 1000 == 0:
