@@ -1,6 +1,5 @@
 """
 ecDNA Copy-Number Kinetics Model - PDMP Dynamics
-=================================================
 Implements the flow (φ), jump intensities (λ), and transition kernel (Q).
 """
 
@@ -12,9 +11,9 @@ from cell import Cell
 import config as cfg
 
 
-# =============================================================================
-# SECTION 4.1: Deterministic Flow Between Events
-# =============================================================================
+
+#Deterministic Flow Between Events
+
 
 def flow_age(a: float, delta: float) -> float:
     """
@@ -88,9 +87,9 @@ def batch_lazy_apply_flow(cells: list, target_time: float) -> None:
         lazy_apply_flow(cell, target_time)
 
 
-# =============================================================================
-# SECTION 4.2: Jump Channel Intensities
-# =============================================================================
+
+# Jump Channel Intensities
+
 
 @jit(nopython=True, cache=True)
 def sigmoid(x: float) -> float:
@@ -133,10 +132,9 @@ class JumpIntensities:
         """Get current drug concentrations."""
         return {name: schedule(t) for name, schedule in self.drug_schedule.items()}
     
-    # -------------------------------------------------------------------------
-    # Section 4.2.1: CTMC Switching Rates
-    # -------------------------------------------------------------------------
-    
+
+    # CTMC Switching Rates
+
     def cycle_switch_rate(self, cell: Cell, c_new: int, t: float,
                           drug_conc: Dict[str, float] = None) -> float:
         """Cell-cycle switching rate q^cycle_{c→c'}."""
@@ -207,9 +205,9 @@ class JumpIntensities:
         
         return rates
     
-    # -------------------------------------------------------------------------
-    # Section 4.2.3: Inter-division ecDNA Gain/Loss
-    # -------------------------------------------------------------------------
+    
+    # Inter-division ecDNA Gain/Loss
+    
     
     def ecdna_gain_rate(self, cell: Cell, j: int, t: float,
                         drug_conc: Dict[str, float] = None) -> float:
@@ -270,9 +268,9 @@ class JumpIntensities:
         
         return rates
     
-    # -------------------------------------------------------------------------
-    # Section 4.2.4: Division and Death Hazards
-    # -------------------------------------------------------------------------
+    
+    # Division and Death Hazards
+    
     
     def division_hazard(self, cell: Cell, t: float,
                         drug_conc: Dict[str, float] = None,
@@ -334,9 +332,9 @@ class JumpIntensities:
         eta = np.log(base_rate * sen_mult * drug_mod + 1e-10)
         return cfg.LAMBDA_DEATH_MAX * sigmoid(eta)
     
-    # -------------------------------------------------------------------------
+    
     # Total Intensity
-    # -------------------------------------------------------------------------
+    
     
     def compute_all_rates(self, cell: Cell, t: float) -> Tuple[List[Tuple], float]:
         """
@@ -393,9 +391,9 @@ class JumpIntensities:
         return bound
 
 
-# =============================================================================
-# SECTION 4.4: Transition Kernel (non-branching channels)
-# =============================================================================
+
+# Transition Kernel (non-branching channels)
+
 
 def apply_transition(cell: Cell, channel_type: str, params: dict) -> None:
     """

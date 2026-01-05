@@ -1,6 +1,5 @@
 """
 ecDNA Copy-Number Kinetics Model - Main Script
-===============================================
 Run simulations and generate results.
 """
 
@@ -128,9 +127,7 @@ def main():
     output_dir = Path("results")
     output_dir.mkdir(exist_ok=True)
     
-    # -------------------------------------------------------------------------
     # Example 1: Single untreated simulation
-    # -------------------------------------------------------------------------
     print("\n--- Example 1: Untreated Simulation ---")
     
     result = run_simulation(
@@ -157,9 +154,7 @@ def main():
     plot_results(result, title="Untreated Simulation", 
                  save_path=output_dir / "untreated_simulation.png")
     
-    # -------------------------------------------------------------------------
     # Example 2: Treatment comparison
-    # -------------------------------------------------------------------------
     print("\n--- Example 2: Treatment Comparison ---")
     
     trial = InSilicoTrial(base_seed=42)

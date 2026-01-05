@@ -1,6 +1,5 @@
 """
 ecDNA Copy-Number Kinetics Model - Cell State
-==============================================
 Defines the Cell class representing single-cell state z = (E, M, K, A, Y).
 """
 

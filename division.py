@@ -1,7 +1,6 @@
 """
 ecDNA Copy-Number Kinetics Model - Division Kernel
-===================================================
-Implements Section 5: ecDNA amplification, segregation, and daughter initialization.
+ecDNA amplification, segregation, and daughter initialization.
 """
 
 import numpy as np
@@ -24,10 +23,10 @@ def _drug_effect_hill(u: float, emax: float, ec50: float, hill_n: float, effect_
 class DivisionKernel:
     """
     Division kernel K^{a,y}_{e,m,k} implementing:
-    - State-dependent ecDNA amplification (Section 5.1)
-    - Random segregation (Section 5.2)
-    - Post-segregation copy loss (Section 5.3)
-    - Daughter discrete state, phenotype, and age reset (Section 5.4)
+    - State-dependent ecDNA amplification
+    - Random segregation
+    - Post-segregation copy loss
+    - Daughter discrete state, phenotype, and age reset
     """
     
     def __init__(self, rng: np.random.Generator = None, drug_schedule: dict = None):
@@ -40,9 +39,9 @@ class DivisionKernel:
             return self.drug_schedule[drug_name](t)
         return 0.0
     
-    # -------------------------------------------------------------------------
-    # Section 5.1: State-dependent ecDNA Amplification
-    # -------------------------------------------------------------------------
+    
+    #State-dependent ecDNA Amplification
+    
     
     def sample_amplification(self, cell: Cell, j: int, t: float) -> int:
         """
@@ -86,9 +85,9 @@ class DivisionKernel:
         
         return k_tilde
     
-    # -------------------------------------------------------------------------
-    # Section 5.2: Random Segregation (Unbiased)
-    # -------------------------------------------------------------------------
+    
+    # Random Segregation (Unbiased)
+    
     
     def segregate(self, k_tilde: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -105,9 +104,9 @@ class DivisionKernel:
         
         return k1, k2
     
-    # -------------------------------------------------------------------------
-    # Section 5.3: Post-segregation Copy Loss
-    # -------------------------------------------------------------------------
+    
+    # Post-segregation Copy Loss
+    
     
     def apply_post_segregation_loss(self, k: np.ndarray, cell: Cell, t: float) -> np.ndarray:
         """
@@ -141,9 +140,9 @@ class DivisionKernel:
         
         return k_star
     
-    # -------------------------------------------------------------------------
-    # Section 5.4: Daughter Discrete State, Phenotype, and Age Reset
-    # -------------------------------------------------------------------------
+    
+    #Daughter Discrete State, Phenotype, and Age Reset
+    
     
     def sample_daughter_cycle(self, parent_cell: Cell) -> int:
         """
@@ -203,9 +202,9 @@ class DivisionKernel:
         
         return y_daughter
     
-    # -------------------------------------------------------------------------
+    
     # Main Division Method
-    # -------------------------------------------------------------------------
+    
     
     def divide(self, parent: Cell, t: float) -> Tuple[Cell, Cell]:
         """
@@ -254,9 +253,7 @@ class DivisionKernel:
         return daughters[0], daughters[1]
 
 
-# =============================================================================
-# Section 5.5: Random-daughter Marginal
-# =============================================================================
+#Random-daughter Marginal
 
 def compute_sister_correlation(k1: np.ndarray, k2: np.ndarray) -> float:
     """

@@ -1,14 +1,12 @@
 """
 ecDNA Copy-Number Kinetics Model - Configuration Parameters
-============================================================
 All tunable parameters are centralized here for convenient modification.
 """
 
 import numpy as np
 
-# =============================================================================
+
 # 1. STATE SPACE DEFINITIONS
-# =============================================================================
 
 # Environment stages E ∈ {0: baseline, 1: treatment}
 ENV_STATES = [0, 1]
@@ -35,9 +33,9 @@ K_MAX = np.array([100])  # shape: (J,)
 # Phenomic state dimension P
 P_DIM = 2
 
-# =============================================================================
+
 # 2. PHENOMIC DYNAMICS (OU Process Parameters)
-# =============================================================================
+
 
 # Attractor μ_{e,m} for each (env, cycle, sen, expr) combination
 # Shape: (n_env, n_cycle, n_sen, n_expr, P)
@@ -64,9 +62,9 @@ def get_B(e, c, s, x):
     """State-dependent relaxation matrix."""
     return B_RELAX_RATE * np.eye(P_DIM)
 
-# =============================================================================
+
 # 3. CTMC SWITCHING RATES (Baseline, without drug)
-# =============================================================================
+
 
 # Maximum switching rates (used for bounded parameterization)
 Q_MAX_CYCLE = 1.0      # cell-cycle transitions
@@ -100,9 +98,9 @@ EXPR_RATES = {
     (4, 3): 0.005, # persister -> stress
 }
 
-# =============================================================================
+
 # 4. DIVISION AND DEATH HAZARDS
-# =============================================================================
+
 
 # Maximum hazard rates (for bounded sigmoid parameterization)
 LAMBDA_DIV_MAX = 0.5   # max division rate per unit time
@@ -125,9 +123,9 @@ DEATH_HAZARD_SEN_MULT = {0: 1.0, 1: 1.5, 2: 3.0}  # senescence multiplier
 USE_AGE_DEPENDENT_HAZARD = True
 AGE_HAZARD_SCALE = 0.1  # how strongly age affects hazard
 
-# =============================================================================
+
 # 5. ecDNA DYNAMICS PARAMETERS
-# =============================================================================
+
 
 # Inter-division gain/loss (optional, can be disabled)
 ENABLE_INTERDIV_ECDNA = True
@@ -141,9 +139,9 @@ MU_LOSS_BASE = 0.002  # baseline loss rate per copy
 # ecDNA effect on fitness (optional)
 ECDNA_FITNESS_EFFECT = 0.01  # per-copy fitness advantage
 
-# =============================================================================
+
 # 6. DIVISION KERNEL PARAMETERS
-# =============================================================================
+
 
 # Amplification distribution g^amp: A_j ~ Poisson(lambda_amp * k_j)
 # or A_j ~ NegBin, etc.
@@ -159,9 +157,9 @@ DAUGHTER_Y_NOISE_STD = 0.1
 # Daughter cycle phase reset probabilities (from G2M -> new phase)
 DAUGHTER_CYCLE_PROBS = {1: 0.95, 0: 0.05}  # mostly G1, small chance G0
 
-# =============================================================================
+
 # 7. TREATMENT / DRUG PARAMETERS
-# =============================================================================
+
 
 # Drug effect parameterization: Hill/Emax form
 # r_c(z;u) = r_{c,0}(z) * (1 - Emax * u^n / (EC50^n + u^n))
@@ -207,9 +205,9 @@ DRUG_SCHEDULE = {
     "ecdna_destabilizer": lambda t: 0.0,
 }
 
-# =============================================================================
+
 # 8. SIMULATION PARAMETERS
-# =============================================================================
+
 
 # Random seed for reproducibility
 RANDOM_SEED = 42
@@ -239,9 +237,9 @@ MAX_POP_SIZE = 100000
 # Recording interval for time series
 RECORD_INTERVAL = 1.0
 
-# =============================================================================
+
 # 9. DERIVED QUANTITIES (computed from above)
-# =============================================================================
+
 
 # Total number of discrete cell states M
 N_CYCLE = len(CYCLE_STATES)

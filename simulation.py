@@ -1,7 +1,6 @@
 """
 ecDNA Copy-Number Kinetics Model - Ogata Thinning Simulation
-=============================================================
-Implements Section 7: Exact event-driven simulation with bounded intensities.
+Exact event-driven simulation with bounded intensities.
 """
 
 import heapq
@@ -28,7 +27,7 @@ class SimulationResult:
 
 class OgataThinningSimulator:
     """
-    Exact simulation using Ogata thinning algorithm (Section 7.3).
+    Exact simulation using Ogata thinning algorithm
     
     The algorithm:
     1. Compute dominating bound r̄
@@ -60,9 +59,9 @@ class OgataThinningSimulator:
         # Compute global dominating bound
         self.r_bar = self.intensities.compute_dominating_bound()
     
-    # -------------------------------------------------------------------------
-    # Section 7.3: Ogata Thinning for Single Cell
-    # -------------------------------------------------------------------------
+    
+    # Ogata Thinning for Single Cell
+    
     
     def sample_next_event(self, cell: Cell, t_start: float, t_max: float) -> Tuple[Optional[float], Optional[str], Optional[dict]]:
         """
@@ -113,11 +112,10 @@ class OgataThinningSimulator:
             current_t = candidate_t
         
         return None, None, None
-    
-    # -------------------------------------------------------------------------
-    # Section 7.4: Population Simulation with Lazy Flow
-    # -------------------------------------------------------------------------
-    
+
+
+    # Population Simulation with Lazy Flow
+
     def simulate(self, 
                  population: CellPopulation = None,
                  t_max: float = None,
@@ -379,10 +377,6 @@ class OgataThinningSimulator:
         result.ecdna_stds.append(summary.get("ecdna_std", 0))
         result.state_compositions.append(summary)
 
-
-# =============================================================================
-# Convenience Functions
-# =============================================================================
 
 def run_simulation(t_max: float = None, 
                    n_init: int = None,

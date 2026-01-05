@@ -1,7 +1,6 @@
 """
 ecDNA Copy-Number Kinetics Model - Treatment / Intervention Module
-===================================================================
-Implements Section 8: In silico trials with time-dependent interventions.
+In silico trials with time-dependent interventions.
 """
 
 import numpy as np
@@ -29,9 +28,7 @@ class TreatmentProtocol:
     duration: float = 100.0
 
 
-# =============================================================================
 # Pre-defined Treatment Protocols
-# =============================================================================
 
 def constant_dose(drug_name: str, concentration: float, start: float = 0, end: float = np.inf):
     """Create constant-dose schedule."""
@@ -79,9 +76,7 @@ def combination_therapy(schedules: List[Dict[str, Callable]]) -> Dict[str, Calla
     return combined
 
 
-# =============================================================================
 # Pre-built Protocols
-# =============================================================================
 
 PROTOCOLS = {
     "untreated": TreatmentProtocol(
@@ -147,9 +142,7 @@ PROTOCOLS = {
 }
 
 
-# =============================================================================
 # In Silico Trial Runner
-# =============================================================================
 
 class InSilicoTrial:
     """
@@ -250,9 +243,7 @@ class InSilicoTrial:
         }
 
 
-# =============================================================================
 # Response Metrics
-# =============================================================================
 
 def compute_growth_rate(result: SimulationResult, window: float = 10.0) -> float:
     """
