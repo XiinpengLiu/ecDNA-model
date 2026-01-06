@@ -136,8 +136,32 @@ MU_GAIN_BASE = 0.001  # baseline gain rate per copy
 # Loss rate (per copy, per unit time)
 MU_LOSS_BASE = 0.002  # baseline loss rate per copy
 
-# ecDNA effect on fitness (optional)
-ECDNA_FITNESS_EFFECT = 0.01  # per-copy fitness advantage
+# ecDNA effect on fitness - Benefit-Cost Tradeoff Model
+# Biological rationale: ecDNA provides oncogene amplification benefits but
+# incurs metabolic costs, segregation errors, and oncogene-induced toxicity.
+
+# Benefit parameters (Hill/saturating function)
+ECDNA_FITNESS_EFFECT = 0.01  # per-copy fitness advantage (legacy, used as scale)
+ECDNA_OPTIMAL_K = 30         # optimal copy number for max fitness (~cancer sweet spot)
+ECDNA_BENEFIT_HILL_N = 2     # Hill coefficient for benefit saturation
+ECDNA_BENEFIT_MAX = 0.5      # maximum fitness benefit (multiplicative factor)
+
+# Cost parameters (metabolic burden)
+ECDNA_BURDEN_COEFF = 0.0003  # quadratic burden coefficient: cost ~ coeff * k^2
+ECDNA_BURDEN_THRESHOLD = 20  # copies below this have minimal burden
+
+# Toxicity parameters (oncogene overdose → apoptosis)
+ECDNA_TOXICITY_THRESHOLD = 50   # copies above which toxicity kicks in
+ECDNA_TOXICITY_COEFF = 0.001    # death rate increase per copy above threshold
+ECDNA_TOXICITY_HILL_N = 2       # steepness of toxicity onset
+
+# Segregation error parameters (physical hindrance at mitosis)
+ECDNA_SEGREGATION_ERROR_THRESHOLD = 40  # copies above which segregation errors increase
+ECDNA_SEGREGATION_ERROR_COEFF = 0.005   # additional loss probability per copy above threshold
+
+# Senescence induction parameters (oncogene-induced senescence, DDR)
+ECDNA_SEN_THRESHOLD = 25     # copies above which senescence risk increases sharply
+ECDNA_SEN_COEFF = 0.02       # senescence rate multiplier per copy above threshold
 
 
 # 6. DIVISION KERNEL PARAMETERS
