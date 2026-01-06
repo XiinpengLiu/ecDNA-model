@@ -3,8 +3,6 @@ ecDNA Copy-Number Kinetics Model - Main Script
 Run simulations and generate results.
 """
 
-import numpy as np
-import matplotlib.pyplot as plt
 from pathlib import Path
 
 # Import model components
@@ -15,106 +13,14 @@ from treatment import (
     InSilicoTrial, PROTOCOLS,
     compute_growth_rate, compute_ecdna_dynamics, compute_sister_correlation_stats
 )
+from plotting import (
+    plot_results, compare_treatments, 
+    plot_ecdna_distribution_evolution, plot_heterogeneity_metrics,
+    plot_ecdna_positive_fraction, plot_lineage_tree,
+    plot_muller_ecdna, plot_muller_comparison, plot_fitness_landscape,
+    plot_lineage_state_trajectory, plot_event_summary
+)
 
-
-def plot_results(result, title="Simulation Results", save_path=None):
-    """Plot simulation results."""
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    
-    # Population size
-    ax = axes[0, 0]
-    ax.plot(result.times, result.population_sizes, 'b-', linewidth=2)
-    ax.set_xlabel('Time')
-    ax.set_ylabel('Population Size')
-    ax.set_title('Population Dynamics')
-    ax.set_yscale('log')
-    ax.grid(True, alpha=0.3)
-    
-    # ecDNA mean
-    ax = axes[0, 1]
-    ax.plot(result.times, result.ecdna_means, 'r-', linewidth=2)
-    ax.fill_between(result.times, 
-                    np.array(result.ecdna_means) - np.array(result.ecdna_stds),
-                    np.array(result.ecdna_means) + np.array(result.ecdna_stds),
-                    alpha=0.3, color='red')
-    ax.set_xlabel('Time')
-    ax.set_ylabel('Mean ecDNA Copy Number')
-    ax.set_title('ecDNA Dynamics')
-    ax.grid(True, alpha=0.3)
-    
-    # State composition over time (cycle phases)
-    ax = axes[1, 0]
-    if result.state_compositions and 'cycle_dist' in result.state_compositions[0]:
-        cycle_names = ['G0', 'G1', 'S', 'G2M']
-        cycle_data = np.array([s.get('cycle_dist', [0]*4) for s in result.state_compositions])
-        for i, name in enumerate(cycle_names):
-            if i < cycle_data.shape[1]:
-                ax.plot(result.times, cycle_data[:, i], label=name, linewidth=2)
-        ax.set_xlabel('Time')
-        ax.set_ylabel('Fraction')
-        ax.set_title('Cell Cycle Distribution')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-    
-    # Sister correlations histogram
-    ax = axes[1, 1]
-    if result.sister_correlations:
-        ax.hist(result.sister_correlations, bins=20, edgecolor='black', alpha=0.7)
-        ax.axvline(np.mean(result.sister_correlations), color='red', 
-                   linestyle='--', label=f'Mean: {np.mean(result.sister_correlations):.3f}')
-        ax.set_xlabel('Sister Correlation')
-        ax.set_ylabel('Count')
-        ax.set_title('Sister ecDNA Correlation')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-    
-    plt.suptitle(title, fontsize=14)
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved plot to {save_path}")
-    
-    plt.show()
-
-
-def compare_treatments(results_dict, save_path=None):
-    """Compare multiple treatment results."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    
-    # Population dynamics
-    ax = axes[0]
-    for name, results in results_dict.items():
-        for i, result in enumerate(results):
-            alpha = 0.3 if i > 0 else 1.0
-            label = name if i == 0 else None
-            ax.plot(result.times, result.population_sizes, alpha=alpha, label=label)
-    ax.set_xlabel('Time')
-    ax.set_ylabel('Population Size')
-    ax.set_title('Population Dynamics by Treatment')
-    ax.set_yscale('log')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    # ecDNA dynamics
-    ax = axes[1]
-    for name, results in results_dict.items():
-        for i, result in enumerate(results):
-            alpha = 0.3 if i > 0 else 1.0
-            label = name if i == 0 else None
-            ax.plot(result.times, result.ecdna_means, alpha=alpha, label=label)
-    ax.set_xlabel('Time')
-    ax.set_ylabel('Mean ecDNA')
-    ax.set_title('ecDNA Dynamics by Treatment')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    
-    plt.show()
 
 
 def main():
@@ -131,8 +37,8 @@ def main():
     print("\n--- Example 1: Untreated Simulation ---")
     
     result = run_simulation(
-        t_max=50.0,
-        n_init=50,
+        t_max=100.0,
+        n_init=100,
         seed=42,
         verbose=True
     )
@@ -150,35 +56,122 @@ def main():
     print(f"  Sister correlation: {sister_stats['sister_corr_mean']:.3f} ± {sister_stats['sister_corr_std']:.3f}")
     print(f"  Total divisions: {sister_stats['n_divisions']}")
     
+    # Save raw data to CSVs
+    result.save_as_csv(output_dir / "untreated_simulation_data")
+    
     # Plot and save
-    plot_results(result, title="Untreated Simulation", 
+    plot_results(result, title="Untreated Simulation",  
                  save_path=output_dir / "untreated_simulation.png")
     
-    # Example 2: Treatment comparison
-    print("\n--- Example 2: Treatment Comparison ---")
+    # Plot ecDNA distribution evolution (intratumoral heterogeneity)
+    print("\n--- ecDNA Heterogeneity Analysis ---")
     
-    trial = InSilicoTrial(base_seed=42)
-    
-    # Run comparison
-    protocols_to_compare = ["untreated", "cdk_inhibitor_continuous", "ecdna_targeting"]
-    
-    results_dict = trial.compare_protocols(
-        protocol_names=protocols_to_compare,
-        n_replicates=2,
-        n_init=50,
-        verbose=True
+    # Combined view: violin + ECDF + quantile trajectories
+    plot_ecdna_distribution_evolution(
+        result, 
+        mode='combined',
+        n_time_points=8,
+        title="ecDNA Copy Number Distribution Evolution",
+        save_path=output_dir / "ecdna_distribution_combined.png"
     )
     
-    # Summarize
-    print("\n--- Summary ---")
-    for name in protocols_to_compare:
-        summary = trial.summarize_results(name)
-        print(f"\n{name}:")
-        print(f"  Final pop: {summary.get('final_pop_mean', 0):.1f} ± {summary.get('final_pop_std', 0):.1f}")
-        print(f"  Final ecDNA: {summary.get('final_ecdna_mean', 0):.2f} ± {summary.get('final_ecdna_std', 0):.2f}")
+    # Ridge plot (alternative visualization)
+    plot_ecdna_distribution_evolution(
+        result,
+        mode='ridge',
+        n_time_points=10,
+        title="ecDNA Distribution Evolution (Ridge Plot)",
+        save_path=output_dir / "ecdna_distribution_ridge.png"
+    )
     
-    # Compare plots and save
-    compare_treatments(results_dict, save_path=output_dir / "treatment_comparison.png")
+    # Heterogeneity metrics over time
+    plot_heterogeneity_metrics(
+        result,
+        title="ecDNA Heterogeneity Metrics",
+        save_path=output_dir / "ecdna_heterogeneity_metrics.png"
+    )
+    
+    # ecDNA+ fraction and high-copy subpopulation over time
+    plot_ecdna_positive_fraction(
+        result,
+        threshold_high=20,
+        title="ecDNA+ and High-Copy Subpopulation Dynamics",
+        save_path=output_dir / "ecdna_positive_fraction.png"
+    )
+    
+    # Alternative: use 95th percentile of initial distribution as threshold
+    plot_ecdna_positive_fraction(
+        result,
+        use_quantile=95,
+        title="ecDNA+ and Extreme Subpopulation (95th percentile threshold)",
+        save_path=output_dir / "ecdna_positive_fraction_quantile.png"
+    )
+    
+    # Lineage tree showing ecDNA inheritance patterns
+    plot_lineage_tree(
+        result,
+        n_lineages=4,
+        max_depth=5,
+        title="ecDNA Inheritance: Non-Mendelian Segregation",
+        save_path=output_dir / "ecdna_lineage_tree.png"
+    )
+    
+    # Muller plot showing clonal dynamics by ecDNA copy number
+    plot_muller_ecdna(
+        result,
+        title="ecDNA Clonal Dynamics (Muller Plot)",
+        save_path=output_dir / "ecdna_muller_plot.png"
+    )
+    
+    # Fitness landscape: ecDNA vs division/death rates
+    plot_fitness_landscape(
+        result,
+        rate_type='both',
+        title="ecDNA-Fitness Landscape",
+        save_path=output_dir / "ecdna_fitness_landscape.png"
+    )
+    
+    # Lineage state trajectory: trace how states evolve along lineages
+    plot_lineage_state_trajectory(
+        result,
+        n_lineages=5,
+        max_events=40,
+        title="Lineage State Trajectories",
+        save_path=output_dir / "lineage_state_trajectory.png"
+    )
+    
+    # Event summary: distribution of event types and rates
+    plot_event_summary(
+        result,
+        title="Event Type Distribution and Dynamics",
+        save_path=output_dir / "event_summary.png"
+    )
+    
+    # Example 2: Treatment Comparison
+    # print("\n--- Example 2: Treatment Comparison ---")
+    
+    # trial = InSilicoTrial(base_seed=42)
+    
+    # # Run comparison
+    # protocols_to_compare = ["untreated", "cdk_inhibitor_continuous", "ecdna_targeting"]
+    
+    # results_dict = trial.compare_protocols(
+    #     protocol_names=protocols_to_compare,
+    #     n_replicates=2,
+    #     n_init=50,
+    #     verbose=True
+    # )
+    
+    # # Summarize
+    # print("\n--- Summary ---")
+    # for name in protocols_to_compare:
+    #     summary = trial.summarize_results(name)
+    #     print(f"\n{name}:")
+    #     print(f"  Final pop: {summary.get('final_pop_mean', 0):.1f} ± {summary.get('final_pop_std', 0):.1f}")
+    #     print(f"  Final ecDNA: {summary.get('final_ecdna_mean', 0):.2f} ± {summary.get('final_ecdna_std', 0):.2f}")
+    
+    # # Compare plots and save
+    # compare_treatments(results_dict, save_path=output_dir / "treatment_comparison.png")
     
     print("\n" + "=" * 60)
     print("Simulation complete!")

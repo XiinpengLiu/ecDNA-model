@@ -23,6 +23,88 @@ class SimulationResult:
     state_compositions: List[Dict] = field(default_factory=list)
     events: List[Tuple] = field(default_factory=list)
     sister_correlations: List[float] = field(default_factory=list)
+    ecdna_distributions: List[np.ndarray] = field(default_factory=list)  # Full ecDNA distribution at each time point
+    fitness_snapshots: List[List[Dict]] = field(default_factory=list)  # Per-cell fitness data at each time point
+
+    def save_as_csv(self, base_dir: str):
+        """Save simulation results to CSV files in the specified directory."""
+        import csv
+        import json
+        from pathlib import Path
+        
+        dir_path = Path(base_dir)
+        dir_path.mkdir(parents=True, exist_ok=True)
+        
+        # 1. Summary Time Series
+        with open(dir_path / 'time_series_summary.csv', 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['time', 'population_size', 'ecdna_mean', 'ecdna_std'])
+            for t, n, m, s in zip(self.times, self.population_sizes, self.ecdna_means, self.ecdna_stds):
+                writer.writerow([t, n, m, s])
+                
+        # 2. ecDNA Distributions (Long format)
+        with open(dir_path / 'ecdna_distributions.csv', 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['time', 'cell_index', 'ecdna_copy_number'])
+            for t, dist in zip(self.times, self.ecdna_distributions):
+                if len(dist) > 0:
+                    for idx, val in enumerate(dist):
+                        writer.writerow([t, idx, val])
+
+        # 3. Fitness Landscape Snapshots
+        with open(dir_path / 'fitness_landscape.csv', 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['time', 'cell_index', 'ecdna', 'cycle', 'sen', 'expr', 'div_rate', 'death_rate', 'net_rate'])
+            for t, snapshot in zip(self.times, self.fitness_snapshots):
+                for idx, cell_data in enumerate(snapshot):
+                    writer.writerow([
+                        t, idx, 
+                        cell_data.get('ecdna'), 
+                        cell_data.get('cycle'), 
+                        cell_data.get('sen'), 
+                        cell_data.get('expr'),
+                        cell_data.get('div_rate'),
+                        cell_data.get('death_rate'),
+                        cell_data.get('net_rate')
+                    ])
+
+        # 4. Events Log (Detailed with pre/post states)
+        with open(dir_path / 'events_log.csv', 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'time', 'event_type', 'cell_id',
+                'pre_e', 'pre_c', 'pre_s', 'pre_x', 'pre_k', 'pre_a',
+                'post_e', 'post_c', 'post_s', 'post_x', 'post_k', 'post_a',
+                'd1_id', 'd1_e', 'd1_c', 'd1_s', 'd1_x', 'd1_k', 'd1_a',
+                'd2_id', 'd2_e', 'd2_c', 'd2_s', 'd2_x', 'd2_k', 'd2_a',
+            ])
+            for event in self.events:
+                t, etype, cid, details = event
+                pre = details.get('state_pre', {})
+                post = details.get('state_post', {})
+                d1 = details.get('d1_state', {})
+                d2 = details.get('d2_state', {})
+                writer.writerow([
+                    t, etype, cid,
+                    pre.get('e'), pre.get('c'), pre.get('s'), pre.get('x'), 
+                    json.dumps(pre.get('k')), pre.get('a'),
+                    post.get('e') if post else None, post.get('c') if post else None,
+                    post.get('s') if post else None, post.get('x') if post else None,
+                    json.dumps(post.get('k')) if post else None, post.get('a') if post else None,
+                    details.get('d1_id'), d1.get('e'), d1.get('c'), d1.get('s'), d1.get('x'),
+                    json.dumps(d1.get('k')) if d1 else None, d1.get('a'),
+                    details.get('d2_id'), d2.get('e'), d2.get('c'), d2.get('s'), d2.get('x'),
+                    json.dumps(d2.get('k')) if d2 else None, d2.get('a'),
+                ])
+
+        # 5. Sister Correlations
+        with open(dir_path / 'sister_correlations.csv', 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['correlation_coefficient'])
+            for val in self.sister_correlations:
+                writer.writerow([val])
+                
+        print(f"Simulation results saved to CSV files in {dir_path}")
 
 
 class OgataThinningSimulator:
@@ -327,6 +409,9 @@ class OgataThinningSimulator:
             batch_lazy_apply_flow(population.cells, t)
             self._record_state(result, t, population)
         
+        # Copy events to result for lineage analysis
+        result.events = population.events.copy()
+        
         if verbose:
             print(f"Simulation complete: t={t:.2f}, pop={population.size()}, events={event_count}")
         
@@ -334,7 +419,10 @@ class OgataThinningSimulator:
     
     def _process_event(self, population: CellPopulation, cell: Cell, 
                        channel: str, params: dict, t: float, result: SimulationResult):
-        """Process a single event."""
+        """Process a single event with full state tracking."""
+        
+        # Capture pre-event state
+        state_pre = cell.get_state_dict()
         
         if channel == "division":
             # Division: remove parent, add two daughters
@@ -344,13 +432,14 @@ class OgataThinningSimulator:
             population.add_cell(daughter1)
             population.add_cell(daughter2)
             
-            # Log event
+            # Log event with full states
             population.log_event(t, "division", cell.cell_id, {
+                "state_pre": state_pre,
+                "state_post": None,  # Parent no longer exists
                 "d1_id": daughter1.cell_id,
                 "d2_id": daughter2.cell_id,
-                "parent_k": cell.k.tolist(),
-                "d1_k": daughter1.k.tolist(),
-                "d2_k": daughter2.k.tolist(),
+                "d1_state": daughter1.get_state_dict(),
+                "d2_state": daughter2.get_state_dict(),
             })
             
             # Record sister correlation
@@ -361,12 +450,20 @@ class OgataThinningSimulator:
         elif channel == "death":
             # Death: remove cell
             population.remove_cell(cell)
-            population.log_event(t, "death", cell.cell_id, {"k": cell.k.tolist()})
+            population.log_event(t, "death", cell.cell_id, {
+                "state_pre": state_pre,
+                "state_post": None,  # Cell no longer exists
+            })
             
         else:
-            # State transition
+            # State transition (cycle, sen, expr, ecdna_gain, ecdna_loss)
             apply_transition(cell, channel, params)
-            population.log_event(t, channel, cell.cell_id, params)
+            state_post = cell.get_state_dict()
+            population.log_event(t, channel, cell.cell_id, {
+                "state_pre": state_pre,
+                "state_post": state_post,
+                **params,  # Include transition-specific params (e.g., j for ecdna)
+            })
     
     def _record_state(self, result: SimulationResult, t: float, population: CellPopulation):
         """Record current population state."""
@@ -376,6 +473,30 @@ class OgataThinningSimulator:
         result.ecdna_means.append(summary.get("ecdna_mean", 0))
         result.ecdna_stds.append(summary.get("ecdna_std", 0))
         result.state_compositions.append(summary)
+        # Record full ecDNA distribution for heterogeneity analysis
+        if population.cells:
+            ecdna_dist = np.array([c.total_ecdna() for c in population.cells])
+            result.ecdna_distributions.append(ecdna_dist)
+            
+            # Record per-cell fitness data for fitness landscape analysis
+            fitness_data = []
+            for cell in population.cells:
+                k_total = cell.total_ecdna()
+                div_rate = self.intensities.division_hazard(cell, t, k_total=k_total)
+                death_rate = self.intensities.death_hazard(cell, t, k_total=k_total)
+                fitness_data.append({
+                    'ecdna': k_total,
+                    'cycle': cell.c,
+                    'sen': cell.s,
+                    'expr': cell.x,
+                    'div_rate': div_rate,
+                    'death_rate': death_rate,
+                    'net_rate': div_rate - death_rate,
+                })
+            result.fitness_snapshots.append(fitness_data)
+        else:
+            result.ecdna_distributions.append(np.array([]))
+            result.fitness_snapshots.append([])
 
 
 def run_simulation(t_max: float = None, 

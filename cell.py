@@ -69,6 +69,15 @@ class Cell:
         """Total ecDNA copy number across all species."""
         return int(np.sum(self.k))
 
+    def get_state_dict(self) -> dict:
+        """Return complete cell state as a dictionary."""
+        return {
+            'e': self.e, 'c': self.c, 's': self.s, 'x': self.x,
+            'k': self.k.tolist(), 'a': self.a, 'y': self.y.tolist(),
+            'cell_id': self.cell_id, 'parent_id': self.parent_id
+        }
+
+
 
 class CellPopulation:
     """
