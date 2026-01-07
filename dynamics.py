@@ -155,32 +155,16 @@ class JumpIntensities:
     
     def sen_switch_rate(self, cell: Cell, s_new: int, t: float,
                         k_total: int = None) -> float:
-        """
-        Senescence switching rate q^sen_{s→s'}.
-        
-        ecDNA effect: Oncogene-induced senescence (OIS) via:
-        - DNA damage response (DDR) from replication stress
-        - p53/Rb pathway activation from oncogene overdose
-        - Telomere dysfunction from genomic instability
-        
-        High ecDNA burden accelerates entry into senescent state.
-        """
+        """Senescence switching rate q^sen_{s→s'}."""
         if (cell.s, s_new) not in cfg.SEN_RATES:
             return 0.0
         
         base_rate = cfg.SEN_RATES[(cell.s, s_new)]
         
-        # ecDNA-induced senescence (threshold + linear increase)
+        # ecDNA can accelerate senescence
         if k_total is None:
             k_total = cell.total_ecdna()
-        
-        # Below threshold: minimal effect; above threshold: accelerating effect
-        k_above_sen = max(0, k_total - cfg.ECDNA_SEN_THRESHOLD)
-        k_effect = 1.0 + cfg.ECDNA_SEN_COEFF * k_above_sen
-        
-        # MYC expression amplifies senescence induction (MYC-induced senescence)
-        if cell.x == 2:  # MYC program
-            k_effect *= 1.5
+        k_effect = 1.0 + 0.01 * k_total
         
         return cfg.Q_MAX_SEN * sigmoid(np.log(base_rate * k_effect)) 
     
@@ -294,13 +278,6 @@ class JumpIntensities:
         """
         Division hazard λ^div_i(a, y; u).
         Only G2M phase can divide.
-        
-        ecDNA effect: Inverted-U curve modeling benefit-cost tradeoff.
-        - Benefit: Saturating Hill function (oncogene amplification)
-        - Cost: Quadratic metabolic burden (resource consumption, replication stress)
-        
-        Net fitness = (1 + benefit(k)) * (1 - burden(k))
-        Peak fitness at k ≈ ECDNA_OPTIMAL_K
         """
         # Cycle-phase gating
         base_rate = cfg.DIV_HAZARD_BY_CYCLE.get(cell.c, 0.0)
@@ -317,24 +294,10 @@ class JumpIntensities:
         else:
             age_factor = 1.0
         
-        # ecDNA fitness effect: Inverted-U (benefit-cost tradeoff)
+        # ecDNA fitness effect
         if k_total is None:
             k_total = cell.total_ecdna()
-        
-        # Benefit: Hill function saturating at high copy number
-        # Models oncogene amplification benefit with diminishing returns
-        k_opt = cfg.ECDNA_OPTIMAL_K
-        hill_n = cfg.ECDNA_BENEFIT_HILL_N
-        benefit = cfg.ECDNA_BENEFIT_MAX * (k_total ** hill_n) / (k_opt ** hill_n + k_total ** hill_n)
-        
-        # Cost: Quadratic burden above threshold
-        # Models metabolic cost of replicating/maintaining large ecDNA load
-        k_above_threshold = max(0, k_total - cfg.ECDNA_BURDEN_THRESHOLD)
-        burden = cfg.ECDNA_BURDEN_COEFF * (k_above_threshold ** 2)
-        burden = min(burden, 0.95)  # Cap burden to avoid negative fitness
-        
-        # Net fitness effect (inverted-U)
-        k_effect = (1.0 + benefit) * (1.0 - burden)
+        k_effect = 1.0 + cfg.ECDNA_FITNESS_EFFECT * k_total
         
         # Drug modulation
         drug_mod = 1.0
@@ -348,36 +311,15 @@ class JumpIntensities:
         return cfg.LAMBDA_DIV_MAX * sigmoid(eta)
     
     def death_hazard(self, cell: Cell, t: float,
-                     drug_conc: Dict[str, float] = None,
-                     k_total: int = None) -> float:
+                     drug_conc: Dict[str, float] = None) -> float:
         """
         Death hazard λ^death_i(a, y; u).
-        
-        ecDNA toxicity: High copy number triggers apoptosis via:
-        - Oncogene overdose (e.g., MYC-induced apoptosis)
-        - Replication stress and DNA damage
-        - Mitotic catastrophe from segregation errors
         """
         # Base death rate
         base_rate = cfg.DEATH_HAZARD_BASE
         
         # Senescence increases death risk
         sen_mult = cfg.DEATH_HAZARD_SEN_MULT.get(cell.s, 1.0)
-        
-        # ecDNA toxicity effect (oncogene overdose → apoptosis)
-        if k_total is None:
-            k_total = cell.total_ecdna()
-        
-        # Toxicity kicks in above threshold with Hill-like steepness
-        k_above_tox = max(0, k_total - cfg.ECDNA_TOXICITY_THRESHOLD)
-        if k_above_tox > 0:
-            # Quadratic toxicity: risk increases sharply with excess copies
-            toxicity = cfg.ECDNA_TOXICITY_COEFF * (k_above_tox ** cfg.ECDNA_TOXICITY_HILL_N)
-            # MYC expression state amplifies toxicity (MYC paradox)
-            if cell.x == 2:  # MYC program
-                toxicity *= 2.0
-        else:
-            toxicity = 0.0
         
         # Drug modulation (senolytic targets senescent cells)
         drug_mod = 1.0
@@ -387,10 +329,7 @@ class JumpIntensities:
         if u > 0 and cell.s >= 1:  # senolytic targets pre-senescent and senescent
             drug_mod = drug_effect(u, cfg.DRUGS["senolytic"], "activate")
         
-        # Combined death rate
-        effective_rate = base_rate * sen_mult * drug_mod + toxicity
-        
-        eta = np.log(effective_rate + 1e-10)
+        eta = np.log(base_rate * sen_mult * drug_mod + 1e-10)
         return cfg.LAMBDA_DEATH_MAX * sigmoid(eta)
     
     

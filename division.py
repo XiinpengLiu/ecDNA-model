@@ -126,15 +126,9 @@ class DivisionKernel:
         """
         Apply post-segregation loss.
         K*_{rj} | K_{rj} ~ Binomial(K_{rj}, 1 - ℓ_{e,m,j})
-        
-        ecDNA effect: High copy number causes physical hindrance during mitosis,
-        leading to increased segregation errors and chromosome mis-segregation.
         Drug modulation: ecDNA_destabilizer activates loss
         """
         k_star = np.zeros(cfg.J_ECDNA, dtype=int)
-        
-        # Total ecDNA for segregation error calculation
-        total_k = np.sum(k)
         
         for j in range(cfg.J_ECDNA):
             loss_prob = cfg.LOSS_PROB_POST_SEG
@@ -143,14 +137,6 @@ class DivisionKernel:
             if cell.x in [3, 4]:
                 loss_prob *= 1.5
             
-            # ecDNA-induced segregation errors (physical hindrance at mitosis)
-            # High copy number causes chromosome bridges, lagging chromosomes
-            k_above_seg = max(0, total_k - cfg.ECDNA_SEGREGATION_ERROR_THRESHOLD)
-            if k_above_seg > 0:
-                # Additional loss probability scales with excess copies
-                seg_error_loss = cfg.ECDNA_SEGREGATION_ERROR_COEFF * k_above_seg
-                loss_prob += seg_error_loss
-            
             # Drug modulation: ecDNA_destabilizer activates loss (target: "loss")
             u = self._get_drug_conc("ecdna_destabilizer", t)
             if u > 0:
@@ -158,10 +144,7 @@ class DivisionKernel:
                 if "loss" in drug.targets:
                     # activation increases loss_prob
                     loss_mult = _drug_effect_hill(u, drug.emax, drug.ec50, drug.hill_n, drug.targets["loss"])
-                    loss_prob = loss_prob * loss_mult
-            
-            # Cap loss probability at 0.95 to avoid complete elimination
-            loss_prob = min(loss_prob, 0.95)
+                    loss_prob = min(1.0, loss_prob * loss_mult)
             
             # Each copy survives with probability (1 - loss_prob)
             k_star[j] = self.rng.binomial(k[j], 1.0 - loss_prob)
