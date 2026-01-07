@@ -252,7 +252,7 @@ class JumpIntensities:
         """ecDNA loss rate μ^loss_{e,m,j}(k,y,a;u) * k_j (per-copy loss)."""
         if not cfg.ENABLE_INTERDIV_ECDNA:
             return 0.0
-        if cell.k[j] == 0:
+        if cell.k[j] <= 1: # Prevent losing the last copy
             return 0.0
         
         # Per-copy loss rate times number of copies

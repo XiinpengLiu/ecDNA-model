@@ -94,13 +94,27 @@ class DivisionKernel:
         Random segregation with binomial distribution.
         K_{1j} | k̃_j ~ Binomial(k̃_j, 1/2)
         K_{2j} = k̃_j - K_{1j}
+        
+        Modified: Guarantee inheritance if possible (no 0 allocation if k_tilde >= 2).
         """
         k1 = np.zeros(cfg.J_ECDNA, dtype=int)
         k2 = np.zeros(cfg.J_ECDNA, dtype=int)
         
         for j in range(cfg.J_ECDNA):
-            k1[j] = self.rng.binomial(k_tilde[j], 0.5)
-            k2[j] = k_tilde[j] - k1[j]
+            # If we have at least 2 copies, ensure both daughters get at least 1
+            if k_tilde[j] >= 2:
+                # Rejection sampling to ensure no daughter receives 0 copies
+                while True:
+                    n1 = self.rng.binomial(k_tilde[j], 0.5)
+                    n2 = k_tilde[j] - n1
+                    if n1 > 0 and n2 > 0:
+                        k1[j] = n1
+                        k2[j] = n2
+                        break
+            else:
+                # If only 0 or 1 copy total, distribution is constrained
+                k1[j] = self.rng.binomial(k_tilde[j], 0.5)
+                k2[j] = k_tilde[j] - k1[j]
         
         return k1, k2
     
@@ -151,6 +165,10 @@ class DivisionKernel:
             
             # Each copy survives with probability (1 - loss_prob)
             k_star[j] = self.rng.binomial(k[j], 1.0 - loss_prob)
+
+            # FORCE SURVIVAL: If parent had copies but all were lost, keep at least 1
+            if k[j] > 0 and k_star[j] == 0:
+                k_star[j] = 1
         
         # Truncate to K_max
         k_star = np.clip(k_star, 0, cfg.K_MAX)
