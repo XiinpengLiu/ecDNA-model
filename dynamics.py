@@ -278,6 +278,10 @@ class JumpIntensities:
         """
         Division hazard λ^div_i(a, y; u).
         Only G2M phase can divide.
+        
+        ecDNA effect: Inverted-U (Gaussian) relationship
+        - Optimal ecDNA copy number maximizes division rate
+        - Too few or too many copies reduce division fitness
         """
         # Cycle-phase gating
         base_rate = cfg.DIV_HAZARD_BY_CYCLE.get(cell.c, 0.0)
@@ -294,10 +298,13 @@ class JumpIntensities:
         else:
             age_factor = 1.0
         
-        # ecDNA fitness effect
+        # ecDNA fitness effect: Inverted-U (Gaussian) function
+        # k_effect = baseline + (peak - baseline) * exp(-((k - k_opt) / sigma)^2)
         if k_total is None:
             k_total = cell.total_ecdna()
-        k_effect = 1.0 + cfg.ECDNA_FITNESS_EFFECT * k_total
+        deviation = (k_total - cfg.ECDNA_OPTIMAL_COPIES) / cfg.ECDNA_FITNESS_WIDTH
+        k_effect = cfg.ECDNA_FITNESS_BASELINE + \
+                   (cfg.ECDNA_FITNESS_PEAK - cfg.ECDNA_FITNESS_BASELINE) * np.exp(-deviation ** 2)
         
         # Drug modulation
         drug_mod = 1.0
@@ -311,15 +318,24 @@ class JumpIntensities:
         return cfg.LAMBDA_DIV_MAX * sigmoid(eta)
     
     def death_hazard(self, cell: Cell, t: float,
-                     drug_conc: Dict[str, float] = None) -> float:
+                     drug_conc: Dict[str, float] = None,
+                     k_total: int = None) -> float:
         """
         Death hazard λ^death_i(a, y; u).
+        
+        ecDNA effect: Linear relationship (higher ecDNA -> higher death risk)
+        This reflects genomic instability cost of carrying many ecDNA copies.
         """
         # Base death rate
         base_rate = cfg.DEATH_HAZARD_BASE
         
         # Senescence increases death risk
         sen_mult = cfg.DEATH_HAZARD_SEN_MULT.get(cell.s, 1.0)
+        
+        # ecDNA increases death risk (linear relationship)
+        if k_total is None:
+            k_total = cell.total_ecdna()
+        k_effect = 1.0 + cfg.ECDNA_DEATH_EFFECT * k_total
         
         # Drug modulation (senolytic targets senescent cells)
         drug_mod = 1.0
@@ -329,7 +345,7 @@ class JumpIntensities:
         if u > 0 and cell.s >= 1:  # senolytic targets pre-senescent and senescent
             drug_mod = drug_effect(u, cfg.DRUGS["senolytic"], "activate")
         
-        eta = np.log(base_rate * sen_mult * drug_mod + 1e-10)
+        eta = np.log(base_rate * sen_mult * k_effect * drug_mod + 1e-10)
         return cfg.LAMBDA_DEATH_MAX * sigmoid(eta)
     
     
@@ -359,7 +375,7 @@ class JumpIntensities:
         if div_rate > 0:
             channels.append(("division", {}, div_rate))
         
-        death_rate = self.death_hazard(cell, t, drug_conc=drug_conc)
+        death_rate = self.death_hazard(cell, t, drug_conc=drug_conc, k_total=k_total)
         if death_rate > 0:
             channels.append(("death", {}, death_rate))
         

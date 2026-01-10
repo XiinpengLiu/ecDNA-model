@@ -104,7 +104,7 @@ EXPR_RATES = {
 
 # Maximum hazard rates (for bounded sigmoid parameterization)
 LAMBDA_DIV_MAX = 0.5   # max division rate per unit time
-LAMBDA_DEATH_MAX = 0.2 # max death rate per unit time
+LAMBDA_DEATH_MAX = 2.0 # max death rate per unit time
 
 # Division hazard parameters (depends on cycle phase)
 # Only G2M phase can divide
@@ -116,7 +116,7 @@ DIV_HAZARD_BY_CYCLE = {
 }
 
 # Death hazard parameters (baseline + senescence effect)
-DEATH_HAZARD_BASE = 0.01
+DEATH_HAZARD_BASE = 0.1
 DEATH_HAZARD_SEN_MULT = {0: 1.0, 1: 1.5, 2: 3.0}  # senescence multiplier
 
 # Age-dependence for hazards (Gompertz-like or constant)
@@ -137,7 +137,14 @@ MU_GAIN_BASE = 0.001  # baseline gain rate per copy
 MU_LOSS_BASE = 0.002  # baseline loss rate per copy
 
 # ecDNA effect on fitness (optional)
-ECDNA_FITNESS_EFFECT = 0.01  # per-copy fitness advantage
+# Division: inverted-U (Gaussian) relationship with ecDNA
+ECDNA_OPTIMAL_COPIES = 10      # optimal ecDNA copy number for division (peak of inverted-U)
+ECDNA_FITNESS_WIDTH = 20       # width parameter (sigma) of the Gaussian curve
+ECDNA_FITNESS_PEAK = 1.5       # peak fitness multiplier at optimal ecDNA (>1 means enhanced division)
+ECDNA_FITNESS_BASELINE = 0.5   # baseline fitness when ecDNA=0 or very high
+
+# Death: linear relationship with ecDNA (higher ecDNA -> higher death risk)
+ECDNA_DEATH_EFFECT = 0.01      # per-copy death rate increase
 
 
 # 6. DIVISION KERNEL PARAMETERS
@@ -225,8 +232,9 @@ def sample_initial_state(rng):
     c = rng.choice([1, 2, 3], p=[0.5, 0.3, 0.2])  # mostly G1
     s = 0  # normal (not senescent)
     x = rng.choice([0, 1, 2], p=[0.7, 0.15, 0.15])  # mostly basal
-    k = rng.poisson(5, size=J_ECDNA)  # Poisson-distributed ecDNA
-    k = np.clip(k, 0, K_MAX)
+    #k = rng.poisson(5, size=J_ECDNA)  # Poisson-distributed ecDNA
+    #k = np.clip(k, 2, K_MAX)
+    k = rng.integers(20, K_MAX + 1, size=J_ECDNA)  # Uniform distribution [2, K_MAX]
     a = rng.exponential(5)  # age from last division
     y = rng.normal(0, 0.5, size=P_DIM)  # phenotype
     return e, c, s, x, k, a, y

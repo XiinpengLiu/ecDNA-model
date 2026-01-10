@@ -483,7 +483,7 @@ class OgataThinningSimulator:
             for cell in population.cells:
                 k_total = cell.total_ecdna()
                 div_rate = self.intensities.division_hazard(cell, t, k_total=k_total)
-                death_rate = self.intensities.death_hazard(cell, t, k_total=k_total)
+                death_rate = self.intensities.death_hazard(cell, t)
                 fitness_data.append({
                     'ecdna': k_total,
                     'cycle': cell.c,
@@ -504,6 +504,7 @@ def run_simulation(t_max: float = None,
                    drug_schedule: Dict = None,
                    env_schedule: callable = None,
                    seed: int = None,
+                   max_pop: int = None,
                    verbose: bool = True) -> SimulationResult:
     """
     Run a simulation with default or custom parameters.
@@ -514,6 +515,7 @@ def run_simulation(t_max: float = None,
         drug_schedule: Drug concentration functions
         env_schedule: Function E(t) -> int for deterministic environment switching
         seed: Random seed
+        max_pop: Maximum population size (termination condition)
         verbose: Print progress
         
     Returns:
@@ -531,5 +533,6 @@ def run_simulation(t_max: float = None,
     return sim.simulate(
         population=pop,
         t_max=t_max or cfg.T_MAX,
+        max_pop=max_pop,
         verbose=verbose
     )

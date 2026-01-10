@@ -39,6 +39,7 @@ def main():
     result = run_simulation(
         t_max=100.0,
         n_init=100,
+        max_pop=2000,
         seed=42,
         verbose=True
     )

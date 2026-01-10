@@ -751,10 +751,15 @@ def plot_fitness_landscape(result,
     death_rates = np.array([d['death_rate'] for d in all_data])
     net_rates = np.array([d['net_rate'] for d in all_data])
     cycles = np.array([d['cycle'] for d in all_data])
+    sen_states = np.array([d['sen'] for d in all_data])
     
     # Cell cycle colors
     cycle_names = ['G0', 'G1', 'S', 'G2/M']
     cycle_colors = ['#95A5A6', '#3498DB', '#27AE60', '#E74C3C']
+    
+    # Senescence state colors
+    sen_names = ['Normal', 'Pre-senescent', 'Senescent']
+    sen_colors = ['#2ECC71', '#F39C12', '#E74C3C']
     
     if rate_type == 'both':
         fig, axes = plt.subplots(2, 2, figsize=figsize)
@@ -767,9 +772,10 @@ def plot_fitness_landscape(result,
                 ax.scatter(ecdna[mask], div_rates[mask], c=cycle_colors[c], 
                           alpha=0.4, s=20, label=cycle_names[c], edgecolors='none')
         
-        # Add smoothed trend line
-        if len(ecdna) > 10:
-            _add_smooth_trend(ax, ecdna, div_rates, color=PALETTE['primary'])
+        # Add smoothed trend line for G2/M cells only (cycle == 3)
+        g2m_mask = cycles == 3
+        if np.sum(g2m_mask) > 10:
+            _add_smooth_trend(ax, ecdna[g2m_mask], div_rates[g2m_mask], color=PALETTE['primary'])
         
         ax.set_xlabel('ecDNA copy number')
         ax.set_ylabel('Division hazard rate')
@@ -777,13 +783,13 @@ def plot_fitness_landscape(result,
         ax.legend(loc='upper right', fontsize=8, title='Cell cycle')
         ax.yaxis.grid(True, alpha=0.3, linestyle='--')
         
-        # Panel B: Death rate vs ecDNA
+        # Panel B: Death rate vs ecDNA (colored by senescence state)
         ax = axes[0, 1]
-        for c in range(4):
-            mask = cycles == c
+        for s in range(3):
+            mask = sen_states == s
             if np.sum(mask) > 0:
-                ax.scatter(ecdna[mask], death_rates[mask], c=cycle_colors[c],
-                          alpha=0.4, s=20, label=cycle_names[c], edgecolors='none')
+                ax.scatter(ecdna[mask], death_rates[mask], c=sen_colors[s],
+                          alpha=0.4, s=20, label=sen_names[s], edgecolors='none')
         
         if len(ecdna) > 10:
             _add_smooth_trend(ax, ecdna, death_rates, color=PALETTE['secondary'])
@@ -791,7 +797,7 @@ def plot_fitness_landscape(result,
         ax.set_xlabel('ecDNA copy number')
         ax.set_ylabel('Death hazard rate')
         ax.set_title('B  Death rate vs ecDNA', loc='left', fontweight='bold')
-        ax.legend(loc='upper left', fontsize=8, title='Cell cycle')
+        ax.legend(loc='upper left', fontsize=8, title='Senescence')
         ax.yaxis.grid(True, alpha=0.3, linestyle='--')
         
         # Panel C: Net rate (division - death) vs ecDNA
@@ -802,8 +808,9 @@ def plot_fitness_landscape(result,
                 ax.scatter(ecdna[mask], net_rates[mask], c=cycle_colors[c],
                           alpha=0.4, s=20, label=cycle_names[c], edgecolors='none')
         
-        if len(ecdna) > 10:
-            _add_smooth_trend(ax, ecdna, net_rates, color=PALETTE['quinary'])
+        # Add smoothed trend line for G2/M cells only (cycle == 3)
+        if np.sum(g2m_mask) > 10:
+            _add_smooth_trend(ax, ecdna[g2m_mask], net_rates[g2m_mask], color=PALETTE['quinary'])
         
         ax.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
         ax.set_xlabel('ecDNA copy number')
@@ -814,10 +821,16 @@ def plot_fitness_landscape(result,
         
         # Panel D: 2D density / marginal histogram
         ax = axes[1, 1]
-        _plot_fitness_density(ax, ecdna, net_rates)
+        # Filter for G2/M cells only (cycle == 3)
+        if np.sum(g2m_mask) > 10:
+            _plot_fitness_density(ax, ecdna[g2m_mask], net_rates[g2m_mask])
+            ax.set_title('D  Fitness landscape density (G2/M)', loc='left', fontweight='bold')
+        else:
+            ax.text(0.5, 0.5, 'Insufficient G2/M data', ha='center', va='center')
+            ax.set_title('D  Fitness landscape density', loc='left', fontweight='bold')
+
         ax.set_xlabel('ecDNA copy number')
         ax.set_ylabel('Net growth rate')
-        ax.set_title('D  Fitness landscape density', loc='left', fontweight='bold')
         
     else:
         # Single panel for specified rate type
