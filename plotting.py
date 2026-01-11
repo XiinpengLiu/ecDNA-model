@@ -14,6 +14,7 @@ from matplotlib.collections import PolyCollection
 # Publication-quality style settings
 # ============================================================================
 
+
 def set_publication_style():
     """Set matplotlib style for publication-quality figures."""
     plt.rcParams.update({
@@ -1660,3 +1661,106 @@ def _build_lineage_chains(events, n_lineages, max_events):
             lineages.append(chain)
     
     return lineages
+
+
+# ============================================================================
+# Grouped Violin Plots by Cell State
+# ============================================================================
+
+def plot_grouped_ecdna_violin(cell_data, min_copy=0, title=None, figsize=(16, 8), save_path=None):
+    """
+    Plot grouped violin plot of ecDNA counts for (C, S, X) combinations.
+    
+    Args:
+        cell_data: List of dictionaries containing cell state data ('ecdna', 'cycle', 'sen', 'expr').
+                   Typically passed from result.fitness_snapshots[-1].
+        min_copy: Filter cells with ecDNA >= min_copy.
+        title: Plot title.
+        figsize: Figure size.
+        save_path: Path to save figure.
+    """
+    import pandas as pd
+    import config as cfg
+    
+    # 1. Prepare data
+    records = []
+    
+    # Pre-fetch names to avoid repeated dict lookups
+    c_names = cfg.CYCLE_NAMES
+    s_names = cfg.SEN_NAMES
+    x_names = cfg.EXPR_NAMES
+    
+    for d in cell_data:
+        k = d.get('ecdna', 0)
+        if k < min_copy:
+            continue
+            
+        c = d.get('cycle')
+        s = d.get('sen')
+        x = d.get('expr')
+        
+        c_name = c_names.get(c, str(c))
+        s_name = s_names.get(s, str(s))
+        x_name = x_names.get(x, str(x))
+        
+        # Create a combined group label
+        # Ordering preference: Cycle -> Senescence -> Expression
+        # Format: C
+        #         S
+        #         X
+        group_label = f"{c_name}\n{s_name}\n{x_name}"
+        
+        records.append({
+            'ecDNA': k,
+            'Group': group_label,
+            'SortKey': (c, s, x) # Tuple for sorting
+        })
+        
+    if not records:
+        print(f"No cells found with ecDNA >= {min_copy}")
+        return None
+        
+    df = pd.DataFrame(records)
+    
+    # Sort groups by the underlying state indices
+    df.sort_values('SortKey', inplace=True)
+    
+    # Get unique groups in order
+    unique_groups = df['Group'].unique()
+    
+    # 2. Plotting
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Prepare list of arrays for violinplot
+    data_to_plot = [df[df['Group'] == g]['ecDNA'].values for g in unique_groups]
+    
+    parts = ax.violinplot(data_to_plot, showmeans=False, showmedians=True, showextrema=False)
+    
+    # Customize violins
+    for pc in parts['bodies']:
+        pc.set_facecolor(PALETTE['primary'])
+        pc.set_edgecolor('black')
+        pc.set_alpha(0.7)
+        
+    if 'cmedians' in parts:
+        parts['cmedians'].set_color(PALETTE['secondary'])
+        
+    # Formatting
+    ax.set_xticks(np.arange(1, len(unique_groups) + 1))
+    ax.set_xticklabels(unique_groups, rotation=90, fontsize=8)
+    ax.set_ylabel('ecDNA Copy Number')
+    ax.grid(axis='y', alpha=0.3)
+    
+    if title:
+        ax.set_title(title)
+    else:
+        suffix = f" (>= {min_copy} copies)" if min_copy > 0 else ""
+        ax.set_title(f"ecDNA Distribution by Cell State{suffix}")
+        
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
+        
+    return fig
+

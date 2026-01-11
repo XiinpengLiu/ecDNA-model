@@ -18,7 +18,8 @@ from plotting import (
     plot_ecdna_distribution_evolution, plot_heterogeneity_metrics,
     plot_ecdna_positive_fraction, plot_lineage_tree,
     plot_muller_ecdna, plot_muller_comparison, plot_fitness_landscape,
-    plot_lineage_state_trajectory, plot_event_summary
+    plot_lineage_state_trajectory, plot_event_summary,
+    plot_grouped_ecdna_violin
 )
 
 
@@ -62,7 +63,7 @@ def main():
     
     # Plot and save
     plot_results(result, title="Untreated Simulation",  
-                 save_path=output_dir / "untreated_simulation.png")
+                 save_path=output_dir / "untreated_simulation.pdf")
     
     # Plot ecDNA distribution evolution (intratumoral heterogeneity)
     print("\n--- ecDNA Heterogeneity Analysis ---")
@@ -73,7 +74,7 @@ def main():
         mode='combined',
         n_time_points=8,
         title="ecDNA Copy Number Distribution Evolution",
-        save_path=output_dir / "ecdna_distribution_combined.png"
+        save_path=output_dir / "ecdna_distribution_combined.pdf"
     )
     
     # Ridge plot (alternative visualization)
@@ -82,14 +83,14 @@ def main():
         mode='ridge',
         n_time_points=10,
         title="ecDNA Distribution Evolution (Ridge Plot)",
-        save_path=output_dir / "ecdna_distribution_ridge.png"
+        save_path=output_dir / "ecdna_distribution_ridge.pdf"
     )
     
     # Heterogeneity metrics over time
     plot_heterogeneity_metrics(
         result,
         title="ecDNA Heterogeneity Metrics",
-        save_path=output_dir / "ecdna_heterogeneity_metrics.png"
+        save_path=output_dir / "ecdna_heterogeneity_metrics.pdf"
     )
     
     # ecDNA+ fraction and high-copy subpopulation over time
@@ -97,7 +98,7 @@ def main():
         result,
         threshold_high=20,
         title="ecDNA+ and High-Copy Subpopulation Dynamics",
-        save_path=output_dir / "ecdna_positive_fraction.png"
+        save_path=output_dir / "ecdna_positive_fraction.pdf"
     )
     
     # Alternative: use 95th percentile of initial distribution as threshold
@@ -105,7 +106,7 @@ def main():
         result,
         use_quantile=95,
         title="ecDNA+ and Extreme Subpopulation (95th percentile threshold)",
-        save_path=output_dir / "ecdna_positive_fraction_quantile.png"
+        save_path=output_dir / "ecdna_positive_fraction_quantile.pdf"
     )
     
     # Lineage tree showing ecDNA inheritance patterns
@@ -114,14 +115,14 @@ def main():
         n_lineages=4,
         max_depth=5,
         title="ecDNA Inheritance: Non-Mendelian Segregation",
-        save_path=output_dir / "ecdna_lineage_tree.png"
+        save_path=output_dir / "ecdna_lineage_tree.pdf"
     )
     
     # Muller plot showing clonal dynamics by ecDNA copy number
     plot_muller_ecdna(
         result,
         title="ecDNA Clonal Dynamics (Muller Plot)",
-        save_path=output_dir / "ecdna_muller_plot.png"
+        save_path=output_dir / "ecdna_muller_plot.pdf"
     )
     
     # Fitness landscape: ecDNA vs division/death rates
@@ -129,7 +130,7 @@ def main():
         result,
         rate_type='both',
         title="ecDNA-Fitness Landscape",
-        save_path=output_dir / "ecdna_fitness_landscape.png"
+        save_path=output_dir / "ecdna_fitness_landscape.pdf"
     )
     
     # Lineage state trajectory: trace how states evolve along lineages
@@ -138,16 +139,38 @@ def main():
         n_lineages=5,
         max_events=40,
         title="Lineage State Trajectories",
-        save_path=output_dir / "lineage_state_trajectory.png"
+        save_path=output_dir / "lineage_state_trajectory.pdf"
     )
     
     # Event summary: distribution of event types and rates
     plot_event_summary(
         result,
         title="Event Type Distribution and Dynamics",
-        save_path=output_dir / "event_summary.png"
+        save_path=output_dir / "event_summary.pdf"
     )
-    
+
+    # Grouped violin plots: ecDNA distribution by cell state
+    if result.fitness_snapshots:
+        # Plot 1: All cells
+        plot_grouped_ecdna_violin(
+            result.fitness_snapshots[-1], 
+            min_copy=0, 
+            title="ecDNA Distribution by Cell State (All Cells)",
+            save_path=output_dir / "grouped_violin_all.pdf"
+        )
+        
+        # Plot 2: High copy subpopulation (>= 90th percentile)
+        import numpy as np
+        all_ecdna_values = [d['ecdna'] for d in result.fitness_snapshots[-1]]
+        if all_ecdna_values:
+            p90 = np.percentile(all_ecdna_values, 90)
+            plot_grouped_ecdna_violin(
+                result.fitness_snapshots[-1], 
+                min_copy=p90, 
+                title=f"ecDNA Distribution by Cell State (High Copy >= {p90:.1f} [90%ile])",
+                save_path=output_dir / "grouped_violin_high_copy.pdf"
+            )
+
     # Example 2: Treatment Comparison
     # print("\n--- Example 2: Treatment Comparison ---")
     
@@ -172,7 +195,7 @@ def main():
     #     print(f"  Final ecDNA: {summary.get('final_ecdna_mean', 0):.2f} ± {summary.get('final_ecdna_std', 0):.2f}")
     
     # # Compare plots and save
-    # compare_treatments(results_dict, save_path=output_dir / "treatment_comparison.png")
+    # compare_treatments(results_dict, save_path=output_dir / "treatment_comparison.pdf")
     
     print("\n" + "=" * 60)
     print("Simulation complete!")
