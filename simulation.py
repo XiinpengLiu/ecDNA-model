@@ -54,9 +54,11 @@ class SimulationResult:
         # 3. Fitness Landscape Snapshots
         with open(dir_path / 'fitness_landscape.csv', 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['time', 'cell_index', 'ecdna', 'cycle', 'sen', 'expr', 'div_rate', 'death_rate', 'net_rate'])
+            writer.writerow(['time', 'cell_index', 'ecdna', 'cycle', 'sen', 'expr', 'div_rate', 'death_rate', 'net_rate', 'y'])
             for t, snapshot in zip(self.times, self.fitness_snapshots):
                 for idx, cell_data in enumerate(snapshot):
+                    y_val = cell_data.get('y', [])
+                    y_str = json.dumps(y_val) if isinstance(y_val, list) else str(y_val)
                     writer.writerow([
                         t, idx, 
                         cell_data.get('ecdna'), 
@@ -65,7 +67,8 @@ class SimulationResult:
                         cell_data.get('expr'),
                         cell_data.get('div_rate'),
                         cell_data.get('death_rate'),
-                        cell_data.get('net_rate')
+                        cell_data.get('net_rate'),
+                        y_str
                     ])
 
         # 4. Events Log (Detailed with pre/post states)
@@ -145,7 +148,8 @@ class OgataThinningSimulator:
     # Ogata Thinning for Single Cell
     
     
-    def sample_next_event(self, cell: Cell, t_start: float, t_max: float) -> Tuple[Optional[float], Optional[str], Optional[dict]]:
+    def sample_next_event(self, cell: Cell, t_start: float, t_max: float
+                          ) -> Tuple[Optional[float], Optional[str], Optional[dict], Optional[dict]]:
         """
         Sample next event time and type for a single cell using Ogata thinning.
         
@@ -158,7 +162,7 @@ class OgataThinningSimulator:
             t_max: Maximum time horizon
         
         Returns:
-            (event_time, channel_type, params) or (None, None, None) if no event before t_max
+            (event_time, channel_type, params, flow_state) or (None, None, None, None)
         """
         current_t = t_start
         temp_cell = cell.copy()  # work on copy for flow propagation
@@ -170,10 +174,10 @@ class OgataThinningSimulator:
             
             if candidate_t >= t_max:
                 # No event before t_max
-                return None, None, None
+                return None, None, None, None
             
             # Step 3: Propagate temp_cell along deterministic flow
-            apply_flow(temp_cell, delta)
+            apply_flow(temp_cell, delta, rng=self.rng)
             
             # Step 4: Evaluate true intensity
             channels, total_rate = self.intensities.compute_all_rates(temp_cell, candidate_t)
@@ -188,12 +192,13 @@ class OgataThinningSimulator:
                     channel_idx = self.rng.choice(len(channels), p=np.array(rates) / total_rate)
                     channel_type, params, _ = channels[channel_idx]
                     
-                    return candidate_t, channel_type, params
+                    flow_state = {"a": temp_cell.a, "y": temp_cell.y.copy()}
+                    return candidate_t, channel_type, params, flow_state
             
             # Rejected, continue from candidate_t
             current_t = candidate_t
         
-        return None, None, None
+        return None, None, None, None
 
 
     # Population Simulation with Lazy Flow
@@ -255,19 +260,19 @@ class OgataThinningSimulator:
         if verbose:
             print(f"Starting simulation: {population.size()} cells, t_max={t_max}")
         
-        # Prepare event heap: (event_time, cell_id, channel, params, version)
-        event_heap: List[Tuple[float, int, str, dict, int]] = []
+        # Prepare event heap: (event_time, cell_id, channel, params, version, flow_state)
+        event_heap: List[Tuple[float, int, str, dict, int, dict]] = []
         cell_versions: Dict[int, int] = {}
         cell_lookup: Dict[int, Cell] = {cell.cell_id: cell for cell in population.cells}
         
         def schedule_cell_event(cell: Cell, from_time: float):
             """Schedule next event for a cell starting from from_time."""
             cell_id = cell.cell_id
-            event_t, channel, params = self.sample_next_event(cell, from_time, t_max)
+            event_t, channel, params, flow_state = self.sample_next_event(cell, from_time, t_max)
             version = cell_versions.get(cell_id, 0) + 1
             cell_versions[cell_id] = version
             if event_t is not None:
-                heapq.heappush(event_heap, (event_t, cell_id, channel, params, version))
+                heapq.heappush(event_heap, (event_t, cell_id, channel, params, version, flow_state))
         
         def resample_all_events(from_time: float):
             """Resample events for all cells from given time."""
@@ -293,9 +298,10 @@ class OgataThinningSimulator:
             next_cell = None
             next_channel = None
             next_params = None
+            next_flow_state = None
             
             while event_heap:
-                event_t, cell_id, channel, params, version = heapq.heappop(event_heap)
+                event_t, cell_id, channel, params, version, flow_state = heapq.heappop(event_heap)
                 if cell_versions.get(cell_id) != version:
                     continue  # Stale event, skip
                 cell = cell_lookup.get(cell_id)
@@ -305,6 +311,7 @@ class OgataThinningSimulator:
                 next_cell = cell
                 next_channel = channel
                 next_params = params
+                next_flow_state = flow_state
                 break
             
             if next_cell is None:
@@ -312,10 +319,10 @@ class OgataThinningSimulator:
                 next_event_t = t_max
             
             # Handle record times before the next event
-            env_changed = False
+            resample_needed = False
             while next_record <= min(next_event_t, t_max):
                 # Synchronize all cells to record time (lazy update)
-                batch_lazy_apply_flow(population.cells, next_record)
+                batch_lazy_apply_flow(population.cells, next_record, rng=self.rng)
                 
                 # Update environment at record time
                 if self.env_schedule is not None:
@@ -324,7 +331,6 @@ class OgataThinningSimulator:
                         for cell in population.cells:
                             cell.e = e_new
                         last_env = e_new
-                        env_changed = True
                 
                 # Update logical time
                 t = next_record
@@ -332,13 +338,11 @@ class OgataThinningSimulator:
                 # Record state
                 self._record_state(result, next_record, population)
                 next_record += record_interval
-                
-                if env_changed:
-                    # Environment changed: resample all events from current time
-                    resample_all_events(t)
-                    break
+                resample_needed = True
+                break
             
-            if env_changed:
+            if resample_needed:
+                resample_all_events(t)
                 continue  # Restart loop with new events
             
             if next_cell is None:
@@ -347,9 +351,15 @@ class OgataThinningSimulator:
             
             # Process the event
             # Only update the cell that has the event (lazy flow)
-            lazy_apply_flow(next_cell, next_event_t)
+            if next_flow_state is not None:
+                next_cell.a = next_flow_state["a"]
+                next_cell.y = next_flow_state["y"]
+                next_cell.last_update_time = next_event_t
+            else:
+                lazy_apply_flow(next_cell, next_event_t, rng=self.rng)
             
             # Update environment at event time if needed
+            env_changed = False
             if self.env_schedule is not None:
                 e_new = self.env_schedule(next_event_t)
                 if e_new != last_env:
@@ -406,7 +416,7 @@ class OgataThinningSimulator:
         
         # Final recording if not already at a record time
         if result.times and result.times[-1] < t:
-            batch_lazy_apply_flow(population.cells, t)
+            batch_lazy_apply_flow(population.cells, t, rng=self.rng)
             self._record_state(result, t, population)
         
         # Copy events to result for lineage analysis
@@ -492,6 +502,7 @@ class OgataThinningSimulator:
                     'div_rate': div_rate,
                     'death_rate': death_rate,
                     'net_rate': div_rate - death_rate,
+                    'y': cell.y.tolist() if hasattr(cell.y, 'tolist') else list(cell.y)
                 })
             result.fitness_snapshots.append(fitness_data)
         else:

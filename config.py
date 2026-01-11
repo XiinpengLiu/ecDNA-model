@@ -20,9 +20,9 @@ CYCLE_NAMES = {0: "G0", 1: "G1", 2: "S", 3: "G2M"}
 SEN_STATES = [0, 1, 2]
 SEN_NAMES = {0: "normal", 1: "pre-sen", 2: "senescent"}
 
-# Expression program X ∈ {0: basal, 1: EMT, 2: MYC, 3: stress, 4: persister}
-EXPR_STATES = [0, 1, 2, 3, 4]
-EXPR_NAMES = {0: "basal", 1: "EMT", 2: "MYC", 3: "stress", 4: "persister"}
+# Expression program X {0: basal, 1: MYC, 2: TP53, 3: MYC_TP53}
+EXPR_STATES = [0, 1, 2, 3]
+EXPR_NAMES = {0: "basal", 1: "MYC", 2: "TP53", 3: "MYC_TP53"}
 
 # Number of ecDNA species
 J_ECDNA = 1
@@ -32,6 +32,13 @@ K_MAX = np.array([100])  # shape: (J,)
 
 # Phenomic state dimension P
 P_DIM = 2
+# Phenotype axes
+Y_DDR_IDX = 0
+Y_SURV_IDX = 1
+
+# Expression program groups
+MYC_STATES = (1, 3)
+TP53_INACTIVE_STATES = (2, 3)
 
 
 # 2. PHENOMIC DYNAMICS (OU Process Parameters)
@@ -40,27 +47,48 @@ P_DIM = 2
 # Attractor μ_{e,m} for each (env, cycle, sen, expr) combination
 # Shape: (n_env, n_cycle, n_sen, n_expr, P)
 # Simplified: use default attractors based on expression program
-def get_mu(e, c, s, x):
+MU_DDR_BASE = 0.0
+MU_SURV_BASE = 0.0
+MU_DDR_BY_CYCLE = np.array([0.0, 0.1, 0.3, 0.2])
+MU_DDR_BY_SEN = np.array([0.0, 0.2, 0.5])
+MU_DDR_BY_EXPR = np.array([0.0, 0.6, 0.1, 0.7])
+MU_DDR_BY_ENV = np.array([0.0, 0.3])
+MU_DDR_K_LOG = 0.09
+
+MU_SURV_BY_EXPR = np.array([0.0, 0.1, 0.6, 0.7])
+MU_SURV_BY_SEN = np.array([0.0, 0.2, 0.4])
+MU_SURV_BY_ENV = np.array([0.0, -0.2])
+
+def get_mu(e, c, s, x, k_total=0):
     """State-dependent phenomic attractor."""
-    base = np.array([0.0, 0.0])
-    # Expression program shifts attractor
-    expr_shift = {
-        0: np.array([0.0, 0.0]),    # basal
-        1: np.array([1.0, -0.5]),   # EMT
-        2: np.array([0.5, 1.0]),    # MYC
-        3: np.array([-0.5, 0.5]),   # stress
-        4: np.array([-1.0, -1.0]),  # persister
-    }
-    # Senescence shifts
-    sen_shift = {0: 0.0, 1: 0.2, 2: 0.5}
-    return base + expr_shift[x] + np.array([sen_shift[s], 0])
+    mu_ddr = (
+        MU_DDR_BASE
+        + MU_DDR_BY_CYCLE[c]
+        + MU_DDR_BY_SEN[s]
+        + MU_DDR_BY_EXPR[x]
+        + MU_DDR_K_LOG * np.log1p(k_total)
+        + MU_DDR_BY_ENV[e]
+    )
+    mu_surv = (
+        MU_SURV_BASE
+        + MU_SURV_BY_EXPR[x]
+        - MU_SURV_BY_SEN[s]
+        + MU_SURV_BY_ENV[e]
+    )
+    return np.array([mu_ddr, mu_surv])
 
 # Mean-reversion matrix B_{e,m} (relaxation rate)
 # For simplicity, use scalar * identity (isotropic relaxation)
-B_RELAX_RATE = 0.5  # eigenvalue magnitude
+B_RELAX_RATE = 0.7  # eigenvalue magnitude
 def get_B(e, c, s, x):
     """State-dependent relaxation matrix."""
     return B_RELAX_RATE * np.eye(P_DIM)
+
+# Diffusion strength (diagonal)
+SIGMA_DIFFUSION = np.array([0.25, 0.2])
+def get_Sigma(e, c, s, x):
+    """State-dependent diffusion (diagonal)."""
+    return SIGMA_DIFFUSION
 
 
 # 3. CTMC SWITCHING RATES (Baseline, without drug)
@@ -88,14 +116,10 @@ SEN_RATES = {
 
 # Expression program switch rates (sparse, biology-constrained)
 EXPR_RATES = {
-    (0, 1): 0.01,  # basal -> EMT
-    (0, 2): 0.02,  # basal -> MYC
-    (0, 3): 0.005, # basal -> stress
-    (1, 0): 0.01,  # EMT -> basal
-    (2, 0): 0.015, # MYC -> basal
-    (3, 0): 0.02,  # stress -> basal
-    (3, 4): 0.01,  # stress -> persister
-    (4, 3): 0.005, # persister -> stress
+    (0, 1): 0.02,  # basal -> MYC
+    (0, 2): 0.02,  # basal -> TP53
+    (1, 3): 0.01,  # MYC -> MYC_TP53
+    (2, 3): 0.01,  # TP53 -> MYC_TP53
 }
 
 
@@ -104,7 +128,7 @@ EXPR_RATES = {
 
 # Maximum hazard rates (for bounded sigmoid parameterization)
 LAMBDA_DIV_MAX = 0.5   # max division rate per unit time
-LAMBDA_DEATH_MAX = 2.0 # max death rate per unit time
+LAMBDA_DEATH_MAX = 0.3 # max death rate per unit time
 
 # Division hazard parameters (depends on cycle phase)
 # Only G2M phase can divide
@@ -117,10 +141,15 @@ DIV_HAZARD_BY_CYCLE = {
 
 # Death hazard parameters (baseline + senescence effect)
 DEATH_HAZARD_BASE = 0.1
-DEATH_HAZARD_SEN_MULT = {0: 1.0, 1: 1.5, 2: 3.0}  # senescence multiplier
+DEATH_HAZARD_SEN_MULT = {0: 1.0, 1: 1.5, 2: 5.0}  # senescence multiplier
+DEATH_BETA_DDR_BY_EXPR = np.array([0.5, 0.7, 0.2, 0.3])
+DEATH_BETA_SURV = 0.5
+
+# Senescence DDR effect
+SEN_DDR_EFFECT = 0.2
 
 # Age-dependence for hazards (Gompertz-like or constant)
-USE_AGE_DEPENDENT_HAZARD = True
+USE_AGE_DEPENDENT_HAZARD = False
 AGE_HAZARD_SCALE = 0.1  # how strongly age affects hazard
 
 
@@ -130,11 +159,24 @@ AGE_HAZARD_SCALE = 0.1  # how strongly age affects hazard
 # Inter-division gain/loss (optional, can be disabled)
 ENABLE_INTERDIV_ECDNA = True
 
-# Gain rate (per unit time)
-MU_GAIN_BASE = 0.001  # baseline gain rate per copy
+# Bounded gain/loss rates (per unit time)
+MU_GAIN_MAX = 0.12
+MU_LOSS_MAX = 0.2
 
-# Loss rate (per copy, per unit time)
-MU_LOSS_BASE = 0.002  # baseline loss rate per copy
+# Gain rate logits
+GAIN_ETA_BASE = -2.0
+GAIN_ETA_K = 0.3
+GAIN_ETA_MYC = 0.6
+GAIN_ETA_DDR_HUMP = 2.6
+DDR_HUMP_THETA1 = 0.0
+DDR_HUMP_THETA2 = 1.1
+DDR_HUMP_WIDTH = 0.4
+
+# Loss rate logits
+LOSS_ETA_BASE = -1.5
+LOSS_ETA_K = 0.3
+LOSS_ETA_DDR = 0.9
+LOSS_ETA_SURV = 0.4
 
 # ecDNA effect on fitness (optional)
 # Division: inverted-U (Gaussian) relationship with ecDNA
@@ -231,10 +273,10 @@ def sample_initial_state(rng):
     e = 0  # baseline environment
     c = rng.choice([1, 2, 3], p=[0.5, 0.3, 0.2])  # mostly G1
     s = 0  # normal (not senescent)
-    x = rng.choice([0, 1, 2], p=[0.7, 0.15, 0.15])  # mostly basal
+    x = rng.choice([0, 1, 2, 3], p=[0.7, 0.15, 0.1, 0.05])  # mostly basal
     #k = rng.poisson(5, size=J_ECDNA)  # Poisson-distributed ecDNA
     #k = np.clip(k, 2, K_MAX)
-    k = rng.integers(20, K_MAX + 1, size=J_ECDNA)  # Uniform distribution [2, K_MAX]
+    k = rng.integers(20, 101, size=J_ECDNA)  # Uniform distribution [2, K_MAX]
     a = rng.exponential(5)  # age from last division
     y = rng.normal(0, 0.5, size=P_DIM)  # phenotype
     return e, c, s, x, k, a, y

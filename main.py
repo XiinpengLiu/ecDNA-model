@@ -19,7 +19,8 @@ from plotting import (
     plot_ecdna_positive_fraction, plot_lineage_tree,
     plot_muller_ecdna, plot_muller_comparison, plot_fitness_landscape,
     plot_lineage_state_trajectory, plot_event_summary,
-    plot_grouped_ecdna_violin
+    plot_grouped_ecdna_violin, plot_phenotype_evolution,
+    plot_state_ecdna_enrichment
 )
 
 
@@ -170,6 +171,20 @@ def main():
                 title=f"ecDNA Distribution by Cell State (High Copy >= {p90:.1f} [90%ile])",
                 save_path=output_dir / "grouped_violin_high_copy.pdf"
             )
+
+    # plot continuous phenotype evolution
+    plot_phenotype_evolution(
+        result,
+        title="Continuous Phenotype Evolution (Y)",
+        save_path=output_dir / "phenotype_evolution.pdf"
+    )
+
+    # State-ecDNA enrichment heatmap (Odds Ratio analysis)
+    plot_state_ecdna_enrichment(
+        result,
+        title="State-ecDNA Enrichment (log₂ OR)",
+        save_path=output_dir / "state_ecdna_enrichment.pdf"
+    )
 
     # Example 2: Treatment Comparison
     # print("\n--- Example 2: Treatment Comparison ---")

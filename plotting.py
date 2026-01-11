@@ -1378,7 +1378,7 @@ def plot_lineage_state_trajectory(result,
     # State labels
     cycle_labels = ['G0', 'G1', 'S', 'G2/M']
     sen_labels = ['Normal', 'Pre-sen', 'Senescent']
-    expr_labels = ['Basal', 'Activated']
+    expr_labels = [cfg.EXPR_NAMES[i] for i in cfg.EXPR_STATES]
     
     # Colors for different lineages
     lineage_colors = plt.cm.tab10(np.linspace(0, 1, min(n_lineages, 10)))
@@ -1764,3 +1764,377 @@ def plot_grouped_ecdna_violin(cell_data, min_copy=0, title=None, figsize=(16, 8)
         
     return fig
 
+
+# ============================================================================
+# Phenotype Space Visualization
+# ============================================================================
+
+def plot_phenotype_evolution(result, title="Phenotype Space Evolution (Y)", save_path=None, figsize=(16, 12)):
+    """
+    Visualize the evolution of continuous phenotype Y = (y1, y2).
+    
+    Generates a multi-panel figure:
+    A. Time evolution of population mean Y1 and Y2.
+    B. Scatter plot of Y1 vs Y2 at initial time (t=0).
+    C. Scatter plot of Y1 vs Y2 at intermediate time.
+    D. Scatter plot of Y1 vs Y2 at final time (colored by ecDNA).
+    
+    Args:
+        result: SimulationResult containing fitness_snapshots with 'y' data.
+        title: Figure title.
+        save_path: Path to save the figure.
+        figsize: Figure size.
+    """
+    import matplotlib.cm as cm
+    
+    # Check if 'y' data exists
+    if not result.fitness_snapshots or not result.fitness_snapshots[-1]:
+        print("No fitness/phenotype data available.")
+        return None
+        
+    sample_cell = result.fitness_snapshots[-1][0]
+    if 'y' not in sample_cell:
+        print("Phenotype 'y' not recorded in simulation results. Update simulation to record 'y'.")
+        return None
+        
+    # Data extraction
+    times = np.array(result.times)
+    n_points = len(times)
+    
+    # Calculate means over time
+    mean_y1 = []
+    mean_y2 = []
+    
+    for snapshot in result.fitness_snapshots:
+        if not snapshot:
+            mean_y1.append(np.nan)
+            mean_y2.append(np.nan)
+            continue
+            
+        ys = np.array([d['y'] for d in snapshot]) # shape (N, P)
+        if ys.size > 0 and ys.ndim == 2 and ys.shape[1] >= 2:
+            mean_y1.append(np.mean(ys[:, 0]))
+            mean_y2.append(np.mean(ys[:, 1]))
+        else:
+            mean_y1.append(np.nan)
+            mean_y2.append(np.nan)
+            
+    # Setup figure
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(2, 3)
+    
+    # Ax1: Time evolution (spanning top row)
+    ax1 = fig.add_subplot(gs[0, :])
+    ax1.plot(times, mean_y1, label='Mean Y1', color=PALETTE['tertiary'], linewidth=2)
+    ax1.plot(times, mean_y2, label='Mean Y2', color=PALETTE['secondary'], linewidth=2)
+    ax1.set_xlabel('Time')
+    ax1.set_ylabel('Mean Phenotype Value')
+    ax1.set_title('A  Evolution of Mean Phenotype', loc='left', fontweight='bold')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Helper to plot scatter snapshot
+    def plot_snapshot(ax, snapshot_idx, panel_label, label_suffix=""):
+        if snapshot_idx >= n_points:
+            return
+            
+        snapshot = result.fitness_snapshots[snapshot_idx]
+        if not snapshot:
+            return
+            
+        ys = np.array([d['y'] for d in snapshot])
+        ecdnas = np.array([d['ecdna'] for d in snapshot])
+        
+        if ys.size == 0:
+            return
+            
+        # Scatter plot colored by ecDNA
+        sc = ax.scatter(ys[:, 0], ys[:, 1], c=ecdnas, cmap='viridis', 
+                       alpha=0.6, s=20, edgecolors='none')
+        
+        ax.set_xlabel('Y1')
+        ax.set_ylabel('Y2')
+        t_val = times[snapshot_idx]
+        ax.set_title(f'{panel_label}  Phenotype Space (t={t_val:.1f}){label_suffix}', loc='left', fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        return sc
+    
+    # Ax2: Initial state
+    ax2 = fig.add_subplot(gs[1, 0])
+    plot_snapshot(ax2, 0, 'B', " (Initial)")
+    
+    # Ax3: Middle state
+    mid_idx = n_points // 2
+    ax3 = fig.add_subplot(gs[1, 1])
+    plot_snapshot(ax3, mid_idx, 'C', " (Mid)")
+    
+    # Ax4: Final state
+    ax4 = fig.add_subplot(gs[1, 2])
+    sc = plot_snapshot(ax4, -1, 'D', " (Final)")
+    
+    # Colorbar
+    if sc:
+        cbar = plt.colorbar(sc, ax=ax4)
+        cbar.set_label('ecDNA Copy Number')
+        
+    plt.suptitle(title, fontsize=16, fontweight='bold', y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
+        
+    return fig
+
+
+# ============================================================================
+# State-ecDNA Enrichment Heatmap (Odds Ratio Analysis)
+# ============================================================================
+
+def plot_state_ecdna_enrichment(result, time_indices=None, n_bins=10, 
+                                 winsorize_range=(-4, 4), min_n_state=5,
+                                 title="State-ecDNA Enrichment Heatmap",
+                                 save_path=None, figsize=(14, 10)):
+    """
+    绘制状态-ecDNA富集热图，显示各离散状态(C,S,X)在不同ecDNA档位中的富集/耗竭情况。
+    
+    颜色意义:
+    - 红色 (log2(OR) > 0): 该状态在该ecDNA档位富集
+    - 蓝色 (log2(OR) < 0): 该状态在该ecDNA档位耗竭
+    - 白色 (log2(OR) ≈ 0): 无显著偏好
+    
+    ecDNA分箱: Bin 1 = 0拷贝; Bin 2-10 = 正值按1/9分位切分(9档)
+    
+    Args:
+        result: SimulationResult对象
+        time_indices: 要绘制的时间点索引列表，None则自动选择
+        n_bins: ecDNA分箱数（默认10档：0单独一档 + 正值9分位档）
+        winsorize_range: log2(OR)颜色显示范围，超出部分饱和
+        min_n_state: 状态最少细胞数阈值，低于此数标记为低可靠性
+        title: 图标题
+        save_path: 保存路径
+        figsize: 图大小
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import config as cfg
+    from scipy.stats import fisher_exact, chi2_contingency
+    from statsmodels.stats.multitest import multipletests
+    
+    if not result.fitness_snapshots:
+        print("No fitness_snapshots data available.")
+        return None
+    
+    # 自动选择时间点
+    n_total = len(result.fitness_snapshots)
+    if time_indices is None:
+        time_indices = [n_total // 4, n_total // 2, 3 * n_total // 4, n_total - 1]
+        time_indices = sorted(set(max(0, min(i, n_total - 1)) for i in time_indices))
+    
+    # 先收集所有时间点的状态集合，确保多面板行一致
+    all_states = set()
+    for t_idx in time_indices:
+        snapshot = result.fitness_snapshots[t_idx]
+        if snapshot:
+            for d in snapshot:
+                c, s, x = int(d['cycle']), int(d['sen']), int(d['expr'])
+                all_states.add((c, s, x))
+    
+    all_states = sorted(all_states, key=lambda x: (x[0], x[1], x[2]))
+    state_to_idx = {st: i for i, st in enumerate(all_states)}
+    
+    n_panels = len(time_indices)
+    ncols = min(2, n_panels)
+    nrows = (n_panels + 1) // 2
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+    
+    im = None
+    for panel_idx, t_idx in enumerate(time_indices):
+        ax = axes[panel_idx // ncols, panel_idx % ncols]
+        snapshot = result.fitness_snapshots[t_idx]
+        if not snapshot:
+            ax.set_visible(False)
+            continue
+        
+        # 提取数据（类型安全）
+        states = []
+        ecdnas = []
+        for d in snapshot:
+            try:
+                c, s, x = int(d['cycle']), int(d['sen']), int(d['expr'])
+                ecdna = float(d['ecdna'])
+                states.append((c, s, x))
+                ecdnas.append(ecdna)
+            except (KeyError, ValueError, TypeError):
+                continue
+        
+        if not states:
+            ax.set_visible(False)
+            continue
+        
+        ecdnas = np.array(ecdnas)
+        N = len(ecdnas)
+        
+        # ecDNA分箱
+        bin_labels = _compute_ecdna_bins(ecdnas, n_bins)
+        
+        # 构建列联表 O[m, b] - 使用字典映射，O(N)复杂度
+        O = np.zeros((len(all_states), n_bins), dtype=int)
+        for st, b in zip(states, bin_labels):
+            m_idx = state_to_idx[st]
+            O[m_idx, b - 1] += 1
+        
+        n_m = O.sum(axis=1)
+        N_b = O.sum(axis=0)
+        
+        # 计算log2(OR)和p值
+        log2_or = np.zeros_like(O, dtype=float)
+        pvals = np.ones_like(O, dtype=float)
+        
+        for m_idx in range(len(all_states)):
+            for b_idx in range(n_bins):
+                # 原始整数计数（用于p值计算）
+                a_int = int(O[m_idx, b_idx])
+                b_int = int(n_m[m_idx] - a_int)
+                c_int = int(N_b[b_idx] - a_int)
+                d_int = int(N - n_m[m_idx] - N_b[b_idx] + a_int)
+                
+                # OR计算：用Haldane-Anscombe校正（浮点数）
+                a, b_prime, c, d = float(a_int), float(b_int), float(c_int), float(d_int)
+                if a == 0 or b_prime == 0 or c == 0 or d == 0:
+                    a += 0.5
+                    b_prime += 0.5
+                    c += 0.5
+                    d += 0.5
+                
+                OR = (a * d) / (b_prime * c) if (b_prime * c) > 0 else 1.0
+                log2_or[m_idx, b_idx] = np.log2(OR) if OR > 0 else 0
+                
+                # p值计算：用原始整数（允许0）
+                table = np.array([[a_int, b_int], 
+                                 [c_int, d_int]], dtype=int)
+                
+                # 跳过全0行或全0列
+                if table.sum() == 0 or table[0].sum() == 0 or table[1].sum() == 0:
+                    pvals[m_idx, b_idx] = 1.0
+                    continue
+                
+                try:
+                    # 统一用chi-square（更快且稳定）
+                    chi2, p, dof, expected = chi2_contingency(table, correction=True)
+                    pvals[m_idx, b_idx] = p
+                    
+                    # 可选：期望频数太小时用Fisher（但可能很慢）
+                    # if expected.min() < 5 and N < 1000:
+                    #     _, p = fisher_exact(table)
+                    #     pvals[m_idx, b_idx] = p
+                except (ValueError, ZeroDivisionError):
+                    pvals[m_idx, b_idx] = 1.0
+                except (ValueError, ZeroDivisionError):
+                    pvals[m_idx, b_idx] = 1.0
+        
+        # BH-FDR校正
+        pvals_flat = pvals.flatten()
+        _, pvals_adj, _, _ = multipletests(pvals_flat, method='fdr_bh')
+        pvals_adj = pvals_adj.reshape(pvals.shape)
+        
+        # Winsorize
+        log2_or_clipped = np.clip(log2_or, winsorize_range[0], winsorize_range[1])
+        
+        # 热图
+        im = ax.imshow(log2_or_clipped, aspect='auto', cmap='RdBu_r',
+                      vmin=winsorize_range[0], vmax=winsorize_range[1])
+        
+        # 显著性标记（只在期望频数合理时标记）
+        for m_idx in range(len(all_states)):
+            for b_idx in range(n_bins):
+                # 检查该格子是否有足够样本
+                a_int = int(O[m_idx, b_idx])
+                expected = (n_m[m_idx] * N_b[b_idx]) / N if N > 0 else 0
+                
+                # 只标记统计可靠的格子
+                if expected < 1:  # 期望频数太小，不标记
+                    continue
+                
+                color = 'white' if abs(log2_or_clipped[m_idx, b_idx]) > 2 else 'black'
+                if pvals_adj[m_idx, b_idx] < 0.05:
+                    ax.text(b_idx, m_idx, '●', ha='center', va='center', fontsize=5, color=color)
+                elif pvals_adj[m_idx, b_idx] < 0.1:
+                    ax.text(b_idx, m_idx, '○', ha='center', va='center', fontsize=5, color=color)
+        
+        # Y轴标签
+        state_labels = [f"{cfg.CYCLE_NAMES[c]}|{cfg.SEN_NAMES[s]}|{cfg.EXPR_NAMES[x]}" 
+                       for c, s, x in all_states]
+        ax.set_yticks(range(len(all_states)))
+        ax.set_yticklabels(state_labels, fontsize=6)
+        
+        # 标记低N状态（整行变浅灰+斜体）
+        for m_idx, nm in enumerate(n_m):
+            if nm < min_n_state:
+                ax.get_yticklabels()[m_idx].set_alpha(0.4)
+                ax.get_yticklabels()[m_idx].set_fontstyle('italic')
+                # 添加浅灰背景
+                ax.axhspan(m_idx - 0.5, m_idx + 0.5, facecolor='gray', alpha=0.1, zorder=0)
+        
+        # X轴
+        ax.set_xticks(range(n_bins))
+        ax.set_xticklabels([f'{i+1}' for i in range(n_bins)], fontsize=8)
+        ax.set_xlabel('ecDNA Bin (1=0, 2-10=quantiles)', fontsize=8)
+        
+        t_val = result.times[t_idx] if t_idx < len(result.times) else t_idx
+        ax.set_title(f't={t_val:.1f} (N={N})', fontsize=10)
+        
+        # 频数条
+        ax_bar = ax.inset_axes([1.02, 0, 0.08, 1])
+        ax_bar.barh(range(len(n_m)), n_m, color='steelblue', height=0.7)
+        ax_bar.set_ylim(-0.5, len(n_m) - 0.5)
+        ax_bar.set_yticks([])
+        ax_bar.set_xlabel('n', fontsize=6)
+        ax_bar.invert_yaxis()
+        ax_bar.tick_params(axis='x', labelsize=5)
+    
+    # 隐藏多余子图
+    for i in range(n_panels, nrows * ncols):
+        axes[i // ncols, i % ncols].set_visible(False)
+    
+    # 色标
+    if im is not None:
+        cbar = fig.colorbar(im, ax=axes, shrink=0.6, pad=0.12)
+        cbar.set_label('log₂(OR): red=enriched, blue=depleted', fontsize=9)
+    
+    fig.suptitle(title, fontsize=13, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 0.88, 0.95])
+    
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight', dpi=300)
+    
+    return fig
+
+
+def _compute_ecdna_bins(ecdnas, n_bins=10):
+    """
+    ecDNA分箱: Bin 1 = 0拷贝; Bin 2-n = 正值按1/9分位切分(9档)
+    
+    对于n_bins=10:
+    - Bin 1: ecDNA = 0
+    - Bin 2-10: 正值部分按等概率切成9档(nonile分位)
+    
+    Args:
+        ecdnas: ecDNA拷贝数数组
+        n_bins: 总分箱数，默认10
+    
+    Returns:
+        bin_labels: 每个细胞的bin标签(1到n_bins)
+    """
+    import numpy as np
+    
+    bin_labels = np.ones(len(ecdnas), dtype=int)
+    pos_mask = ecdnas > 0
+    
+    if pos_mask.sum() > 0:
+        # 正值部分切成(n_bins-1)档
+        # linspace生成n_bins个点(0,100)，取中间n_bins-2个作为切点
+        quantiles = np.percentile(ecdnas[pos_mask], np.linspace(0, 100, n_bins)[1:-1])
+        bin_labels[pos_mask] = np.digitize(ecdnas[pos_mask], quantiles) + 2
+        bin_labels[pos_mask] = np.clip(bin_labels[pos_mask], 2, n_bins)
+    
+    return bin_labels

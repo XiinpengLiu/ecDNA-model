@@ -57,7 +57,7 @@ class DivisionKernel:
         lambda_amp = cfg.AMP_LAMBDA_PER_COPY * k_j
         
         # MYC expression increases amplification
-        if cell.x == 2:
+        if cell.x in cfg.MYC_STATES:
             lambda_amp *= 1.5
         
         # Drug modulation: ecDNA_destabilizer inhibits amplification (target: "amp")
@@ -133,8 +133,8 @@ class DivisionKernel:
         for j in range(cfg.J_ECDNA):
             loss_prob = cfg.LOSS_PROB_POST_SEG
             
-            # Stress/persister states may have higher loss
-            if cell.x in [3, 4]:
+            # TP53-inactive states may have higher loss
+            if cell.x in cfg.TP53_INACTIVE_STATES:
                 loss_prob *= 1.5
             
             # Drug modulation: ecDNA_destabilizer activates loss (target: "loss")
@@ -198,11 +198,12 @@ class DivisionKernel:
             if x != 0:
                 x = 0 if self.rng.random() < 0.7 else x
             else:
-                x = self.rng.choice([0, 1, 2], p=[0.8, 0.1, 0.1])
+                x = self.rng.choice([0, 1, 2, 3], p=[0.8, 0.08, 0.08, 0.04])
         
         return x
     
-    def sample_daughter_phenotype(self, parent_cell: Cell, m_daughter: Tuple[int, int, int]) -> np.ndarray:
+    def sample_daughter_phenotype(self, parent_cell: Cell, m_daughter: Tuple[int, int, int],
+                                  k_daughter: np.ndarray) -> np.ndarray:
         """
         Sample daughter phenotype.
         Y_r ~ H^{(e)}(· | m_r, k_r, y; u)
@@ -215,7 +216,7 @@ class DivisionKernel:
         y_daughter = parent_cell.y + self.rng.normal(0, cfg.DAUGHTER_Y_NOISE_STD, size=cfg.P_DIM)
         
         # Small pull toward new state's attractor
-        mu_new = cfg.get_mu(parent_cell.e, c, s, x)
+        mu_new = cfg.get_mu(parent_cell.e, c, s, x, int(np.sum(k_daughter)))
         y_daughter = 0.9 * y_daughter + 0.1 * mu_new
         
         return y_daughter
@@ -253,7 +254,7 @@ class DivisionKernel:
             x_r = self.sample_daughter_expression(parent, k_r)
             
             # Sample phenotype
-            y_r = self.sample_daughter_phenotype(parent, (c_r, s_r, x_r))
+            y_r = self.sample_daughter_phenotype(parent, (c_r, s_r, x_r), k_r)
             
             # Create daughter cell (age reset to 0)
             daughter = Cell(

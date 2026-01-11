@@ -5,14 +5,13 @@ Implements the flow (φ), jump intensities (λ), and transition kernel (Q).
 
 import numpy as np
 from numba import jit
-from scipy.linalg import expm
 from typing import Tuple, Dict, List
 from cell import Cell
 import config as cfg
 
 
 
-#Deterministic Flow Between Events
+# Flow Between Events
 
 
 def flow_age(a: float, delta: float) -> float:
@@ -23,44 +22,66 @@ def flow_age(a: float, delta: float) -> float:
     return a + delta
 
 
-def flow_phenotype(y: np.ndarray, e: int, c: int, s: int, x: int, delta: float) -> np.ndarray:
+def flow_phenotype(y: np.ndarray, e: int, c: int, s: int, x: int,
+                   k_total: int, delta: float, rng: np.random.Generator = None) -> np.ndarray:
     """
-    Phenomic dynamics (OU mean-reversion ODE):
-    dY/dt = -B_{e,m}(Y - μ_{e,m})
-    
-    Closed-form solution:
-    Y(t+Δ) = μ_{e,m} + exp(-B_{e,m}·Δ)·(Y(t) - μ_{e,m})
+    Phenomic dynamics (OU with diffusion):
+    dY = -B_{e,m}(Y - mu_{e,m}) dt + Sigma_{e,m} dW
     """
-    mu = cfg.get_mu(e, c, s, x)
+    if delta <= 0:
+        return y
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    mu = cfg.get_mu(e, c, s, x, k_total)
     B = cfg.get_B(e, c, s, x)
+    Sigma = cfg.get_Sigma(e, c, s, x)
 
-    # Fast path: B is scalar * I (current default), use closed-form scaling.
+    # Extract per-dimension relaxation rates.
     if np.isscalar(B):
-        scale = np.exp(-B * delta)
-        return mu + scale * (y - mu)
-    if isinstance(B, np.ndarray) and B.ndim == 2 and B.shape[0] == B.shape[1]:
+        beta = np.full(cfg.P_DIM, float(B))
+    elif isinstance(B, np.ndarray) and B.ndim == 2 and B.shape[0] == B.shape[1]:
         b0 = B[0, 0]
-        if np.all(B == np.eye(B.shape[0]) * b0):
-            scale = np.exp(-b0 * delta)
-            return mu + scale * (y - mu)
+        if np.allclose(B, np.eye(B.shape[0]) * b0):
+            beta = np.full(B.shape[0], float(b0))
+        else:
+            beta = np.diagonal(B).copy()
+    else:
+        beta = np.full(cfg.P_DIM, cfg.B_RELAX_RATE)
 
-    # Fallback: matrix exponential for general B
-    exp_neg_B_delta = expm(-B * delta)
-    return mu + exp_neg_B_delta @ (y - mu)
+    # Extract per-dimension diffusion.
+    if np.isscalar(Sigma):
+        sigma = np.full(cfg.P_DIM, float(Sigma))
+    elif isinstance(Sigma, np.ndarray) and Sigma.ndim == 1:
+        sigma = Sigma.copy()
+    elif isinstance(Sigma, np.ndarray) and Sigma.ndim == 2:
+        sigma = np.diagonal(Sigma).copy()
+    else:
+        sigma = np.zeros(cfg.P_DIM)
+
+    beta_safe = np.maximum(beta, 1e-12)
+    exp_term = np.exp(-beta_safe * delta)
+    mean = mu + exp_term * (y - mu)
+    var = (sigma ** 2) / (2.0 * beta_safe) * (1.0 - np.exp(-2.0 * beta_safe * delta))
+    var = np.maximum(var, 0.0)
+    noise = rng.normal(0.0, 1.0, size=mu.shape) * np.sqrt(var)
+    return mean + noise
 
 
-def apply_flow(cell: Cell, delta: float) -> None:
+def apply_flow(cell: Cell, delta: float, rng: np.random.Generator = None) -> None:
     """
-    Apply deterministic PDMP flow φ(z, Δ) to cell in-place.
+    Apply PDMP flow φ(z, Δ) to cell in-place.
     Updates age and phenotype; (E, M, K) remain constant.
     """
     cell.a = flow_age(cell.a, delta)
-    cell.y = flow_phenotype(cell.y, cell.e, cell.c, cell.s, cell.x, delta)
+    k_total = cell.total_ecdna()
+    cell.y = flow_phenotype(cell.y, cell.e, cell.c, cell.s, cell.x, k_total, delta, rng=rng)
 
 
-def lazy_apply_flow(cell: Cell, target_time: float) -> None:
+def lazy_apply_flow(cell: Cell, target_time: float, rng: np.random.Generator = None) -> None:
     """
-    Lazily apply deterministic PDMP flow to cell in-place.
+    Lazily apply PDMP flow to cell in-place.
     Only applies flow if target_time > cell.last_update_time.
     Updates cell.last_update_time after applying flow.
     
@@ -70,11 +91,11 @@ def lazy_apply_flow(cell: Cell, target_time: float) -> None:
     """
     delta = target_time - cell.last_update_time
     if delta > 1e-12:  # Only apply if meaningful time has passed
-        apply_flow(cell, delta)
+        apply_flow(cell, delta, rng=rng)
         cell.last_update_time = target_time
 
 
-def batch_lazy_apply_flow(cells: list, target_time: float) -> None:
+def batch_lazy_apply_flow(cells: list, target_time: float, rng: np.random.Generator = None) -> None:
     """
     Lazily apply flow to all cells, advancing each to target_time.
     Used at record times when all cell states must be synchronized.
@@ -84,7 +105,7 @@ def batch_lazy_apply_flow(cells: list, target_time: float) -> None:
         target_time: Target time to advance all cells to
     """
     for cell in cells:
-        lazy_apply_flow(cell, target_time)
+        lazy_apply_flow(cell, target_time, rng=rng)
 
 
 
@@ -100,6 +121,12 @@ def sigmoid(x: float) -> float:
     elif x > 500.0:
         x = 500.0
     return 1.0 / (1.0 + np.exp(-x))
+
+
+def ddr_hump(y_ddr: float) -> float:
+    """Bounded hump for DDR-driven gain."""
+    width = max(cfg.DDR_HUMP_WIDTH, 1e-6)
+    return sigmoid((y_ddr - cfg.DDR_HUMP_THETA1) / width) - sigmoid((y_ddr - cfg.DDR_HUMP_THETA2) / width)
 
 
 def drug_effect(u: float, drug: cfg.DrugParams, effect_type: str) -> float:
@@ -165,8 +192,9 @@ class JumpIntensities:
         if k_total is None:
             k_total = cell.total_ecdna()
         k_effect = 1.0 + 0.01 * k_total
-        
-        return cfg.Q_MAX_SEN * sigmoid(np.log(base_rate * k_effect)) 
+        y_ddr = cell.y[cfg.Y_DDR_IDX]
+        eta = np.log(base_rate * k_effect + 1e-10) + cfg.SEN_DDR_EFFECT * y_ddr
+        return cfg.Q_MAX_SEN * sigmoid(eta) 
     
     def expr_switch_rate(self, cell: Cell, x_new: int, t: float) -> float:
         """Expression program switching rate q^expr_{x→x'}."""
@@ -215,21 +243,25 @@ class JumpIntensities:
         if not cfg.ENABLE_INTERDIV_ECDNA:
             return 0.0
         
-        # Base rate proportional to existing copy number
-        base_rate = cfg.MU_GAIN_BASE * (1 + cell.k[j])
+        y_ddr = cell.y[cfg.Y_DDR_IDX]
+        k_j = cell.k[j]
+        myc_flag = 1.0 if cell.x in cfg.MYC_STATES else 0.0
+        eta = (
+            cfg.GAIN_ETA_BASE
+            + cfg.GAIN_ETA_K * np.log1p(k_j)
+            + cfg.GAIN_ETA_MYC * myc_flag
+            + cfg.GAIN_ETA_DDR_HUMP * ddr_hump(y_ddr)
+        )
         
-        # MYC expression promotes gain
-        if cell.x == 2:  # MYC program
-            base_rate *= 1.5
-        
-        # Drug modulation
+        # Drug modulation (logit shift, bounded by MU_GAIN_MAX)
         if drug_conc is None:
             drug_conc = self.get_drug_conc(t)
         u = drug_conc.get("ecdna_destabilizer", 0.0)
         if u > 0:
-            base_rate *= drug_effect(u, cfg.DRUGS["ecdna_destabilizer"], "inhibit")
+            mod = drug_effect(u, cfg.DRUGS["ecdna_destabilizer"], "inhibit")
+            eta += np.log(max(mod, 1e-12))
         
-        return base_rate
+        return cfg.MU_GAIN_MAX * sigmoid(eta)
     
     def ecdna_loss_rate(self, cell: Cell, j: int, t: float,
                         drug_conc: Dict[str, float] = None) -> float:
@@ -239,17 +271,25 @@ class JumpIntensities:
         if cell.k[j] <= 1: # Prevent losing the last copy
             return 0.0
         
-        # Per-copy loss rate times number of copies
-        base_rate = cfg.MU_LOSS_BASE * cell.k[j]
+        y_ddr = cell.y[cfg.Y_DDR_IDX]
+        y_surv = cell.y[cfg.Y_SURV_IDX]
+        k_j = cell.k[j]
+        eta = (
+            cfg.LOSS_ETA_BASE
+            + cfg.LOSS_ETA_K * np.log1p(k_j)
+            + cfg.LOSS_ETA_DDR * y_ddr
+            - cfg.LOSS_ETA_SURV * y_surv
+        )
         
-        # Drug modulation
+        # Drug modulation (logit shift, bounded by MU_LOSS_MAX)
         if drug_conc is None:
             drug_conc = self.get_drug_conc(t)
         u = drug_conc.get("ecdna_destabilizer", 0.0)
         if u > 0:
-            base_rate *= drug_effect(u, cfg.DRUGS["ecdna_destabilizer"], "activate")
+            mod = drug_effect(u, cfg.DRUGS["ecdna_destabilizer"], "activate")
+            eta += np.log(max(mod, 1e-12))
         
-        return base_rate
+        return cfg.MU_LOSS_MAX * sigmoid(eta)
     
     def all_ecdna_rates(self, cell: Cell, t: float,
                         drug_conc: Dict[str, float] = None) -> List[Tuple[str, dict, float]]:
@@ -345,7 +385,14 @@ class JumpIntensities:
         if u > 0 and cell.s >= 1:  # senolytic targets pre-senescent and senescent
             drug_mod = drug_effect(u, cfg.DRUGS["senolytic"], "activate")
         
-        eta = np.log(base_rate * sen_mult * k_effect * drug_mod + 1e-10)
+        y_ddr = cell.y[cfg.Y_DDR_IDX]
+        y_surv = cell.y[cfg.Y_SURV_IDX]
+        beta_ddr = cfg.DEATH_BETA_DDR_BY_EXPR[cell.x]
+        eta = (
+            np.log(base_rate * sen_mult * k_effect * drug_mod + 1e-10)
+            + beta_ddr * y_ddr
+            - cfg.DEATH_BETA_SURV * y_surv
+        )
         return cfg.LAMBDA_DEATH_MAX * sigmoid(eta)
     
     
@@ -397,8 +444,8 @@ class JumpIntensities:
         # ecDNA channels
         if cfg.ENABLE_INTERDIV_ECDNA:
             for j in range(cfg.J_ECDNA):
-                bound += cfg.MU_GAIN_BASE * (1 + cfg.K_MAX[j]) * 2  # gain
-                bound += cfg.MU_LOSS_BASE * cfg.K_MAX[j] * 2       # loss
+                bound += cfg.MU_GAIN_MAX  # gain
+                bound += cfg.MU_LOSS_MAX  # loss
         
         # Terminal events
         bound += cfg.LAMBDA_DIV_MAX
