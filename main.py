@@ -20,7 +20,7 @@ from plotting import (
     plot_muller_ecdna, plot_muller_comparison, plot_fitness_landscape,
     plot_lineage_state_trajectory, plot_event_summary,
     plot_grouped_ecdna_violin, plot_phenotype_evolution,
-    plot_state_ecdna_enrichment
+    plot_state_ecdna_enrichment, plot_ogata_thinning_diagnostics
 )
 
 
@@ -182,8 +182,15 @@ def main():
     # State-ecDNA enrichment heatmap (Odds Ratio analysis)
     plot_state_ecdna_enrichment(
         result,
-        title="State-ecDNA Enrichment (log₂ OR)",
+        title="State-ecDNA Enrichment (log2(OR))",
         save_path=output_dir / "state_ecdna_enrichment.pdf"
+    )
+
+    # Ogata thinning diagnostics
+    plot_ogata_thinning_diagnostics(
+        result,
+        title="Ogata Thinning Diagnostics",
+        save_path=output_dir / "ogata_thinning_diagnostics.pdf"
     )
 
     # Example 2: Treatment Comparison

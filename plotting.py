@@ -4,10 +4,11 @@ Plotting utilities for ecDNA Copy-Number Kinetics Model.
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.colors import LinearSegmentedColormap, to_rgb
 from scipy import stats
 import matplotlib.patches as mpatches
 from matplotlib.collections import PolyCollection
+import config as cfg
 
 
 # ============================================================================
@@ -18,8 +19,8 @@ from matplotlib.collections import PolyCollection
 def set_publication_style():
     """Set matplotlib style for publication-quality figures."""
     plt.rcParams.update({
-        'font.family': 'sans-serif',
-        'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans'],
+        'font.family': 'serif',
+        'font.serif': ['Times New Roman', 'STIXGeneral', 'DejaVu Serif'],
         'font.size': 10,
         'axes.titlesize': 12,
         'axes.labelsize': 11,
@@ -28,36 +29,60 @@ def set_publication_style():
         'legend.fontsize': 9,
         'figure.dpi': 150,
         'savefig.dpi': 300,
-        'axes.linewidth': 1.0,
+        'axes.linewidth': 0.9,
         'axes.spines.top': False,
         'axes.spines.right': False,
-        'xtick.major.width': 1.0,
-        'ytick.major.width': 1.0,
+        'axes.grid': True,
+        'grid.color': '#D8D8D8',
+        'grid.linestyle': '--',
+        'grid.linewidth': 0.6,
+        'grid.alpha': 0.7,
+        'figure.facecolor': 'white',
+        'axes.facecolor': 'white',
+        'legend.frameon': False,
+        'xtick.direction': 'out',
+        'ytick.direction': 'out',
+        'xtick.major.width': 0.8,
+        'ytick.major.width': 0.8,
         'xtick.major.size': 4,
         'ytick.major.size': 4,
+        'axes.prop_cycle': plt.cycler(color=[
+            PALETTE['tertiary'],
+            PALETTE['secondary'],
+            PALETTE['quaternary'],
+            PALETTE['quinary'],
+            PALETTE['primary'],
+        ]),
     })
 
 
-# Nature/Cell-inspired color palette
+# Harmonized, paper-style color palette
 PALETTE = {
-    'primary': '#2C3E50',      # Dark blue-gray
-    'secondary': '#E74C3C',    # Coral red
-    'tertiary': '#3498DB',     # Sky blue
-    'quaternary': '#27AE60',   # Emerald green
-    'quinary': '#9B59B6',      # Purple
-    'light_gray': '#ECF0F1',
-    'dark_gray': '#7F8C8D',
-    'gradient': ['#3498DB', '#9B59B6', '#E74C3C', '#F39C12', '#E74C3C'],  # Blue to red
+    'primary': '#1F2D3A',      # Deep slate
+    'secondary': '#B5544D',    # Muted red
+    'tertiary': '#4C84B5',     # Steel blue
+    'quaternary': '#3A7D6B',   # Teal green
+    'quinary': '#C28E4F',      # Warm amber
+    'light_gray': '#F2F2F2',
+    'dark_gray': '#6B6B6B',
+    'gradient': ['#4C84B5', '#7FA8C7', '#A9B9A7', '#C28E4F', '#B5544D'],
 }
 
-# Quantile colors - harmonious gradient from cool to warm
+# Quantile colors - muted, paper-style ramp
 QUANTILE_COLORS = {
-    50: '#3498DB',   # Blue - median
-    75: '#27AE60',   # Green
-    90: '#F39C12',   # Orange
-    95: '#E74C3C',   # Coral red
-    99: '#8E44AD',   # Deep purple
+    50: '#4C84B5',   # Blue - median
+    75: '#3A7D6B',   # Teal
+    90: '#C28E4F',   # Amber
+    95: '#B5544D',   # Muted red
+    99: '#7A4F4F',   # Deep brown-red
 }
+
+# Colormap choices
+SEQUENTIAL_CMAP = 'cividis'
+DIVERGING_CMAP = LinearSegmentedColormap.from_list(
+    'paper_diverging',
+    ['#3A6EA5', '#F2F2F2', '#B5544D']
+)
 
 
 # ============================================================================
@@ -170,6 +195,7 @@ def _draw_violin_panel(ax, times, distributions):
     
     # Prepare data for violin plot
     positions = np.arange(n_times)
+    max_copy = max((np.max(d) for d in distributions if len(d) > 0), default=0)
     
     # Draw violins manually for better control
     for i, (t, dist) in enumerate(zip(times, distributions)):
@@ -200,6 +226,15 @@ def _draw_violin_panel(ax, times, distributions):
             # Fallback: simple box representation
             ax.boxplot([dist], positions=[positions[i]], widths=0.6,
                       patch_artist=True, boxprops=dict(facecolor=colors[i], alpha=0.7))
+
+        # Highlight the two highest values
+        top_n = min(2, len(dist))
+        top_vals = np.sort(dist)[-top_n:]
+        if top_n == 1:
+            x_positions = [positions[i]]
+        else:
+            x_positions = [positions[i] - 0.08, positions[i] + 0.08]
+        ax.scatter(x_positions, top_vals, color='black', s=18, zorder=7)
     
     # Styling
     ax.set_xticks(positions)
@@ -210,6 +245,9 @@ def _draw_violin_panel(ax, times, distributions):
     # Add subtle grid
     ax.yaxis.grid(True, alpha=0.3, linestyle='--')
     ax.set_axisbelow(True)
+    if max_copy > 0:
+        y_pad = max(1.0, max_copy * 0.05)
+        ax.set_ylim(0, max_copy + y_pad)
 
 
 def _draw_ecdf_panel(ax, times, distributions):
@@ -256,7 +294,7 @@ def _draw_quantile_trajectory_panel(ax, result):
     
     # Plot quantile bands (shaded regions between quantiles)
     quantile_pairs = [(50, 75), (75, 90), (90, 95), (95, 99)]
-    fill_colors = ['#E8F4FD', '#D4EDDA', '#FFF3CD', '#F8D7DA']
+    fill_colors = ['#E6EEF5', '#E3EEE9', '#F1E9DD', '#F2E3E0']
     fill_alphas = [0.6, 0.5, 0.4, 0.3]
     
     for (q_low, q_high), color, alpha in zip(quantile_pairs, fill_colors, fill_alphas):
@@ -386,6 +424,7 @@ def plot_heterogeneity_metrics(result,
     gini_values = []
     tail_fractions = {90: [], 95: [], 99: []}
     entropy_values = []
+    initial_percentiles = None
     
     for i, dist in enumerate(result.ecdna_distributions):
         if len(dist) < 2:
@@ -402,10 +441,11 @@ def plot_heterogeneity_metrics(result,
         gini_values.append(gini)
         
         # Tail fractions (cells above percentile thresholds of initial distribution)
-        if i == 0:
+        is_initial = initial_percentiles is None
+        if is_initial:
             initial_percentiles = {q: np.percentile(dist, q) for q in [90, 95, 99]}
         for q in [90, 95, 99]:
-            if i == 0:
+            if is_initial:
                 tail_fractions[q].append(1 - q/100)
             else:
                 frac = np.mean(dist > initial_percentiles.get(q, np.percentile(dist, q)))
@@ -415,6 +455,11 @@ def plot_heterogeneity_metrics(result,
         entropy = _compute_entropy(dist)
         entropy_values.append(entropy)
     
+    if not valid_times:
+        print("Warning: No valid distributions for heterogeneity metrics.")
+        plt.close(fig)
+        return None
+
     valid_times = np.array(valid_times)
     
     # Panel A: CV over time
@@ -438,9 +483,15 @@ def plot_heterogeneity_metrics(result,
     
     # Panel C: Tail fractions
     ax = axes[1, 0]
-    for q, color in [(90, PALETTE['quaternary']), (95, PALETTE['secondary']), (99, PALETTE['quinary'])]:
-        ax.plot(valid_times, tail_fractions[q], linewidth=2, 
-                label=f'>{q}th initial percentile', color=color)
+    tail_lines = [
+        (99, PALETTE['quinary'], 1),
+        (90, PALETTE['quaternary'], 2),
+        (95, PALETTE['secondary'], 3),
+    ]
+    for q, color, zorder in tail_lines:
+        lw = 2.4 if q == 95 else 2.0
+        ax.plot(valid_times, tail_fractions[q], linewidth=lw,
+                label=f'>{q}th initial percentile', color=color, zorder=zorder)
     ax.set_xlabel('Time')
     ax.set_ylabel('Fraction of cells')
     ax.set_title('C  Tail expansion', loc='left', fontweight='bold')
@@ -554,13 +605,7 @@ def plot_muller_ecdna(result,
     fig, ax = plt.subplots(figsize=figsize)
     
     # Muller-style color palette (cool to warm gradient)
-    colors = [
-        '#4575B4',  # Blue - no ecDNA
-        '#91BFDB',  # Light blue
-        '#FEE090',  # Light yellow
-        '#FC8D59',  # Orange
-        '#D73027',  # Red - high ecDNA
-    ]
+    colors = PALETTE['gradient']
     
     # Prepare data for stackplot
     y_data = [bin_fractions[label] for label in bin_labels]
@@ -631,7 +676,7 @@ def plot_muller_comparison(results_dict,
         bin_labels = ['0', '1-5', '6-10', '11-20', '>20']
     
     # Colors
-    colors = ['#4575B4', '#91BFDB', '#FEE090', '#FC8D59', '#D73027']
+    colors = PALETTE['gradient']
     
     # Create subplots
     fig, axes = plt.subplots(1, n_conditions, figsize=figsize, sharey=True)
@@ -756,11 +801,11 @@ def plot_fitness_landscape(result,
     
     # Cell cycle colors
     cycle_names = ['G0', 'G1', 'S', 'G2/M']
-    cycle_colors = ['#95A5A6', '#3498DB', '#27AE60', '#E74C3C']
+    cycle_colors = [PALETTE['light_gray'], PALETTE['tertiary'], PALETTE['quaternary'], PALETTE['secondary']]
     
     # Senescence state colors
     sen_names = ['Normal', 'Pre-senescent', 'Senescent']
-    sen_colors = ['#2ECC71', '#F39C12', '#E74C3C']
+    sen_colors = [PALETTE['quaternary'], PALETTE['quinary'], PALETTE['secondary']]
     
     if rate_type == 'both':
         fig, axes = plt.subplots(2, 2, figsize=figsize)
@@ -938,7 +983,7 @@ def _plot_fitness_density(ax, ecdna, net_rates):
         Z = kde(np.vstack([X.ravel(), Y.ravel()])).reshape(X.shape)
         
         # Plot density
-        ax.contourf(X, Y, Z, levels=15, cmap='YlOrRd', alpha=0.8)
+        ax.contourf(X, Y, Z, levels=15, cmap=SEQUENTIAL_CMAP, alpha=0.8)
         ax.contour(X, Y, Z, levels=5, colors='white', linewidths=0.5, alpha=0.5)
         
         # Add zero line
@@ -1064,7 +1109,7 @@ def plot_lineage_tree(result,
     axes = axes.flatten()
     
     # Color map
-    cmap = plt.cm.RdYlBu_r  # Red (high) - Yellow - Blue (low)
+    cmap = DIVERGING_CMAP
     
     def draw_tree(ax, tree, x_center=0.5, x_width=1.0, y=1.0, y_step=0.15):
         """Recursively draw tree on axes."""
@@ -1381,7 +1426,7 @@ def plot_lineage_state_trajectory(result,
     expr_labels = [cfg.EXPR_NAMES[i] for i in cfg.EXPR_STATES]
     
     # Colors for different lineages
-    lineage_colors = plt.cm.tab10(np.linspace(0, 1, min(n_lineages, 10)))
+    lineage_colors = plt.cm.Set3(np.linspace(0, 1, min(n_lineages, 10)))
     
     for i, (lineage, color) in enumerate(zip(lineages, lineage_colors)):
         times = [e['time'] for e in lineage]
@@ -1475,9 +1520,9 @@ def plot_event_summary(result,
         'death': PALETTE['secondary'],
         'cycle': PALETTE['tertiary'],
         'sen': PALETTE['quinary'],
-        'expr': '#F39C12',
-        'ecdna_gain': '#2ECC71',
-        'ecdna_loss': '#E74C3C',
+        'expr': PALETTE['quinary'],
+        'ecdna_gain': PALETTE['quaternary'],
+        'ecdna_loss': PALETTE['secondary'],
     }
     
     # Collect event times by type
@@ -1713,7 +1758,8 @@ def plot_grouped_ecdna_violin(cell_data, min_copy=0, title=None, figsize=(16, 8)
         records.append({
             'ecDNA': k,
             'Group': group_label,
-            'SortKey': (c, s, x) # Tuple for sorting
+            'SortKey': (c, s, x), # Tuple for sorting
+            'CycleIdx': c
         })
         
     if not records:
@@ -1727,6 +1773,33 @@ def plot_grouped_ecdna_violin(cell_data, min_copy=0, title=None, figsize=(16, 8)
     
     # Get unique groups in order
     unique_groups = df['Group'].unique()
+
+    group_cycle_map = (df.drop_duplicates('Group')[['Group', 'CycleIdx']]
+                       .set_index('Group')['CycleIdx']
+                       .to_dict())
+    cycle_base_colors = {
+        0: PALETTE['light_gray'],
+        1: PALETTE['tertiary'],
+        2: PALETTE['quaternary'],
+        3: PALETTE['secondary'],
+    }
+
+    def _cycle_gradient(base_color, n):
+        base = np.array(to_rgb(base_color))
+        if n <= 1:
+            return [base]
+        light = base + (1 - base) * 0.35
+        dark = base * 0.75
+        return [light + (dark - light) * (i / (n - 1)) for i in range(n)]
+
+    group_colors = {}
+    for cycle_idx, base_color in cycle_base_colors.items():
+        groups = [g for g in unique_groups if group_cycle_map.get(g) == cycle_idx]
+        if not groups:
+            continue
+        colors = _cycle_gradient(base_color, len(groups))
+        for g, color in zip(groups, colors):
+            group_colors[g] = tuple(color)
     
     # 2. Plotting
     fig, ax = plt.subplots(figsize=figsize)
@@ -1737,8 +1810,8 @@ def plot_grouped_ecdna_violin(cell_data, min_copy=0, title=None, figsize=(16, 8)
     parts = ax.violinplot(data_to_plot, showmeans=False, showmedians=True, showextrema=False)
     
     # Customize violins
-    for pc in parts['bodies']:
-        pc.set_facecolor(PALETTE['primary'])
+    for pc, group in zip(parts['bodies'], unique_groups):
+        pc.set_facecolor(group_colors.get(group, PALETTE['primary']))
         pc.set_edgecolor('black')
         pc.set_alpha(0.7)
         
@@ -1771,13 +1844,13 @@ def plot_grouped_ecdna_violin(cell_data, min_copy=0, title=None, figsize=(16, 8)
 
 def plot_phenotype_evolution(result, title="Phenotype Space Evolution (Y)", save_path=None, figsize=(16, 12)):
     """
-    Visualize the evolution of continuous phenotype Y = (y1, y2).
+    Visualize the evolution of continuous phenotype Y = (DDR, SURV).
     
     Generates a multi-panel figure:
-    A. Time evolution of population mean Y1 and Y2.
-    B. Scatter plot of Y1 vs Y2 at initial time (t=0).
-    C. Scatter plot of Y1 vs Y2 at intermediate time.
-    D. Scatter plot of Y1 vs Y2 at final time (colored by ecDNA).
+    A. Time evolution of population mean DDR and SURV (with IQR bands).
+    B. Scatter plot of DDR vs SURV at initial time (t=0).
+    C. Scatter plot of DDR vs SURV at intermediate time.
+    D. Scatter plot of DDR vs SURV at final time (colored by ecDNA).
     
     Args:
         result: SimulationResult containing fitness_snapshots with 'y' data.
@@ -1786,6 +1859,8 @@ def plot_phenotype_evolution(result, title="Phenotype Space Evolution (Y)", save
         figsize: Figure size.
     """
     import matplotlib.cm as cm
+    import config as cfg
+    set_publication_style()
     
     # Check if 'y' data exists
     if not result.fitness_snapshots or not result.fitness_snapshots[-1]:
@@ -1801,23 +1876,38 @@ def plot_phenotype_evolution(result, title="Phenotype Space Evolution (Y)", save
     times = np.array(result.times)
     n_points = len(times)
     
-    # Calculate means over time
-    mean_y1 = []
-    mean_y2 = []
+    # Calculate summary stats over time
+    mean_y1, mean_y2 = [], []
+    q25_y1, q75_y1 = [], []
+    q25_y2, q75_y2 = [], []
+    valid_indices = []
     
-    for snapshot in result.fitness_snapshots:
+    for idx, snapshot in enumerate(result.fitness_snapshots):
         if not snapshot:
             mean_y1.append(np.nan)
             mean_y2.append(np.nan)
+            q25_y1.append(np.nan)
+            q75_y1.append(np.nan)
+            q25_y2.append(np.nan)
+            q75_y2.append(np.nan)
             continue
-            
-        ys = np.array([d['y'] for d in snapshot]) # shape (N, P)
+        
+        ys = np.array([d['y'] for d in snapshot])
         if ys.size > 0 and ys.ndim == 2 and ys.shape[1] >= 2:
-            mean_y1.append(np.mean(ys[:, 0]))
-            mean_y2.append(np.mean(ys[:, 1]))
+            mean_y1.append(np.mean(ys[:, cfg.Y_DDR_IDX]))
+            mean_y2.append(np.mean(ys[:, cfg.Y_SURV_IDX]))
+            q25_y1.append(np.quantile(ys[:, cfg.Y_DDR_IDX], 0.25))
+            q75_y1.append(np.quantile(ys[:, cfg.Y_DDR_IDX], 0.75))
+            q25_y2.append(np.quantile(ys[:, cfg.Y_SURV_IDX], 0.25))
+            q75_y2.append(np.quantile(ys[:, cfg.Y_SURV_IDX], 0.75))
+            valid_indices.append(idx)
         else:
             mean_y1.append(np.nan)
             mean_y2.append(np.nan)
+            q25_y1.append(np.nan)
+            q75_y1.append(np.nan)
+            q25_y2.append(np.nan)
+            q75_y2.append(np.nan)
             
     # Setup figure
     fig = plt.figure(figsize=figsize)
@@ -1825,8 +1915,10 @@ def plot_phenotype_evolution(result, title="Phenotype Space Evolution (Y)", save
     
     # Ax1: Time evolution (spanning top row)
     ax1 = fig.add_subplot(gs[0, :])
-    ax1.plot(times, mean_y1, label='Mean Y1', color=PALETTE['tertiary'], linewidth=2)
-    ax1.plot(times, mean_y2, label='Mean Y2', color=PALETTE['secondary'], linewidth=2)
+    ax1.plot(times, mean_y1, label='Mean DDR', color=PALETTE['tertiary'], linewidth=2.5)
+    ax1.fill_between(times, q25_y1, q75_y1, color=PALETTE['tertiary'], alpha=0.15, linewidth=0)
+    ax1.plot(times, mean_y2, label='Mean SURV', color=PALETTE['secondary'], linewidth=2.5)
+    ax1.fill_between(times, q25_y2, q75_y2, color=PALETTE['secondary'], alpha=0.12, linewidth=0)
     ax1.set_xlabel('Time')
     ax1.set_ylabel('Mean Phenotype Value')
     ax1.set_title('A  Evolution of Mean Phenotype', loc='left', fontweight='bold')
@@ -1835,42 +1927,48 @@ def plot_phenotype_evolution(result, title="Phenotype Space Evolution (Y)", save
     
     # Helper to plot scatter snapshot
     def plot_snapshot(ax, snapshot_idx, panel_label, label_suffix=""):
-        if snapshot_idx >= n_points:
-            return
+        if snapshot_idx >= n_points or snapshot_idx < 0:
+            return None
             
         snapshot = result.fitness_snapshots[snapshot_idx]
         if not snapshot:
-            return
+            return None
             
         ys = np.array([d['y'] for d in snapshot])
         ecdnas = np.array([d['ecdna'] for d in snapshot])
         
         if ys.size == 0:
-            return
+            return None
             
         # Scatter plot colored by ecDNA
-        sc = ax.scatter(ys[:, 0], ys[:, 1], c=ecdnas, cmap='viridis', 
-                       alpha=0.6, s=20, edgecolors='none')
+        sc = ax.scatter(
+            ys[:, cfg.Y_DDR_IDX], ys[:, cfg.Y_SURV_IDX],
+            c=ecdnas, cmap=SEQUENTIAL_CMAP, alpha=0.65, s=18, edgecolors='none'
+        )
         
-        ax.set_xlabel('Y1')
-        ax.set_ylabel('Y2')
+        ax.set_xlabel('DDR (Y_DDR)')
+        ax.set_ylabel('SURV (Y_SURV)')
         t_val = times[snapshot_idx]
         ax.set_title(f'{panel_label}  Phenotype Space (t={t_val:.1f}){label_suffix}', loc='left', fontweight='bold')
         ax.grid(True, alpha=0.3)
         return sc
     
     # Ax2: Initial state
+    if not valid_indices:
+        print("Warning: No valid phenotype snapshots.")
+        return None
+
     ax2 = fig.add_subplot(gs[1, 0])
-    plot_snapshot(ax2, 0, 'B', " (Initial)")
+    plot_snapshot(ax2, valid_indices[0], 'B', " (Initial)")
     
     # Ax3: Middle state
-    mid_idx = n_points // 2
+    mid_idx = valid_indices[len(valid_indices) // 2]
     ax3 = fig.add_subplot(gs[1, 1])
     plot_snapshot(ax3, mid_idx, 'C', " (Mid)")
     
     # Ax4: Final state
     ax4 = fig.add_subplot(gs[1, 2])
-    sc = plot_snapshot(ax4, -1, 'D', " (Final)")
+    sc = plot_snapshot(ax4, valid_indices[-1], 'D', " (Final)")
     
     # Colorbar
     if sc:
@@ -1883,6 +1981,97 @@ def plot_phenotype_evolution(result, title="Phenotype Space Evolution (Y)", save
     if save_path:
         plt.savefig(save_path, bbox_inches='tight')
         
+    return fig
+
+
+# ============================================================================
+# Ogata Thinning Diagnostics
+# ============================================================================
+
+def plot_ogata_thinning_diagnostics(result, title="Ogata Thinning Diagnostics",
+                                    save_path=None, figsize=(12, 8)):
+    """
+    Visualize Ogata thinning behavior from recorded diagnostics.
+    
+    Panels:
+    A. Acceptance probability r/r_bar over time (with smoothed trend + global mean).
+    B. Histogram of proposals per accepted event.
+    C. Acceptance probability by event type (boxplot).
+    """
+    set_publication_style()
+    
+    if not hasattr(result, 'thinning_records') or not result.thinning_records:
+        print("Warning: No thinning diagnostics available.")
+        return None
+    
+    times = np.array([d.get("time", np.nan) for d in result.thinning_records])
+    accept_probs = np.array([d.get("accept_prob", np.nan) for d in result.thinning_records])
+    proposals = np.array([d.get("proposals", np.nan) for d in result.thinning_records])
+    channels = np.array([d.get("channel", "unknown") for d in result.thinning_records])
+    
+    valid = np.isfinite(times) & np.isfinite(accept_probs) & np.isfinite(proposals)
+    times = times[valid]
+    accept_probs = accept_probs[valid]
+    proposals = proposals[valid]
+    channels = channels[valid]
+    
+    if times.size == 0:
+        print("Warning: No valid thinning diagnostics available.")
+        return None
+    
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.1, 1.0])
+    ax0 = fig.add_subplot(gs[0, :])
+    ax1 = fig.add_subplot(gs[1, 0])
+    ax2 = fig.add_subplot(gs[1, 1])
+    
+    ax0.scatter(times, accept_probs, s=12, alpha=0.4, color=PALETTE['tertiary'],
+                    label='Accepted event')
+    if accept_probs.size >= 10:
+        window = max(5, accept_probs.size // 50)
+        kernel = np.ones(window) / window
+        smooth = np.convolve(accept_probs, kernel, mode='same')
+        ax0.plot(times, smooth, color=PALETTE['primary'], linewidth=2,
+                     label=f'Smoothed (w={window})')
+    order = np.argsort(times)
+    cum_mean = np.cumsum(accept_probs[order]) / np.arange(1, accept_probs.size + 1)
+    ax0.plot(times[order], cum_mean, color=PALETTE['quaternary'], linewidth=2,
+             label='Global accept rate')
+    ax0.set_ylabel('Acceptance Prob (r/r_bar)')
+    ax0.set_title('A  Acceptance Probability Over Time', loc='left', fontweight='bold')
+    ax0.legend()
+    ax0.grid(True, alpha=0.3)
+    
+    bins = min(30, max(6, int(np.sqrt(proposals.size))))
+    ax1.hist(proposals, bins=bins, color=PALETTE['secondary'], alpha=0.7, edgecolor='white')
+    ax1.set_xlabel('Proposals per Accepted Event')
+    ax1.set_ylabel('Count')
+    ax1.set_title('B  Thinning Load Distribution', loc='left', fontweight='bold')
+    ax1.grid(True, axis='y', alpha=0.3)
+    
+    channel_vals = {}
+    for ch, prob in zip(channels, accept_probs):
+        channel_vals.setdefault(ch, []).append(prob)
+    if channel_vals:
+        labels = list(channel_vals.keys())
+        data = [channel_vals[k] for k in labels]
+        ax2.boxplot(data, labels=labels, patch_artist=True,
+                    boxprops=dict(facecolor=PALETTE['light_gray'], edgecolor=PALETTE['dark_gray']),
+                    medianprops=dict(color=PALETTE['primary'], linewidth=1.5))
+        ax2.set_ylabel('Acceptance Prob')
+        ax2.set_title('C  Acceptance by Event Type', loc='left', fontweight='bold')
+        ax2.grid(True, axis='y', alpha=0.3)
+        ax2.tick_params(axis='x', rotation=25)
+    else:
+        ax2.text(0.5, 0.5, 'No event-type data', ha='center', va='center')
+        ax2.set_axis_off()
+    
+    fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    
     return fig
 
 
@@ -2041,7 +2230,7 @@ def plot_state_ecdna_enrichment(result, time_indices=None, n_bins=10,
         log2_or_clipped = np.clip(log2_or, winsorize_range[0], winsorize_range[1])
         
         # 热图
-        im = ax.imshow(log2_or_clipped, aspect='auto', cmap='RdBu_r',
+        im = ax.imshow(log2_or_clipped, aspect='auto', cmap=DIVERGING_CMAP,
                       vmin=winsorize_range[0], vmax=winsorize_range[1])
         
         # 显著性标记（只在期望频数合理时标记）
@@ -2099,10 +2288,10 @@ def plot_state_ecdna_enrichment(result, time_indices=None, n_bins=10,
     # 色标
     if im is not None:
         cbar = fig.colorbar(im, ax=axes, shrink=0.6, pad=0.12)
-        cbar.set_label('log₂(OR): red=enriched, blue=depleted', fontsize=9)
+        cbar.set_label('log2(OR): red=enriched, blue=depleted', fontsize=9)
     
     fig.suptitle(title, fontsize=13, fontweight='bold')
-    plt.tight_layout(rect=[0, 0, 0.88, 0.95])
+    fig.subplots_adjust(left=0.06, right=0.88, top=0.92, bottom=0.08, wspace=0.35, hspace=0.4)
     
     if save_path:
         plt.savefig(save_path, bbox_inches='tight', dpi=300)

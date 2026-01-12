@@ -25,6 +25,7 @@ class SimulationResult:
     sister_correlations: List[float] = field(default_factory=list)
     ecdna_distributions: List[np.ndarray] = field(default_factory=list)  # Full ecDNA distribution at each time point
     fitness_snapshots: List[List[Dict]] = field(default_factory=list)  # Per-cell fitness data at each time point
+    thinning_records: List[Dict] = field(default_factory=list)  # Ogata thinning diagnostics per accepted event
 
     def save_as_csv(self, base_dir: str):
         """Save simulation results to CSV files in the specified directory."""
@@ -149,7 +150,7 @@ class OgataThinningSimulator:
     
     
     def sample_next_event(self, cell: Cell, t_start: float, t_max: float
-                          ) -> Tuple[Optional[float], Optional[str], Optional[dict], Optional[dict]]:
+                          ) -> Tuple[Optional[float], Optional[str], Optional[dict], Optional[dict], Optional[dict]]:
         """
         Sample next event time and type for a single cell using Ogata thinning.
         
@@ -162,19 +163,22 @@ class OgataThinningSimulator:
             t_max: Maximum time horizon
         
         Returns:
-            (event_time, channel_type, params, flow_state) or (None, None, None, None)
+            (event_time, channel_type, params, flow_state, thinning_stats)
+            or (None, None, None, None, None)
         """
         current_t = t_start
         temp_cell = cell.copy()  # work on copy for flow propagation
         
+        proposals = 0
         while current_t < t_max:
             # Step 1-2: Sample candidate time from dominating process
             delta = self.rng.exponential(1.0 / self.r_bar)
             candidate_t = current_t + delta
+            proposals += 1
             
             if candidate_t >= t_max:
                 # No event before t_max
-                return None, None, None, None
+                return None, None, None, None, None
             
             # Step 3: Propagate temp_cell along deterministic flow
             apply_flow(temp_cell, delta, rng=self.rng)
@@ -193,12 +197,13 @@ class OgataThinningSimulator:
                     channel_type, params, _ = channels[channel_idx]
                     
                     flow_state = {"a": temp_cell.a, "y": temp_cell.y.copy()}
-                    return candidate_t, channel_type, params, flow_state
+                    thinning_stats = {"proposals": proposals, "accept_prob": accept_prob}
+                    return candidate_t, channel_type, params, flow_state, thinning_stats
             
             # Rejected, continue from candidate_t
             current_t = candidate_t
         
-        return None, None, None, None
+        return None, None, None, None, None
 
 
     # Population Simulation with Lazy Flow
@@ -260,19 +265,19 @@ class OgataThinningSimulator:
         if verbose:
             print(f"Starting simulation: {population.size()} cells, t_max={t_max}")
         
-        # Prepare event heap: (event_time, cell_id, channel, params, version, flow_state)
-        event_heap: List[Tuple[float, int, str, dict, int, dict]] = []
+        # Prepare event heap: (event_time, cell_id, channel, params, version, flow_state, thinning_stats)
+        event_heap: List[Tuple[float, int, str, dict, int, dict, dict]] = []
         cell_versions: Dict[int, int] = {}
         cell_lookup: Dict[int, Cell] = {cell.cell_id: cell for cell in population.cells}
         
         def schedule_cell_event(cell: Cell, from_time: float):
             """Schedule next event for a cell starting from from_time."""
             cell_id = cell.cell_id
-            event_t, channel, params, flow_state = self.sample_next_event(cell, from_time, t_max)
+            event_t, channel, params, flow_state, thinning_stats = self.sample_next_event(cell, from_time, t_max)
             version = cell_versions.get(cell_id, 0) + 1
             cell_versions[cell_id] = version
             if event_t is not None:
-                heapq.heappush(event_heap, (event_t, cell_id, channel, params, version, flow_state))
+                heapq.heappush(event_heap, (event_t, cell_id, channel, params, version, flow_state, thinning_stats))
         
         def resample_all_events(from_time: float):
             """Resample events for all cells from given time."""
@@ -299,9 +304,10 @@ class OgataThinningSimulator:
             next_channel = None
             next_params = None
             next_flow_state = None
+            next_thinning_stats = None
             
             while event_heap:
-                event_t, cell_id, channel, params, version, flow_state = heapq.heappop(event_heap)
+                event_t, cell_id, channel, params, version, flow_state, thinning_stats = heapq.heappop(event_heap)
                 if cell_versions.get(cell_id) != version:
                     continue  # Stale event, skip
                 cell = cell_lookup.get(cell_id)
@@ -312,6 +318,7 @@ class OgataThinningSimulator:
                 next_channel = channel
                 next_params = params
                 next_flow_state = flow_state
+                next_thinning_stats = thinning_stats
                 break
             
             if next_cell is None:
@@ -376,6 +383,15 @@ class OgataThinningSimulator:
             # Process event
             self._process_event(population, next_cell, next_channel, next_params, t, result)
             event_count += 1
+            
+            if next_thinning_stats:
+                result.thinning_records.append({
+                    "time": t,
+                    "cell_id": next_cell.cell_id,
+                    "channel": next_channel,
+                    "proposals": next_thinning_stats.get("proposals", 0),
+                    "accept_prob": next_thinning_stats.get("accept_prob", 0.0),
+                })
             
             # Update lookup/cache after event
             if next_channel == "division":
