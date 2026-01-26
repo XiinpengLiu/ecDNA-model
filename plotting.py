@@ -1099,10 +1099,11 @@ def plot_lineage_tree(result,
     trees = [build_tree(f) for f in founders]
     
     # Determine color scale
-    all_ecdna = list(cell_ecdna.values())
-    vmin, vmax = min(all_ecdna), max(all_ecdna)
-    if vmax == vmin:
-        vmax = vmin + 1
+    all_ecdna = np.array(list(cell_ecdna.values()), dtype=float)
+    vmin = float(np.min(all_ecdna))
+    vmax = float(np.percentile(all_ecdna, 95))
+    if vmax <= vmin:
+        vmax = vmin + 1.0
     
     # Create figure
     fig, axes = plt.subplots(1, len(trees), figsize=figsize, squeeze=False)
@@ -1115,6 +1116,7 @@ def plot_lineage_tree(result,
         """Recursively draw tree on axes."""
         # Node color based on ecDNA
         norm_ecdna = (tree["ecdna"] - vmin) / (vmax - vmin)
+        norm_ecdna = np.clip(norm_ecdna, 0.0, 1.0)
         color = cmap(norm_ecdna)
         
         # Node size based on fate
@@ -2272,14 +2274,18 @@ def plot_state_ecdna_enrichment(result, time_indices=None, n_bins=10,
         t_val = result.times[t_idx] if t_idx < len(result.times) else t_idx
         ax.set_title(f't={t_val:.1f} (N={N})', fontsize=10)
         
-        # 频数条
-        ax_bar = ax.inset_axes([1.02, 0, 0.08, 1])
-        ax_bar.barh(range(len(n_m)), n_m, color='steelblue', height=0.7)
+        # 频数数字
+        ax_bar = ax.inset_axes([1.02, 0, 0.12, 1])
         ax_bar.set_ylim(-0.5, len(n_m) - 0.5)
-        ax_bar.set_yticks([])
-        ax_bar.set_xlabel('n', fontsize=6)
+        ax_bar.set_xlim(0, 1)
         ax_bar.invert_yaxis()
-        ax_bar.tick_params(axis='x', labelsize=5)
+        ax_bar.set_xticks([])
+        ax_bar.set_yticks([])
+        ax_bar.set_frame_on(False)
+        ax_bar.set_title('n', fontsize=6, pad=2, color=PALETTE['dark_gray'])
+        for idx, nm in enumerate(n_m):
+            ax_bar.text(0.98, idx, f"{nm}", ha='right', va='center',
+                        fontsize=6, color=PALETTE['dark_gray'])
     
     # 隐藏多余子图
     for i in range(n_panels, nrows * ncols):

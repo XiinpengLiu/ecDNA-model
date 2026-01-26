@@ -262,7 +262,7 @@ DRUG_SCHEDULE = {
 RANDOM_SEED = 42
 
 # Simulation time
-T_MAX = 100.0  # total simulation time
+T_MAX = 100000.0  # total simulation time
 
 # Initial population
 N_INIT = 100   # initial number of cells
