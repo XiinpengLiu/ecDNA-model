@@ -1,290 +1,96 @@
 """
-ecDNA Copy-Number Kinetics Model - Division Kernel
-ecDNA amplification, segregation, and daughter initialization.
+Division kernel and daughter initialization for the ecDNA v4 model.
 """
 
+from __future__ import annotations
+
 import numpy as np
-from typing import Tuple
-from cell import Cell
-import config as cfg
 
-
-def _drug_effect_hill(u: float, emax: float, ec50: float, hill_n: float, effect_type: str) -> float:
-    """Compute drug effect using Hill/Emax form."""
-    if u <= 0:
-        return 1.0
-    hill = (u ** hill_n) / (ec50 ** hill_n + u ** hill_n)
-    if effect_type == "inhibit":
-        return 1.0 - emax * hill
-    else:  # activate
-        return 1.0 + emax * hill
+import v4_config as cfg
+import v4_dynamics as dyn
+from v4_cell import Cell
 
 
 class DivisionKernel:
-    """
-    Division kernel K^{a,y}_{e,m,k} implementing:
-    - State-dependent ecDNA amplification
-    - Random segregation
-    - Post-segregation copy loss
-    - Daughter discrete state, phenotype, and age reset
-    """
-    
-    def __init__(self, rng: np.random.Generator = None, drug_schedule: dict = None):
-        self.rng = rng if rng is not None else np.random.default_rng(cfg.RANDOM_SEED)
-        self.drug_schedule = drug_schedule or cfg.DRUG_SCHEDULE
-    
-    def _get_drug_conc(self, drug_name: str, t: float) -> float:
-        """Get drug concentration at time t."""
-        if drug_name in self.drug_schedule:
-            return self.drug_schedule[drug_name](t)
-        return 0.0
-    
-    
-    #State-dependent ecDNA Amplification
-    
-    
-    def sample_amplification(self, cell: Cell, j: int, t: float) -> int:
-        """
-        Sample amplification A_j ~ g^amp_{e,m,j}(· | k_j, y, a; u)
-        
-        Model: A_j ~ Poisson(λ_amp * k_j)
-        Pre-segregation copy number: k̃_j = 2*k_j + A_j
-        Drug modulation: ecDNA_destabilizer inhibits amplification
-        """
-        k_j = cell.k[j]
-        
-        # Base amplification rate
-        lambda_amp = cfg.AMP_LAMBDA_PER_COPY * k_j
-        
-        # MYC expression increases amplification
-        if cell.x in cfg.MYC_STATES:
-            lambda_amp *= 1.5
-        
-        # Drug modulation: ecDNA_destabilizer inhibits amplification (target: "amp")
-        u = self._get_drug_conc("ecdna_destabilizer", t)
-        if u > 0:
-            drug = cfg.DRUGS["ecdna_destabilizer"]
-            if "amp" in drug.targets:
-                lambda_amp *= _drug_effect_hill(u, drug.emax, drug.ec50, drug.hill_n, drug.targets["amp"])
-        
-        # Sample extra copies
-        A_j = self.rng.poisson(max(0, lambda_amp))
-        
-        return A_j
-    
-    def compute_pre_segregation(self, cell: Cell, t: float) -> np.ndarray:
-        """
-        Compute pre-segregation copy numbers for all species.
-        k̃_j = 2*k_j + A_j (replication + amplification)
-        """
-        k_tilde = np.zeros(cfg.J_ECDNA, dtype=int)
-        
-        for j in range(cfg.J_ECDNA):
-            A_j = self.sample_amplification(cell, j, t)
-            k_tilde[j] = 2 * cell.k[j] + A_j
-        
-        return k_tilde
-    
-    
-    # Random Segregation (Unbiased)
-    
-    
-    def segregate(self, k_tilde: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Random segregation with binomial distribution.
-        K_{1j} | k̃_j ~ Binomial(k̃_j, 1/2)
-        K_{2j} = k̃_j - K_{1j}
-        
-        Modified: Guarantee inheritance if possible (no 0 allocation if k_tilde >= 2).
-        """
-        k1 = np.zeros(cfg.J_ECDNA, dtype=int)
-        k2 = np.zeros(cfg.J_ECDNA, dtype=int)
-        
-        for j in range(cfg.J_ECDNA):
-            # If we have at least 2 copies, ensure both daughters get at least 1
-            if k_tilde[j] >= 2:
-                # Rejection sampling to ensure no daughter receives 0 copies
-                while True:
-                    n1 = self.rng.binomial(k_tilde[j], 0.5)
-                    n2 = k_tilde[j] - n1
-                    if n1 > 0 and n2 > 0:
-                        k1[j] = n1
-                        k2[j] = n2
-                        break
-            else:
-                # If only 0 or 1 copy total, distribution is constrained
-                k1[j] = self.rng.binomial(k_tilde[j], 0.5)
-                k2[j] = k_tilde[j] - k1[j]
-        
-        return k1, k2
-    
-    
-    # Post-segregation Copy Loss
-    
-    
-    def apply_post_segregation_loss(self, k: np.ndarray, cell: Cell, t: float) -> np.ndarray:
-        """
-        Apply post-segregation loss.
-        K*_{rj} | K_{rj} ~ Binomial(K_{rj}, 1 - ℓ_{e,m,j})
-        Drug modulation: ecDNA_destabilizer activates loss
-        """
-        k_star = np.zeros(cfg.J_ECDNA, dtype=int)
-        
-        for j in range(cfg.J_ECDNA):
-            loss_prob = cfg.LOSS_PROB_POST_SEG
-            
-            # TP53-inactive states may have higher loss
-            if cell.x in cfg.TP53_INACTIVE_STATES:
-                loss_prob *= 1.5
-            
-            # Drug modulation: ecDNA_destabilizer activates loss (target: "loss")
-            u = self._get_drug_conc("ecdna_destabilizer", t)
-            if u > 0:
-                drug = cfg.DRUGS["ecdna_destabilizer"]
-                if "loss" in drug.targets:
-                    # activation increases loss_prob
-                    loss_mult = _drug_effect_hill(u, drug.emax, drug.ec50, drug.hill_n, drug.targets["loss"])
-                    loss_prob = min(1.0, loss_prob * loss_mult)
-            
-            # Each copy survives with probability (1 - loss_prob)
-            k_star[j] = self.rng.binomial(k[j], 1.0 - loss_prob)
+    def __init__(self, rng: np.random.Generator):
+        self.rng = rng
 
-            # FORCE SURVIVAL: If parent had copies but all were lost, keep at least 1
-            if k[j] > 0 and k_star[j] == 0:
-                k_star[j] = 1
-        
-        # Truncate to K_max
-        k_star = np.clip(k_star, 0, cfg.K_MAX)
-        
-        return k_star
-    
-    
-    #Daughter Discrete State, Phenotype, and Age Reset
-    
-    
-    def sample_daughter_cycle(self, parent_cell: Cell) -> int:
-        """
-        Sample daughter cycle phase.
-        Typically resets to G1 (or small probability G0).
-        """
-        phases = list(cfg.DAUGHTER_CYCLE_PROBS.keys())
-        probs = list(cfg.DAUGHTER_CYCLE_PROBS.values())
-        return self.rng.choice(phases, p=probs)
-    
-    def sample_daughter_senescence(self, parent_cell: Cell, k_daughter: np.ndarray) -> int:
-        """
-        Sample daughter senescence status.
-        Largely inherited, with small probability of progression.
-        """
-        s = parent_cell.s
-        
-        # High ecDNA may accelerate senescence
-        if s < 2 and np.sum(k_daughter) > 50:
-            if self.rng.random() < 0.1:
-                s = min(s + 1, 2)
-        
-        return s
-    
-    def sample_daughter_expression(self, parent_cell: Cell, k_daughter: np.ndarray) -> int:
-        """
-        Sample daughter expression program.
-        Partially inherited with rare reprogramming.
-        """
-        x = parent_cell.x
-        
-        # Small chance of reprogramming at division
-        if self.rng.random() < 0.05:
-            # Random switch with preference for basal
-            if x != 0:
-                x = 0 if self.rng.random() < 0.7 else x
-            else:
-                x = self.rng.choice([0, 1, 2, 3], p=[0.8, 0.08, 0.08, 0.04])
-        
-        return x
-    
-    def sample_daughter_phenotype(self, parent_cell: Cell, m_daughter: Tuple[int, int, int],
-                                  k_daughter: np.ndarray) -> np.ndarray:
-        """
-        Sample daughter phenotype.
-        Y_r ~ H^{(e)}(· | m_r, k_r, y; u)
-        
-        Model: Y_daughter ~ N(Y_parent, σ²I) with pull toward new attractor.
-        """
-        c, s, x = m_daughter
-        
-        # Daughter inherits parent phenotype with noise
-        y_daughter = parent_cell.y + self.rng.normal(0, cfg.DAUGHTER_Y_NOISE_STD, size=cfg.P_DIM)
-        
-        # Small pull toward new state's attractor
-        mu_new = cfg.get_mu(parent_cell.e, c, s, x, int(np.sum(k_daughter)))
-        y_daughter = 0.9 * y_daughter + 0.1 * mu_new
-        
-        return y_daughter
-    
-    
-    # Main Division Method
-    
-    
-    def divide(self, parent: Cell, t: float) -> Tuple[Cell, Cell]:
-        """
-        Execute division kernel to produce two daughter cells.
-        
-        Args:
-            parent: Parent cell state
-            t: Current time
-            
-        Returns:
-            daughter1, daughter2: Two daughter cells
-        """
-        # Step 1: Amplification and pre-segregation
-        k_tilde = self.compute_pre_segregation(parent, t)
-        
-        # Step 2: Binomial segregation
-        k1, k2 = self.segregate(k_tilde)
-        
-        # Step 3: Post-segregation loss
-        k1 = self.apply_post_segregation_loss(k1, parent, t)
-        k2 = self.apply_post_segregation_loss(k2, parent, t)
-        
-        # Step 4: Sample daughter discrete states
-        daughters = []
-        for k_r in [k1, k2]:
-            c_r = self.sample_daughter_cycle(parent)
-            s_r = self.sample_daughter_senescence(parent, k_r)
-            x_r = self.sample_daughter_expression(parent, k_r)
-            
-            # Sample phenotype
-            y_r = self.sample_daughter_phenotype(parent, (c_r, s_r, x_r), k_r)
-            
-            # Create daughter cell (age reset to 0)
-            daughter = Cell(
-                e=parent.e,
-                c=c_r,
-                s=s_r,
-                x=x_r,
-                k=k_r.copy(),
-                a=0.0,
-                y=y_r,
-                parent_id=parent.cell_id
-            )
-            daughters.append(daughter)
-        
-        return daughters[0], daughters[1]
+    def amplification_rate(self, parent: Cell, species_idx: int, context: dyn.ReplicateContext) -> float:
+        params = cfg.PARAMS.division
+        if parent.cycle_state not in (cfg.S, cfg.G2M):
+            return 0.0
+        ceiling = params.lambda_amp_ceiling[species_idx]
+        if ceiling <= 0.0:
+            return 0.0
+        rate_logit = (
+            params.c0[species_idx]
+            + params.cR[species_idx] * dyn.stress_window(parent.stress)
+            + params.cC[species_idx] * context.D_C
+            + params.cP[species_idx] * context.D_P
+        )
+        return ceiling * cfg.sigmoid(rate_logit)
 
+    def replicated_copies(self, parent: Cell, context: dyn.ReplicateContext) -> np.ndarray:
+        amplified = np.zeros(cfg.N_SPECIES, dtype=int)
+        for idx in range(cfg.N_SPECIES):
+            amp_rate = self.amplification_rate(parent, idx, context)
+            amplified[idx] = self.rng.poisson(amp_rate) if amp_rate > 0.0 else 0
+        replicated = 2 * parent.copy_numbers + amplified
+        cfg.validate_copy_vector(replicated)
+        return replicated
 
-#Random-daughter Marginal
+    def segregate(self, replicated_copies: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        params = cfg.PARAMS.division
+        mitotic_shock = self.rng.normal(loc=0.0, scale=params.tau)
+        daughter_one = np.zeros(cfg.N_SPECIES, dtype=int)
+        daughter_two = np.zeros(cfg.N_SPECIES, dtype=int)
+        for idx in range(cfg.N_SPECIES):
+            segregation_probability = cfg.sigmoid(params.delta[idx] * mitotic_shock)
+            daughter_one[idx] = self.rng.binomial(int(replicated_copies[idx]), float(segregation_probability))
+            daughter_two[idx] = int(replicated_copies[idx] - daughter_one[idx])
+        cfg.validate_copy_vector(daughter_one)
+        cfg.validate_copy_vector(daughter_two)
+        return daughter_one, daughter_two
 
-def compute_sister_correlation(k1: np.ndarray, k2: np.ndarray) -> float:
-    """
-    Compute correlation between sister cells' ecDNA counts.
-    Used for model validation against experimental data.
-    """
-    if len(k1) == 1:
-        return 0.0 if (k1[0] + k2[0]) == 0 else 2 * min(k1[0], k2[0]) / (k1[0] + k2[0])
-    
-    # Multi-species correlation
-    total1 = np.sum(k1)
-    total2 = np.sum(k2)
-    if total1 + total2 == 0:
-        return 0.0
-    return 2 * min(total1, total2) / (total1 + total2)
+    def initialize_daughter(self, parent: Cell, daughter_copies: np.ndarray, context: dyn.ReplicateContext) -> Cell:
+        params = cfg.PARAMS.division
+        draft = Cell(
+            cycle_state=cfg.G1,
+            copy_numbers=daughter_copies.copy(),
+            latent_state=np.zeros(cfg.LATENT_DIM, dtype=float),
+            soft_state=np.full(cfg.N_STATES, 1.0 / cfg.N_STATES, dtype=float),
+            stress=0.0,
+            survival=0.0,
+            age=0.0,
+            parent_id=parent.cell_id,
+        )
+        derived = dyn.compute_derived_quantities(draft, context)
+        latent_noise = self.rng.multivariate_normal(mean=np.zeros(cfg.LATENT_DIM), cov=params.Omega_U)
+        draft.latent_state = params.rho_U * parent.latent_state + (1.0 - params.rho_U) * derived.target_latent + latent_noise
+        draft.soft_state = cfg.inverse_ilr(draft.latent_state)
+
+        updated_derived = dyn.compute_derived_quantities(draft, context)
+        stress_mean = dyn.compute_stress_attractor(draft, updated_derived, context, cycle_state=cfg.G1)
+        draft.stress = params.rho_R * parent.stress + (1.0 - params.rho_R) * stress_mean + params.sigma_R0 * self.rng.normal()
+
+        survival_mean = dyn.compute_survival_attractor(draft, updated_derived, context, cycle_state=cfg.G1)
+        draft.survival = params.rho_V * parent.survival + (1.0 - params.rho_V) * survival_mean + params.sigma_V0 * self.rng.normal()
+
+        p_quiescent = cfg.sigmoid(
+            params.zeta_0
+            + params.zeta_R * parent.stress
+            + params.zeta_M * parent.soft_state[cfg.MES]
+            + params.zeta_a * context.astrocytic_cue
+            + params.zeta_m * context.mesenchymal_cue
+        )
+        draft.cycle_state = cfg.Q if self.rng.random() < p_quiescent else cfg.G1
+        draft.age = 0.0
+        draft.validate()
+        return draft
+
+    def divide(self, parent: Cell, context: dyn.ReplicateContext) -> tuple[Cell, Cell]:
+        replicated = self.replicated_copies(parent, context)
+        daughter_one_copies, daughter_two_copies = self.segregate(replicated)
+        daughter_one = self.initialize_daughter(parent, daughter_one_copies, context)
+        daughter_two = self.initialize_daughter(parent, daughter_two_copies, context)
+        return daughter_one, daughter_two

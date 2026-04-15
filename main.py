@@ -1,228 +1,70 @@
 """
-ecDNA Copy-Number Kinetics Model - Main Script
-Run simulations and generate results.
+Main entry point for the ecDNA v4 simulation program.
 """
 
 from pathlib import Path
 
-# Import model components
-import config as cfg
-from cell import Cell, CellPopulation
-from simulation import run_simulation, OgataThinningSimulator
-from treatment import (
-    InSilicoTrial, PROTOCOLS,
-    compute_growth_rate, compute_ecdna_dynamics, compute_sister_correlation_stats
-)
-from plotting import (
-    plot_results, compare_treatments, 
-    plot_ecdna_distribution_evolution, plot_heterogeneity_metrics,
-    plot_ecdna_positive_fraction, plot_lineage_tree,
-    plot_muller_ecdna, plot_muller_comparison, plot_fitness_landscape,
-    plot_lineage_state_trajectory, plot_event_summary,
-    plot_grouped_ecdna_violin, plot_phenotype_evolution,
-    plot_state_ecdna_enrichment, plot_ogata_thinning_diagnostics
-)
+from v4_plotting import plot_event_summary, plot_lineage_state_paths, plot_observation_proxies, plot_results
+from v4_simulation import run_simulation
+from v4_treatment import compute_bulk_copy_trends, compute_growth_rate, compute_terminal_event_counts
 
 
-
-def main():
-    """Main entry point."""
-    print("=" * 60)
-    print("ecDNA Copy-Number Kinetics Model")
-    print("=" * 60)
-    
-    # 创建输出目录
-    output_dir = Path("results")
+def main() -> None:
+    output_dir = Path("results_v4")
     output_dir.mkdir(exist_ok=True)
-    
-    # Example 1: Single untreated simulation
-    print("\n--- Example 1: Untreated Simulation ---")
-    
+
+    t_max = 72000
+    target_population_size = 2000
+    max_pop_size = 200000
+    record_interval = 1.0
+
     result = run_simulation(
-        t_max=100.0,
-        n_init=100,
-        max_pop=2000,
+        t_max=t_max,
+        n_init=80,
+        record_interval=record_interval,
+        target_population_size=target_population_size,
+        max_pop_size=max_pop_size,
         seed=42,
-        verbose=True
+        verbose=True,
     )
-    
-    # Compute metrics
+
     growth_rate = compute_growth_rate(result)
-    ecdna_metrics = compute_ecdna_dynamics(result)
-    sister_stats = compute_sister_correlation_stats(result)
-    
-    print(f"\nResults Summary:")
-    print(f"  Final population: {result.population_sizes[-1]}")
-    print(f"  Growth rate: {growth_rate:.4f}")
-    print(f"  Final ecDNA mean: {ecdna_metrics['ecdna_final']:.2f}")
-    print(f"  ecDNA trend: {ecdna_metrics['ecdna_trend']:.4f}")
-    print(f"  Sister correlation: {sister_stats['sister_corr_mean']:.3f} ± {sister_stats['sister_corr_std']:.3f}")
-    print(f"  Total divisions: {sister_stats['n_divisions']}")
-    
-    # Save raw data to CSVs
-    result.save_as_csv(output_dir / "untreated_simulation_data")
-    
-    # Plot and save
-    plot_results(result, title="Untreated Simulation",  
-                 save_path=output_dir / "untreated_simulation.pdf")
-    
-    # Plot ecDNA distribution evolution (intratumoral heterogeneity)
-    print("\n--- ecDNA Heterogeneity Analysis ---")
-    
-    # Combined view: violin + ECDF + quantile trajectories
-    plot_ecdna_distribution_evolution(
-        result, 
-        mode='combined',
-        n_time_points=8,
-        title="ecDNA Copy Number Distribution Evolution",
-        save_path=output_dir / "ecdna_distribution_combined.pdf"
+    copy_trends = compute_bulk_copy_trends(result)
+    terminal_counts = compute_terminal_event_counts(result)
+
+    print("=" * 64)
+    print("ecDNA v4 simulation summary")
+    print("=" * 64)
+    print(
+        "Simulation limits: "
+        f"t_max={t_max:.1f}, "
+        f"record_interval={record_interval:.1f}, "
+        f"target_population_size={target_population_size}, "
+        f"max_pop_size={max_pop_size}"
     )
-    
-    # Ridge plot (alternative visualization)
-    plot_ecdna_distribution_evolution(
-        result,
-        mode='ridge',
-        n_time_points=10,
-        title="ecDNA Distribution Evolution (Ridge Plot)",
-        save_path=output_dir / "ecdna_distribution_ridge.pdf"
+    print(f"Stop reason: {result.stop_reason} at t={result.stop_time:.2f}")
+    print(f"Final population size: {result.population_sizes[-1]}")
+    print(f"Estimated late growth rate: {growth_rate:.4f}")
+    print(
+        "Bulk ecDNA trends: "
+        f"MYC={copy_trends['MYC']:.4f}, "
+        f"CDK4={copy_trends['CDK4']:.4f}, "
+        f"PDGFRA={copy_trends['PDGFRA']:.4f}"
     )
-    
-    # Heterogeneity metrics over time
-    plot_heterogeneity_metrics(
-        result,
-        title="ecDNA Heterogeneity Metrics",
-        save_path=output_dir / "ecdna_heterogeneity_metrics.pdf"
-    )
-    
-    # ecDNA+ fraction and high-copy subpopulation over time
-    plot_ecdna_positive_fraction(
-        result,
-        threshold_high=20,
-        title="ecDNA+ and High-Copy Subpopulation Dynamics",
-        save_path=output_dir / "ecdna_positive_fraction.pdf"
-    )
-    
-    # Alternative: use 95th percentile of initial distribution as threshold
-    plot_ecdna_positive_fraction(
-        result,
-        use_quantile=95,
-        title="ecDNA+ and Extreme Subpopulation (95th percentile threshold)",
-        save_path=output_dir / "ecdna_positive_fraction_quantile.pdf"
-    )
-    
-    # Lineage tree showing ecDNA inheritance patterns
-    plot_lineage_tree(
-        result,
-        n_lineages=4,
-        max_depth=5,
-        title="ecDNA Inheritance: Non-Mendelian Segregation",
-        save_path=output_dir / "ecdna_lineage_tree.pdf"
-    )
-    
-    # Muller plot showing clonal dynamics by ecDNA copy number
-    plot_muller_ecdna(
-        result,
-        title="ecDNA Clonal Dynamics (Muller Plot)",
-        save_path=output_dir / "ecdna_muller_plot.pdf"
-    )
-    
-    # Fitness landscape: ecDNA vs division/death rates
-    plot_fitness_landscape(
-        result,
-        rate_type='both',
-        title="ecDNA-Fitness Landscape",
-        save_path=output_dir / "ecdna_fitness_landscape.pdf"
-    )
-    
-    # Lineage state trajectory: trace how states evolve along lineages
-    plot_lineage_state_trajectory(
-        result,
-        n_lineages=5,
-        max_events=40,
-        title="Lineage State Trajectories",
-        save_path=output_dir / "lineage_state_trajectory.pdf"
-    )
-    
-    # Event summary: distribution of event types and rates
-    plot_event_summary(
-        result,
-        title="Event Type Distribution and Dynamics",
-        save_path=output_dir / "event_summary.pdf"
+    print(
+        "Terminal events: "
+        f"division={terminal_counts['division']}, "
+        f"death={terminal_counts['death']}"
     )
 
-    # Grouped violin plots: ecDNA distribution by cell state
-    if result.fitness_snapshots:
-        # Plot 1: All cells
-        plot_grouped_ecdna_violin(
-            result.fitness_snapshots[-1], 
-            min_copy=0, 
-            title="ecDNA Distribution by Cell State (All Cells)",
-            save_path=output_dir / "grouped_violin_all.pdf"
-        )
-        
-        # Plot 2: High copy subpopulation (>= 90th percentile)
-        import numpy as np
-        all_ecdna_values = [d['ecdna'] for d in result.fitness_snapshots[-1]]
-        if all_ecdna_values:
-            p90 = np.percentile(all_ecdna_values, 90)
-            plot_grouped_ecdna_violin(
-                result.fitness_snapshots[-1], 
-                min_copy=p90, 
-                title=f"ecDNA Distribution by Cell State (High Copy >= {p90:.1f} [90%ile])",
-                save_path=output_dir / "grouped_violin_high_copy.pdf"
-            )
+    result.save_as_csv(output_dir / "simulation_data")
+    plot_results(result, save_path=output_dir / "simulation_summary.png")
+    plot_observation_proxies(result, save_path=output_dir / "observation_proxies.png")
+    plot_event_summary(result, save_path=output_dir / "event_summary.png")
+    plot_lineage_state_paths(result, save_path=output_dir / "lineage_state_paths.png")
 
-    # plot continuous phenotype evolution
-    plot_phenotype_evolution(
-        result,
-        title="Continuous Phenotype Evolution (Y)",
-        save_path=output_dir / "phenotype_evolution.pdf"
-    )
+    print(f"Results written to: {output_dir.resolve()}")
 
-    # State-ecDNA enrichment heatmap (Odds Ratio analysis)
-    plot_state_ecdna_enrichment(
-        result,
-        title="State-ecDNA Enrichment (log2(OR))",
-        save_path=output_dir / "state_ecdna_enrichment.pdf"
-    )
-
-    # Ogata thinning diagnostics
-    plot_ogata_thinning_diagnostics(
-        result,
-        title="Ogata Thinning Diagnostics",
-        save_path=output_dir / "ogata_thinning_diagnostics.pdf"
-    )
-
-    # Example 2: Treatment Comparison
-    # print("\n--- Example 2: Treatment Comparison ---")
-    
-    # trial = InSilicoTrial(base_seed=42)
-    
-    # # Run comparison
-    # protocols_to_compare = ["untreated", "cdk_inhibitor_continuous", "ecdna_targeting"]
-    
-    # results_dict = trial.compare_protocols(
-    #     protocol_names=protocols_to_compare,
-    #     n_replicates=2,
-    #     n_init=50,
-    #     verbose=True
-    # )
-    
-    # # Summarize
-    # print("\n--- Summary ---")
-    # for name in protocols_to_compare:
-    #     summary = trial.summarize_results(name)
-    #     print(f"\n{name}:")
-    #     print(f"  Final pop: {summary.get('final_pop_mean', 0):.1f} ± {summary.get('final_pop_std', 0):.1f}")
-    #     print(f"  Final ecDNA: {summary.get('final_ecdna_mean', 0):.2f} ± {summary.get('final_ecdna_std', 0):.2f}")
-    
-    # # Compare plots and save
-    # compare_treatments(results_dict, save_path=output_dir / "treatment_comparison.pdf")
-    
-    print("\n" + "=" * 60)
-    print("Simulation complete!")
-    print(f"Figures saved to: {output_dir.absolute()}")
-    print("=" * 60)
 
 if __name__ == "__main__":
     main()

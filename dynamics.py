@@ -1,478 +1,344 @@
 """
-ecDNA Copy-Number Kinetics Model - PDMP Dynamics
-Implements the flow (φ), jump intensities (λ), and transition kernel (Q).
+Derived quantities, continuous dynamics, and event-rate calculations for the ecDNA v4 model.
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+
 import numpy as np
-from numba import jit
-from typing import Tuple, Dict, List
-from cell import Cell
-import config as cfg
+
+import v4_config as cfg
 
 
+@dataclass(frozen=True)
+class ReplicateContext:
+    time: float
+    u_C: float
+    u_P: float
+    D_C: float
+    D_P: float
+    astrocytic_cue: float
+    mesenchymal_cue: float
 
-# Flow Between Events
+
+@dataclass(frozen=True)
+class DerivedQuantities:
+    log_copies: np.ndarray
+    effective_signaling: np.ndarray
+    burden: float
+    proliferative_signal: float
+    logits: np.ndarray
+    target_composition: np.ndarray
+    target_latent: np.ndarray
+    diffusion_scale: float
 
 
-def flow_age(a: float, delta: float) -> float:
-    """
-    Age evolution: dA/dt = 1
-    A(t + Δ) = a + Δ
-    """
-    return a + delta
+def update_exposure(current_exposure: float, dose: float, decay: float, conversion: float, dt: float) -> float:
+    next_value = current_exposure + dt * (-decay * current_exposure + conversion * dose)
+    cfg.require(next_value >= -1e-10, "Internal drug exposure must remain non-negative.")
+    return max(0.0, next_value)
 
 
-def flow_phenotype(y: np.ndarray, e: int, c: int, s: int, x: int,
-                   k_total: int, delta: float, rng: np.random.Generator = None) -> np.ndarray:
-    """
-    Phenomic dynamics (OU with diffusion):
-    dY = -B_{e,m}(Y - mu_{e,m}) dt + Sigma_{e,m} dW
-    """
-    if delta <= 0:
-        return y
+def compute_log_copies(copy_numbers: np.ndarray) -> np.ndarray:
+    return np.log1p(copy_numbers.astype(float))
 
-    if rng is None:
-        rng = np.random.default_rng()
 
-    mu = cfg.get_mu(e, c, s, x, k_total)
-    B = cfg.get_B(e, c, s, x)
-    Sigma = cfg.get_Sigma(e, c, s, x)
+def compute_effective_signaling(log_copies: np.ndarray, context: ReplicateContext) -> np.ndarray:
+    params = cfg.PARAMS.exposure
+    signaling = np.array(
+        [
+            log_copies[cfg.MYC],
+            log_copies[cfg.CDK4] / (1.0 + params.nu_C * context.D_C),
+            log_copies[cfg.PDGFRA] / (1.0 + params.nu_P * context.D_P),
+        ],
+        dtype=float,
+    )
+    cfg.require(np.all(np.isfinite(signaling)), "Effective signaling must be finite.")
+    return signaling
 
-    # Extract per-dimension relaxation rates.
-    if np.isscalar(B):
-        beta = np.full(cfg.P_DIM, float(B))
-    elif isinstance(B, np.ndarray) and B.ndim == 2 and B.shape[0] == B.shape[1]:
-        b0 = B[0, 0]
-        if np.allclose(B, np.eye(B.shape[0]) * b0):
-            beta = np.full(B.shape[0], float(b0))
-        else:
-            beta = np.diagonal(B).copy()
+
+def compute_total_burden(log_copies: np.ndarray) -> float:
+    burden = float(np.dot(cfg.PARAMS.exposure.burden_weights, log_copies))
+    cfg.require(np.isfinite(burden), "Total ecDNA burden must be finite.")
+    return burden
+
+
+def compute_proliferative_signal(effective_signaling: np.ndarray) -> float:
+    proliferative = float(
+        cfg.PARAMS.exposure.proliferative_weights[0] * effective_signaling[cfg.MYC]
+        + cfg.PARAMS.exposure.proliferative_weights[1] * effective_signaling[cfg.CDK4]
+    )
+    cfg.require(np.isfinite(proliferative), "Proliferative signal must be finite.")
+    return proliferative
+
+
+def compute_state_logits(effective_signaling: np.ndarray, burden: float, context: ReplicateContext) -> np.ndarray:
+    landscape = cfg.PARAMS.landscape
+    logits = (
+        landscape.alpha
+        + landscape.gamma_M * effective_signaling[cfg.MYC]
+        + landscape.gamma_C * effective_signaling[cfg.CDK4]
+        + landscape.gamma_P * effective_signaling[cfg.PDGFRA]
+        + landscape.eta_a * context.astrocytic_cue
+        + landscape.eta_m * context.mesenchymal_cue
+        - landscape.xi_B * burden
+    )
+    return np.asarray(logits, dtype=float)
+
+
+def compute_target_composition(logits: np.ndarray) -> np.ndarray:
+    composition = cfg.softmax(logits)
+    return composition
+
+
+def compute_target_latent(target_composition: np.ndarray) -> np.ndarray:
+    return cfg.ilr(target_composition)
+
+
+def compute_diffusion_scale(log_copies: np.ndarray) -> float:
+    scale = cfg.PARAMS.landscape.sigma_0 + cfg.PARAMS.landscape.sigma_M * log_copies[cfg.MYC]
+    cfg.require(scale >= 0.0, "Latent diffusion scale must be non-negative.")
+    return float(scale)
+
+
+def compute_derived_quantities(cell: "Cell", context: ReplicateContext) -> DerivedQuantities:
+    cached = cell.get_cached_derived_quantities(context)
+    if cached is not None:
+        return cached
+    log_copies = compute_log_copies(cell.copy_numbers)
+    signaling = compute_effective_signaling(log_copies, context)
+    burden = compute_total_burden(log_copies)
+    proliferative = compute_proliferative_signal(signaling)
+    logits = compute_state_logits(signaling, burden, context)
+    target_composition = compute_target_composition(logits)
+    target_latent = compute_target_latent(target_composition)
+    diffusion_scale = compute_diffusion_scale(log_copies)
+    derived = DerivedQuantities(
+        log_copies=log_copies,
+        effective_signaling=signaling,
+        burden=burden,
+        proliferative_signal=proliferative,
+        logits=logits,
+        target_composition=target_composition,
+        target_latent=target_latent,
+        diffusion_scale=diffusion_scale,
+    )
+    cell.cache_derived_quantities(context, derived)
+    return derived
+
+
+def compute_stress_attractor(cell: "Cell", derived: DerivedQuantities, context: ReplicateContext, cycle_state: int | None = None) -> float:
+    params = cfg.PARAMS.stress_survival
+    current_cycle = cell.cycle_state if cycle_state is None else cycle_state
+    in_replication = 1.0 if current_cycle in (cfg.S, cfg.G2M) else 0.0
+    return (
+        params.alpha_R
+        + params.r_B * derived.burden
+        + params.r_S * in_replication
+        + params.r_C * context.D_C
+        + params.r_P * context.D_P
+        + params.r_m * context.mesenchymal_cue
+    )
+
+
+def compute_survival_attractor(cell: "Cell", derived: DerivedQuantities, context: ReplicateContext, cycle_state: int | None = None) -> float:
+    params = cfg.PARAMS.stress_survival
+    current_cycle = cell.cycle_state if cycle_state is None else cycle_state
+    is_quiescent = 1.0 if current_cycle == cfg.Q else 0.0
+    return (
+        params.alpha_V
+        + params.v_M * cell.soft_state[cfg.MES]
+        + params.v_A * cell.soft_state[cfg.AC]
+        + params.v_Q * is_quiescent
+        - params.v_R * cell.stress
+        - params.v_C * context.D_C
+        - params.v_P * context.D_P
+        + params.v_a * context.astrocytic_cue
+    )
+
+
+def update_continuous_state(cell: "Cell", context: ReplicateContext, duration: float, rng: np.random.Generator) -> DerivedQuantities:
+    cfg.require(duration >= 0.0, "Flow duration must be non-negative.")
+    if duration == 0.0:
+        return compute_derived_quantities(cell, context)
+
+    derived_before = compute_derived_quantities(cell, context)
+    landscape = cfg.PARAMS.landscape
+    latent_noise = rng.normal(size=cfg.LATENT_DIM)
+    cell.latent_state = (
+        cell.latent_state
+        - landscape.B_U @ (cell.latent_state - derived_before.target_latent) * duration
+        + derived_before.diffusion_scale * np.sqrt(duration) * latent_noise
+    )
+    cell.soft_state = cfg.inverse_ilr(cell.latent_state)
+    cell.invalidate_derived_cache()
+
+    derived_after_u = compute_derived_quantities(cell, context)
+    params = cfg.PARAMS.stress_survival
+    stress_mean = compute_stress_attractor(cell, derived_after_u, context)
+    cell.stress = cell.stress - params.b_R * (cell.stress - stress_mean) * duration + params.sigma_R * np.sqrt(duration) * rng.normal()
+
+    survival_mean = compute_survival_attractor(cell, derived_after_u, context)
+    cell.survival = cell.survival - params.b_V * (cell.survival - survival_mean) * duration + params.sigma_V * np.sqrt(duration) * rng.normal()
+    cell.age += duration
+    cfg.require(np.isfinite(cell.stress), "Stress must remain finite after flow update.")
+    cfg.require(np.isfinite(cell.survival), "Survival reserve must remain finite after flow update.")
+    cfg.require(cell.age >= 0.0, "Cell age must remain non-negative after flow update.")
+    return derived_after_u
+
+
+def stress_window(stress_value: float) -> float:
+    params = cfg.PARAMS.turnover_window
+    return float(
+        cfg.sigmoid(params.eta_1 * (stress_value - params.r_L))
+        - cfg.sigmoid(params.eta_2 * (stress_value - params.r_U))
+    )
+
+
+def compute_cycle_transition_rates(cell: "Cell", derived: DerivedQuantities, context: ReplicateContext) -> dict[str, float]:
+    params = cfg.PARAMS.cycle
+    rates: dict[str, float] = {}
+    x_no = cell.soft_state[cfg.NPC] + cell.soft_state[cfg.OPC]
+    if cell.cycle_state == cfg.G1:
+        eta_g1s = (
+            params.beta_0
+            + params.beta_P * derived.proliferative_signal
+            + params.beta_NO * x_no
+            - params.beta_R * cell.stress
+            + params.beta_V * cell.survival
+            - params.beta_C * context.D_C
+            - params.beta_Pg * context.D_P
+        )
+        eta_g1q = (
+            params.gamma_0
+            + params.gamma_M * cell.soft_state[cfg.MES]
+            + params.gamma_R * cell.stress
+            + params.gamma_m * context.mesenchymal_cue
+            - params.gamma_V * cell.survival
+        )
+        rates["G1_to_S"] = params.qbar_G1S * cfg.sigmoid(eta_g1s)
+        rates["G1_to_Q"] = params.qbar_G1Q * cfg.sigmoid(eta_g1q)
+    elif cell.cycle_state == cfg.Q:
+        eta_qg1 = (
+            params.delta_0
+            + params.delta_P * derived.proliferative_signal
+            + params.delta_V * cell.survival
+            + params.delta_NO * x_no
+            - params.delta_R * cell.stress
+            - params.delta_m * context.mesenchymal_cue
+        )
+        rates["Q_to_G1"] = params.qbar_QG1 * cfg.sigmoid(eta_qg1)
+    elif cell.cycle_state == cfg.S:
+        eta_sg2m = params.kappa_0 - params.kappa_R * cell.stress + params.kappa_V * cell.survival
+        rates["S_to_G2M"] = params.qbar_SG2M * cfg.sigmoid(eta_sg2m)
+    return rates
+
+
+def compute_turnover_rates(cell: "Cell", derived: DerivedQuantities, context: ReplicateContext) -> dict[str, float]:
+    rates: dict[str, float] = {}
+    window_value = stress_window(cell.stress)
+    for species_name in cfg.SPECIES:
+        species_idx = cfg.SPECIES_INDEX[species_name]
+        species_params = cfg.PARAMS.turnover[species_name]
+        if cell.cycle_state in (cfg.S, cfg.G2M):
+            gain_eta = (
+                species_params.a0
+                + species_params.a_R * window_value
+                + species_params.a_prol * derived.proliferative_signal
+                + species_params.a_C * context.D_C
+                + species_params.a_P * context.D_P
+            )
+            rates[f"gain_{species_name}"] = species_params.gain_ceiling * cfg.sigmoid(gain_eta)
+
+        if cell.copy_numbers[species_idx] > 0:
+            loss_eta = (
+                species_params.b0
+                + species_params.b_R * cell.stress
+                - species_params.b_V * cell.survival
+                + species_params.b_C * context.D_C
+                + species_params.b_P * context.D_P
+            )
+            rates[f"loss_{species_name}"] = species_params.loss_ceiling * cfg.sigmoid(loss_eta)
+    return rates
+
+
+def burden_penalty(burden: float) -> float:
+    params = cfg.PARAMS.hazard
+    return params.chi_B * (burden - params.B_star) ** 2
+
+
+def compute_division_hazard(cell: "Cell", derived: DerivedQuantities, context: ReplicateContext) -> float:
+    if cell.cycle_state != cfg.G2M:
+        return 0.0
+    params = cfg.PARAMS.hazard
+    x_no = cell.soft_state[cfg.NPC] + cell.soft_state[cfg.OPC]
+    eta = (
+        params.theta_0
+        + params.theta_P * derived.proliferative_signal
+        + params.theta_NO * x_no
+        - params.theta_R * cell.stress
+        - burden_penalty(derived.burden)
+        + params.theta_V * cell.survival
+    )
+    return params.lambda_div_ceiling * cfg.sigmoid(eta)
+
+
+def compute_death_hazard(cell: "Cell", derived: DerivedQuantities, context: ReplicateContext) -> float:
+    params = cfg.PARAMS.hazard
+    W_C = cell.soft_state[cfg.NPC] + params.omega_O_given_C * cell.soft_state[cfg.OPC]
+    W_P = cell.soft_state[cfg.OPC]
+    eta = (
+        params.phi_0
+        + params.phi_R * cell.stress
+        - params.phi_V * cell.survival
+        + params.phi_M * cell.soft_state[cfg.MES]
+        + params.phi_B * derived.burden
+        + params.chi_C * context.D_C * derived.log_copies[cfg.CDK4] * W_C
+        + params.chi_P * context.D_P * derived.log_copies[cfg.PDGFRA] * W_P
+    )
+    return params.lambda_death_ceiling * cfg.sigmoid(eta)
+
+
+def compute_all_event_rates(cell: "Cell", derived: DerivedQuantities, context: ReplicateContext) -> dict[str, float]:
+    rates = {}
+    rates.update(compute_cycle_transition_rates(cell, derived, context))
+    rates.update(compute_turnover_rates(cell, derived, context))
+    rates["division"] = compute_division_hazard(cell, derived, context)
+    rates["death"] = compute_death_hazard(cell, derived, context)
+    return {name: float(rate) for name, rate in rates.items() if rate > 0.0}
+
+
+def apply_nonterminal_event(cell: "Cell", event_name: str) -> None:
+    if event_name == "G1_to_S":
+        cell.cycle_state = cfg.S
+    elif event_name == "G1_to_Q":
+        cell.cycle_state = cfg.Q
+    elif event_name == "Q_to_G1":
+        cell.cycle_state = cfg.G1
+    elif event_name == "S_to_G2M":
+        cell.cycle_state = cfg.G2M
+    elif event_name.startswith("gain_"):
+        species = event_name.split("_", 1)[1]
+        idx = cfg.SPECIES_INDEX[species]
+        cell.copy_numbers[idx] += 1
+    elif event_name.startswith("loss_"):
+        species = event_name.split("_", 1)[1]
+        idx = cfg.SPECIES_INDEX[species]
+        cfg.require(cell.copy_numbers[idx] > 0, f"Cannot lose ecDNA from zero-copy species {species}.")
+        cell.copy_numbers[idx] -= 1
     else:
-        beta = np.full(cfg.P_DIM, cfg.B_RELAX_RATE)
-
-    # Extract per-dimension diffusion.
-    if np.isscalar(Sigma):
-        sigma = np.full(cfg.P_DIM, float(Sigma))
-    elif isinstance(Sigma, np.ndarray) and Sigma.ndim == 1:
-        sigma = Sigma.copy()
-    elif isinstance(Sigma, np.ndarray) and Sigma.ndim == 2:
-        sigma = np.diagonal(Sigma).copy()
-    else:
-        sigma = np.zeros(cfg.P_DIM)
-
-    beta_safe = np.maximum(beta, 1e-12)
-    exp_term = np.exp(-beta_safe * delta)
-    mean = mu + exp_term * (y - mu)
-    var = (sigma ** 2) / (2.0 * beta_safe) * (1.0 - np.exp(-2.0 * beta_safe * delta))
-    var = np.maximum(var, 0.0)
-    noise = rng.normal(0.0, 1.0, size=mu.shape) * np.sqrt(var)
-    return mean + noise
+        raise ValueError(f"Unsupported nonterminal event: {event_name}")
+    cell.invalidate_derived_cache()
+    cell.validate()
 
 
-def apply_flow(cell: Cell, delta: float, rng: np.random.Generator = None) -> None:
-    """
-    Apply PDMP flow φ(z, Δ) to cell in-place.
-    Updates age and phenotype; (E, M, K) remain constant.
-    """
-    cell.a = flow_age(cell.a, delta)
-    k_total = cell.total_ecdna()
-    cell.y = flow_phenotype(cell.y, cell.e, cell.c, cell.s, cell.x, k_total, delta, rng=rng)
-
-
-def lazy_apply_flow(cell: Cell, target_time: float, rng: np.random.Generator = None) -> None:
-    """
-    Lazily apply PDMP flow to cell in-place.
-    Only applies flow if target_time > cell.last_update_time.
-    Updates cell.last_update_time after applying flow.
-    
-    Args:
-        cell: Cell to update
-        target_time: Target time to advance to
-    """
-    delta = target_time - cell.last_update_time
-    if delta > 1e-12:  # Only apply if meaningful time has passed
-        apply_flow(cell, delta, rng=rng)
-        cell.last_update_time = target_time
-
-
-def batch_lazy_apply_flow(cells: list, target_time: float, rng: np.random.Generator = None) -> None:
-    """
-    Lazily apply flow to all cells, advancing each to target_time.
-    Used at record times when all cell states must be synchronized.
-    
-    Args:
-        cells: List of Cell objects
-        target_time: Target time to advance all cells to
-    """
-    for cell in cells:
-        lazy_apply_flow(cell, target_time, rng=rng)
-
-
-
-# Jump Channel Intensities
-
-
-@jit(nopython=True, cache=True)
-def sigmoid(x: float) -> float:
-    """Sigmoid function σ(x) = 1/(1+exp(-x))."""
-    # Manual clamp to keep numba nopython-friendly on scalars.
-    if x < -500.0:
-        x = -500.0
-    elif x > 500.0:
-        x = 500.0
-    return 1.0 / (1.0 + np.exp(-x))
-
-
-def ddr_hump(y_ddr: float) -> float:
-    """Bounded hump for DDR-driven gain."""
-    width = max(cfg.DDR_HUMP_WIDTH, 1e-6)
-    return sigmoid((y_ddr - cfg.DDR_HUMP_THETA1) / width) - sigmoid((y_ddr - cfg.DDR_HUMP_THETA2) / width)
-
-
-def drug_effect(u: float, drug: cfg.DrugParams, effect_type: str) -> float:
-    """
-    Compute drug modulator using Hill/Emax form.
-    
-    Inhibition: 1 - Emax * u^n / (EC50^n + u^n)
-    Activation: 1 + Emax * u^n / (EC50^n + u^n)
-    """
-    if u <= 0:
-        return 1.0
-    
-    hill = (u ** drug.hill_n) / (drug.ec50 ** drug.hill_n + u ** drug.hill_n)
-    
-    if effect_type == "inhibit":
-        return 1.0 - drug.emax * hill
-    else:  # activate
-        return 1.0 + drug.emax * hill
-
-
-class JumpIntensities:
-    """
-    Computes all jump channel intensities for a cell state.
-    """
-    
-    def __init__(self, drug_schedule: Dict = None):
-        self.drug_schedule = drug_schedule or cfg.DRUG_SCHEDULE
-    
-    def get_drug_conc(self, t: float) -> Dict[str, float]:
-        """Get current drug concentrations."""
-        return {name: schedule(t) for name, schedule in self.drug_schedule.items()}
-    
-
-    # CTMC Switching Rates
-
-    def cycle_switch_rate(self, cell: Cell, c_new: int, t: float,
-                          drug_conc: Dict[str, float] = None) -> float:
-        """Cell-cycle switching rate q^cycle_{c→c'}."""
-        if (cell.c, c_new) not in cfg.CYCLE_RATES:
-            return 0.0
-        
-        base_rate = cfg.CYCLE_RATES[(cell.c, c_new)]
-        
-        # Drug modulation (e.g., CDK inhibitor blocks G1→S)
-        drug_mod = 1.0
-        if drug_conc is None:
-            drug_conc = self.get_drug_conc(t)
-        u = drug_conc.get("cell_cycle_inhibitor", 0.0)
-        if u > 0 and cell.c == 1 and c_new == 2:  # G1→S
-            drug_mod = drug_effect(u, cfg.DRUGS["cell_cycle_inhibitor"], "inhibit")
-        
-        return cfg.Q_MAX_CYCLE * sigmoid(np.log(base_rate / (1 - base_rate + 1e-10))) * drug_mod
-    
-    def sen_switch_rate(self, cell: Cell, s_new: int, t: float,
-                        k_total: int = None) -> float:
-        """Senescence switching rate q^sen_{s→s'}."""
-        if (cell.s, s_new) not in cfg.SEN_RATES:
-            return 0.0
-        
-        base_rate = cfg.SEN_RATES[(cell.s, s_new)]
-        
-        # ecDNA can accelerate senescence
-        if k_total is None:
-            k_total = cell.total_ecdna()
-        k_effect = 1.0 + 0.01 * k_total
-        y_ddr = cell.y[cfg.Y_DDR_IDX]
-        eta = np.log(base_rate * k_effect + 1e-10) + cfg.SEN_DDR_EFFECT * y_ddr
-        return cfg.Q_MAX_SEN * sigmoid(eta) 
-    
-    def expr_switch_rate(self, cell: Cell, x_new: int, t: float) -> float:
-        """Expression program switching rate q^expr_{x→x'}."""
-        if (cell.x, x_new) not in cfg.EXPR_RATES:
-            return 0.0
-        
-        base_rate = cfg.EXPR_RATES[(cell.x, x_new)]
-        return cfg.Q_MAX_EXPR * sigmoid(np.log(base_rate / (1 - base_rate + 1e-10)))
-    
-    def all_switch_rates(self, cell: Cell, t: float,
-                         drug_conc: Dict[str, float] = None,
-                         k_total: int = None) -> List[Tuple[str, dict, float]]:
-        """Get all non-zero switching rates."""
-        rates = []
-        
-        # Cycle switches
-        for c_new in cfg.CYCLE_STATES:
-            if c_new != cell.c:
-                r = self.cycle_switch_rate(cell, c_new, t, drug_conc=drug_conc)
-                if r > 0:
-                    rates.append(("cycle", {"c_new": c_new}, r))
-        
-        # Senescence switches
-        for s_new in cfg.SEN_STATES:
-            if s_new != cell.s:
-                r = self.sen_switch_rate(cell, s_new, t, k_total=k_total)
-                if r > 0:
-                    rates.append(("sen", {"s_new": s_new}, r))
-        
-        # Expression switches
-        for x_new in cfg.EXPR_STATES:
-            if x_new != cell.x:
-                r = self.expr_switch_rate(cell, x_new, t)
-                if r > 0:
-                    rates.append(("expr", {"x_new": x_new}, r))
-        
-        return rates
-    
-    
-    # Inter-division ecDNA Gain/Loss
-    
-    
-    def ecdna_gain_rate(self, cell: Cell, j: int, t: float,
-                        drug_conc: Dict[str, float] = None) -> float:
-        """ecDNA gain rate μ^gain_{e,m,j}(k,y,a;u)."""
-        if not cfg.ENABLE_INTERDIV_ECDNA:
-            return 0.0
-        
-        y_ddr = cell.y[cfg.Y_DDR_IDX]
-        k_j = cell.k[j]
-        myc_flag = 1.0 if cell.x in cfg.MYC_STATES else 0.0
-        eta = (
-            cfg.GAIN_ETA_BASE
-            + cfg.GAIN_ETA_K * np.log1p(k_j)
-            + cfg.GAIN_ETA_MYC * myc_flag
-            + cfg.GAIN_ETA_DDR_HUMP * ddr_hump(y_ddr)
-        )
-        
-        # Drug modulation (logit shift, bounded by MU_GAIN_MAX)
-        if drug_conc is None:
-            drug_conc = self.get_drug_conc(t)
-        u = drug_conc.get("ecdna_destabilizer", 0.0)
-        if u > 0:
-            mod = drug_effect(u, cfg.DRUGS["ecdna_destabilizer"], "inhibit")
-            eta += np.log(max(mod, 1e-12))
-        
-        return cfg.MU_GAIN_MAX * sigmoid(eta)
-    
-    def ecdna_loss_rate(self, cell: Cell, j: int, t: float,
-                        drug_conc: Dict[str, float] = None) -> float:
-        """ecDNA loss rate μ^loss_{e,m,j}(k,y,a;u) * k_j (per-copy loss)."""
-        if not cfg.ENABLE_INTERDIV_ECDNA:
-            return 0.0
-        if cell.k[j] <= 1: # Prevent losing the last copy
-            return 0.0
-        
-        y_ddr = cell.y[cfg.Y_DDR_IDX]
-        y_surv = cell.y[cfg.Y_SURV_IDX]
-        k_j = cell.k[j]
-        eta = (
-            cfg.LOSS_ETA_BASE
-            + cfg.LOSS_ETA_K * np.log1p(k_j)
-            + cfg.LOSS_ETA_DDR * y_ddr
-            - cfg.LOSS_ETA_SURV * y_surv
-        )
-        
-        # Drug modulation (logit shift, bounded by MU_LOSS_MAX)
-        if drug_conc is None:
-            drug_conc = self.get_drug_conc(t)
-        u = drug_conc.get("ecdna_destabilizer", 0.0)
-        if u > 0:
-            mod = drug_effect(u, cfg.DRUGS["ecdna_destabilizer"], "activate")
-            eta += np.log(max(mod, 1e-12))
-        
-        return cfg.MU_LOSS_MAX * sigmoid(eta)
-    
-    def all_ecdna_rates(self, cell: Cell, t: float,
-                        drug_conc: Dict[str, float] = None) -> List[Tuple[str, dict, float]]:
-        """Get all ecDNA gain/loss rates."""
-        rates = []
-        for j in range(cfg.J_ECDNA):
-            # Gain
-            r_gain = self.ecdna_gain_rate(cell, j, t, drug_conc=drug_conc)
-            if r_gain > 0 and cell.k[j] < cfg.K_MAX[j]:
-                rates.append(("ecdna_gain", {"j": j}, r_gain))
-            
-            # Loss
-            r_loss = self.ecdna_loss_rate(cell, j, t, drug_conc=drug_conc)
-            if r_loss > 0:
-                rates.append(("ecdna_loss", {"j": j}, r_loss))
-        
-        return rates
-    
-    
-    # Division and Death Hazards
-    
-    
-    def division_hazard(self, cell: Cell, t: float,
-                        drug_conc: Dict[str, float] = None,
-                        k_total: int = None) -> float:
-        """
-        Division hazard λ^div_i(a, y; u).
-        Only G2M phase can divide.
-        
-        ecDNA effect: Inverted-U (Gaussian) relationship
-        - Optimal ecDNA copy number maximizes division rate
-        - Too few or too many copies reduce division fitness
-        """
-        # Cycle-phase gating
-        base_rate = cfg.DIV_HAZARD_BY_CYCLE.get(cell.c, 0.0)
-        if base_rate == 0:
-            return 0.0
-        
-        # Senescent cells don't divide
-        if cell.s == 2:
-            return 0.0
-        
-        # Age dependence (maturation)
-        if cfg.USE_AGE_DEPENDENT_HAZARD:
-            age_factor = 1.0 - np.exp(-cfg.AGE_HAZARD_SCALE * cell.a)
-        else:
-            age_factor = 1.0
-        
-        # ecDNA fitness effect: Inverted-U (Gaussian) function
-        # k_effect = baseline + (peak - baseline) * exp(-((k - k_opt) / sigma)^2)
-        if k_total is None:
-            k_total = cell.total_ecdna()
-        deviation = (k_total - cfg.ECDNA_OPTIMAL_COPIES) / cfg.ECDNA_FITNESS_WIDTH
-        k_effect = cfg.ECDNA_FITNESS_BASELINE + \
-                   (cfg.ECDNA_FITNESS_PEAK - cfg.ECDNA_FITNESS_BASELINE) * np.exp(-deviation ** 2)
-        
-        # Drug modulation
-        drug_mod = 1.0
-        if drug_conc is None:
-            drug_conc = self.get_drug_conc(t)
-        u = drug_conc.get("cell_cycle_inhibitor", 0.0)
-        if u > 0:
-            drug_mod = drug_effect(u, cfg.DRUGS["cell_cycle_inhibitor"], "inhibit")
-        
-        eta = np.log(base_rate * age_factor * k_effect * drug_mod + 1e-10)
-        return cfg.LAMBDA_DIV_MAX * sigmoid(eta)
-    
-    def death_hazard(self, cell: Cell, t: float,
-                     drug_conc: Dict[str, float] = None,
-                     k_total: int = None) -> float:
-        """
-        Death hazard λ^death_i(a, y; u).
-        
-        ecDNA effect: Linear relationship (higher ecDNA -> higher death risk)
-        This reflects genomic instability cost of carrying many ecDNA copies.
-        """
-        # Base death rate
-        base_rate = cfg.DEATH_HAZARD_BASE
-        
-        # Senescence increases death risk
-        sen_mult = cfg.DEATH_HAZARD_SEN_MULT.get(cell.s, 1.0)
-        
-        # ecDNA increases death risk (linear relationship)
-        if k_total is None:
-            k_total = cell.total_ecdna()
-        k_effect = 1.0 + cfg.ECDNA_DEATH_EFFECT * k_total
-        
-        # Drug modulation (senolytic targets senescent cells)
-        drug_mod = 1.0
-        if drug_conc is None:
-            drug_conc = self.get_drug_conc(t)
-        u = drug_conc.get("senolytic", 0.0)
-        if u > 0 and cell.s >= 1:  # senolytic targets pre-senescent and senescent
-            drug_mod = drug_effect(u, cfg.DRUGS["senolytic"], "activate")
-        
-        y_ddr = cell.y[cfg.Y_DDR_IDX]
-        y_surv = cell.y[cfg.Y_SURV_IDX]
-        beta_ddr = cfg.DEATH_BETA_DDR_BY_EXPR[cell.x]
-        eta = (
-            np.log(base_rate * sen_mult * k_effect * drug_mod + 1e-10)
-            + beta_ddr * y_ddr
-            - cfg.DEATH_BETA_SURV * y_surv
-        )
-        return cfg.LAMBDA_DEATH_MAX * sigmoid(eta)
-    
-    
-    # Total Intensity
-    
-    
-    def compute_all_rates(self, cell: Cell, t: float) -> Tuple[List[Tuple], float]:
-        """
-        Compute all channel rates and total intensity.
-        
-        Returns:
-            channels: List of (channel_type, params, rate)
-            total: Total intensity λ(z; t)
-        """
-        drug_conc = self.get_drug_conc(t)
-        k_total = cell.total_ecdna()
-        channels = []
-        
-        # Switching rates
-        channels.extend(self.all_switch_rates(cell, t, drug_conc=drug_conc, k_total=k_total))
-        
-        # ecDNA rates
-        channels.extend(self.all_ecdna_rates(cell, t, drug_conc=drug_conc))
-        
-        # Terminal events
-        div_rate = self.division_hazard(cell, t, drug_conc=drug_conc, k_total=k_total)
-        if div_rate > 0:
-            channels.append(("division", {}, div_rate))
-        
-        death_rate = self.death_hazard(cell, t, drug_conc=drug_conc, k_total=k_total)
-        if death_rate > 0:
-            channels.append(("death", {}, death_rate))
-        
-        total = sum(r for _, _, r in channels)
-        return channels, total
-    
-    def compute_dominating_bound(self) -> float:
-        """
-        Compute global upper bound r̄ for Ogata thinning.
-        Sum of all channel maxima.
-        """
-        bound = 0.0
-        
-        # Switching channels
-        bound += cfg.Q_MAX_CYCLE * len(cfg.CYCLE_RATES)
-        bound += cfg.Q_MAX_SEN * len(cfg.SEN_RATES)
-        bound += cfg.Q_MAX_EXPR * len(cfg.EXPR_RATES)
-        
-        # ecDNA channels
-        if cfg.ENABLE_INTERDIV_ECDNA:
-            for j in range(cfg.J_ECDNA):
-                bound += cfg.MU_GAIN_MAX  # gain
-                bound += cfg.MU_LOSS_MAX  # loss
-        
-        # Terminal events
-        bound += cfg.LAMBDA_DIV_MAX
-        bound += cfg.LAMBDA_DEATH_MAX
-        
-        return bound
-
-
-
-# Transition Kernel (non-branching channels)
-
-
-def apply_transition(cell: Cell, channel_type: str, params: dict) -> None:
-    """
-    Apply state transition for non-branching channels.
-    Modifies cell in-place.
-    """
-    if channel_type == "cycle":
-        cell.c = params["c_new"]
-    elif channel_type == "sen":
-        cell.s = params["s_new"]
-    elif channel_type == "expr":
-        cell.x = params["x_new"]
-    elif channel_type == "ecdna_gain":
-        j = params["j"]
-        cell.k[j] = min(cell.k[j] + 1, cfg.K_MAX[j])
-    elif channel_type == "ecdna_loss":
-        j = params["j"]
-        cell.k[j] = max(cell.k[j] - 1, 0)
-    # division and death handled separately
+def compute_local_transition_generator(logits: np.ndarray) -> np.ndarray:
+    params = cfg.PARAMS.generator
+    generator = np.zeros((cfg.N_STATES, cfg.N_STATES), dtype=float)
+    for (source, target), base_rate in params.base_edges.items():
+        gamma = params.gamma_edges[(source, target)]
+        generator[source, target] = base_rate * np.exp(gamma * (logits[target] - logits[source]))
+    for idx in range(cfg.N_STATES):
+        generator[idx, idx] = -np.sum(generator[idx, :])
+    return generator

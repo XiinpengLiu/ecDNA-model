@@ -1,312 +1,352 @@
 """
-ecDNA Copy-Number Kinetics Model - Configuration Parameters
-All tunable parameters are centralized here for convenient modification.
+Configuration and shared math utilities for the ecDNA v4 model.
 """
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable, Dict
 
 import numpy as np
 
 
-# 1. STATE SPACE DEFINITIONS
+SPECIES = ("MYC", "CDK4", "PDGFRA")
+STATE_NAMES = ("NPC-like", "OPC-like", "AC-like", "MES-like")
+CYCLE_NAMES = ("Q", "G1", "S", "G2M")
 
-# Environment stages E ∈ {0: baseline, 1: treatment}
-ENV_STATES = [0, 1]
-ENV_NAMES = {0: "baseline", 1: "treatment"}
+SPECIES_INDEX = {name: idx for idx, name in enumerate(SPECIES)}
+STATE_INDEX = {name: idx for idx, name in enumerate(STATE_NAMES)}
+CYCLE_INDEX = {name: idx for idx, name in enumerate(CYCLE_NAMES)}
 
-# Cell-cycle phases C ∈ {0: G0, 1: G1, 2: S, 3: G2M}
-CYCLE_STATES = [0, 1, 2, 3]
-CYCLE_NAMES = {0: "G0", 1: "G1", 2: "S", 3: "G2M"}
+N_SPECIES = len(SPECIES)
+N_STATES = len(STATE_NAMES)
+LATENT_DIM = N_STATES - 1
+N_CYCLE = len(CYCLE_NAMES)
 
-# Senescence status S ∈ {0: normal, 1: pre-senescent, 2: senescent}
-SEN_STATES = [0, 1, 2]
-SEN_NAMES = {0: "normal", 1: "pre-sen", 2: "senescent"}
+MYC = SPECIES_INDEX["MYC"]
+CDK4 = SPECIES_INDEX["CDK4"]
+PDGFRA = SPECIES_INDEX["PDGFRA"]
 
-# Expression program X {0: basal, 1: MYC, 2: TP53, 3: MYC_TP53}
-EXPR_STATES = [0, 1, 2, 3]
-EXPR_NAMES = {0: "basal", 1: "MYC", 2: "TP53", 3: "MYC_TP53"}
+NPC = STATE_INDEX["NPC-like"]
+OPC = STATE_INDEX["OPC-like"]
+AC = STATE_INDEX["AC-like"]
+MES = STATE_INDEX["MES-like"]
 
-# Number of ecDNA species
-J_ECDNA = 1
+Q = CYCLE_INDEX["Q"]
+G1 = CYCLE_INDEX["G1"]
+S = CYCLE_INDEX["S"]
+G2M = CYCLE_INDEX["G2M"]
 
-# Truncation bounds K_max,j for each ecDNA species
-K_MAX = np.array([100])  # shape: (J,)
-
-# Phenomic state dimension P
-P_DIM = 2
-# Phenotype axes
-Y_DDR_IDX = 0
-Y_SURV_IDX = 1
-
-# Expression program groups
-MYC_STATES = (1, 3)
-TP53_INACTIVE_STATES = (2, 3)
-
-
-# 2. PHENOMIC DYNAMICS (OU Process Parameters)
+HELMERT_SUBMATRIX = np.array(
+    [
+        [1.0 / np.sqrt(2.0), 1.0 / np.sqrt(6.0), 1.0 / np.sqrt(12.0)],
+        [-1.0 / np.sqrt(2.0), 1.0 / np.sqrt(6.0), 1.0 / np.sqrt(12.0)],
+        [0.0, -2.0 / np.sqrt(6.0), 1.0 / np.sqrt(12.0)],
+        [0.0, 0.0, -3.0 / np.sqrt(12.0)],
+    ],
+    dtype=float,
+)
 
 
-# Attractor μ_{e,m} for each (env, cycle, sen, expr) combination
-# Shape: (n_env, n_cycle, n_sen, n_expr, P)
-# Simplified: use default attractors based on expression program
-MU_DDR_BASE = 0.0
-MU_SURV_BASE = 0.0
-MU_DDR_BY_CYCLE = np.array([0.0, 0.1, 0.3, 0.2])
-MU_DDR_BY_SEN = np.array([0.0, 0.2, 0.5])
-MU_DDR_BY_EXPR = np.array([0.0, 0.6, 0.1, 0.7])
-MU_DDR_BY_ENV = np.array([0.0, 0.3])
-MU_DDR_K_LOG = 0.09
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
 
-MU_SURV_BY_EXPR = np.array([0.0, 0.1, 0.6, 0.7])
-MU_SURV_BY_SEN = np.array([0.0, 0.2, 0.4])
-MU_SURV_BY_ENV = np.array([0.0, -0.2])
 
-def get_mu(e, c, s, x, k_total=0):
-    """State-dependent phenomic attractor."""
-    mu_ddr = (
-        MU_DDR_BASE
-        + MU_DDR_BY_CYCLE[c]
-        + MU_DDR_BY_SEN[s]
-        + MU_DDR_BY_EXPR[x]
-        + MU_DDR_K_LOG * np.log1p(k_total)
-        + MU_DDR_BY_ENV[e]
+def sigmoid(x: float | np.ndarray) -> float | np.ndarray:
+    x_array = np.asarray(x, dtype=float)
+    x_clamped = np.clip(x_array, -500.0, 500.0)
+    result = 1.0 / (1.0 + np.exp(-x_clamped))
+    if np.isscalar(x):
+        return float(result)
+    return result
+
+
+def softmax(logits: np.ndarray) -> np.ndarray:
+    logits = np.asarray(logits, dtype=float)
+    require(logits.shape == (N_STATES,), f"Expected {N_STATES} logits, got {logits.shape}.")
+    shifted = logits - np.max(logits)
+    weights = np.exp(shifted)
+    total = np.sum(weights)
+    require(np.isfinite(total) and total > 0.0, "Softmax denominator must be positive.")
+    return weights / total
+
+
+def closure(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    require(values.shape == (N_STATES,), f"Expected {N_STATES} composition entries, got {values.shape}.")
+    require(np.all(np.isfinite(values)), "Composition values must be finite.")
+    require(np.all(values > 0.0), "Composition values must be strictly positive.")
+    total = float(np.sum(values))
+    require(np.isfinite(total) and total > 0.0, "Composition sum must be finite and positive.")
+    return values / total
+
+
+def ilr(composition: np.ndarray) -> np.ndarray:
+    composition = closure(composition)
+    latent = HELMERT_SUBMATRIX.T @ np.log(composition)
+    require(latent.shape == (LATENT_DIM,), f"Expected latent dimension {LATENT_DIM}, got {latent.shape}.")
+    return latent
+
+
+def inverse_ilr(latent: np.ndarray) -> np.ndarray:
+    latent = np.asarray(latent, dtype=float)
+    require(latent.shape == (LATENT_DIM,), f"Expected latent dimension {LATENT_DIM}, got {latent.shape}.")
+    return closure(np.exp(HELMERT_SUBMATRIX @ latent))
+
+
+def validate_copy_vector(copy_vector: np.ndarray) -> None:
+    copy_vector = np.asarray(copy_vector)
+    require(copy_vector.shape == (N_SPECIES,), f"Expected {N_SPECIES} ecDNA species, got {copy_vector.shape}.")
+    require(np.issubdtype(copy_vector.dtype, np.integer), "ecDNA copy numbers must be integer-valued.")
+    require(np.all(copy_vector >= 0), "ecDNA copy numbers must be non-negative.")
+
+
+def validate_simplex(composition: np.ndarray) -> None:
+    composition = np.asarray(composition, dtype=float)
+    require(composition.shape == (N_STATES,), f"Expected {N_STATES}-state composition, got {composition.shape}.")
+    require(np.all(np.isfinite(composition)), "Soft state composition must be finite.")
+    require(np.all(composition > 0.0), "Soft state composition must be strictly positive.")
+    total = float(np.sum(composition))
+    require(abs(total - 1.0) <= 1e-8, f"Soft state composition must sum to 1, got {total}.")
+
+
+def validate_cycle_state(cycle_state: int) -> None:
+    require(cycle_state in range(N_CYCLE), f"Invalid cycle state index: {cycle_state}.")
+
+
+@dataclass(frozen=True)
+class ExposureParameters:
+    k_C: float = 0.25
+    k_P: float = 0.25
+    eta_C: float = 1.0
+    eta_P: float = 1.0
+    D_C0: float = 0.0
+    D_P0: float = 0.0
+    nu_C: float = 0.85
+    nu_P: float = 0.85
+    burden_weights: np.ndarray = field(default_factory=lambda: np.array([0.65, 0.70, 0.70], dtype=float))
+    proliferative_weights: np.ndarray = field(default_factory=lambda: np.array([0.95, 0.75], dtype=float))
+
+
+@dataclass(frozen=True)
+class StateLandscapeParameters:
+    alpha: np.ndarray = field(default_factory=lambda: np.array([0.25, 0.15, -0.05, -0.25], dtype=float))
+    gamma_M: np.ndarray = field(default_factory=lambda: np.array([0.20, 0.05, 0.00, 0.05], dtype=float))
+    gamma_C: np.ndarray = field(default_factory=lambda: np.array([1.10, 0.15, -0.20, -0.10], dtype=float))
+    gamma_P: np.ndarray = field(default_factory=lambda: np.array([0.05, 1.05, -0.15, -0.10], dtype=float))
+    eta_a: np.ndarray = field(default_factory=lambda: np.array([-0.15, -0.10, 1.15, -0.10], dtype=float))
+    eta_m: np.ndarray = field(default_factory=lambda: np.array([-0.20, -0.15, -0.10, 1.10], dtype=float))
+    xi_B: np.ndarray = field(default_factory=lambda: np.array([0.10, 0.10, 0.06, 0.12], dtype=float))
+    B_U: np.ndarray = field(default_factory=lambda: np.diag(np.array([0.85, 0.80, 0.75], dtype=float)))
+    sigma_0: float = 0.12
+    sigma_M: float = 0.05
+
+
+@dataclass(frozen=True)
+class StressSurvivalParameters:
+    alpha_R: float = 0.05
+    r_B: float = 0.18
+    r_S: float = 0.45
+    r_C: float = 0.35
+    r_P: float = 0.35
+    r_m: float = 0.20
+    b_R: float = 0.90
+    sigma_R: float = 0.12
+    alpha_V: float = 0.40
+    v_M: float = 0.45
+    v_A: float = 0.32
+    v_Q: float = 0.22
+    v_R: float = 0.35
+    v_C: float = 0.18
+    v_P: float = 0.18
+    v_a: float = 0.24
+    b_V: float = 0.85
+    sigma_V: float = 0.10
+
+
+@dataclass(frozen=True)
+class CycleTransitionParameters:
+    qbar_G1S: float = 0.70
+    qbar_G1Q: float = 0.14
+    qbar_QG1: float = 0.42
+    qbar_SG2M: float = 0.65
+    beta_0: float = -0.90
+    beta_P: float = 1.05
+    beta_NO: float = 0.65
+    beta_R: float = 0.45
+    beta_V: float = 0.55
+    beta_C: float = 0.75
+    beta_Pg: float = 0.35
+    gamma_0: float = -1.70
+    gamma_M: float = 0.65
+    gamma_R: float = 0.65
+    gamma_m: float = 0.35
+    gamma_V: float = 0.40
+    delta_0: float = -0.95
+    delta_P: float = 0.95
+    delta_V: float = 0.50
+    delta_NO: float = 0.55
+    delta_R: float = 0.40
+    delta_m: float = 0.25
+    kappa_0: float = -0.35
+    kappa_R: float = 0.45
+    kappa_V: float = 0.40
+
+
+@dataclass(frozen=True)
+class TurnoverWindowParameters:
+    eta_1: float = 2.4
+    eta_2: float = 2.2
+    r_L: float = 0.35
+    r_U: float = 1.10
+
+
+@dataclass(frozen=True)
+class TurnoverSpeciesParameters:
+    gain_ceiling: float
+    loss_ceiling: float
+    a0: float
+    a_R: float
+    a_prol: float
+    a_C: float
+    a_P: float
+    b0: float
+    b_R: float
+    b_V: float
+    b_C: float
+    b_P: float
+
+
+@dataclass(frozen=True)
+class HazardParameters:
+    lambda_div_ceiling: float = 0.62
+    lambda_death_ceiling: float = 0.24
+    theta_0: float = -0.15
+    theta_P: float = 1.00
+    theta_NO: float = 0.70
+    theta_R: float = 0.50
+    theta_V: float = 0.65
+    B_star: float = 3.9
+    chi_B: float = 0.10
+    phi_0: float = -2.10
+    phi_R: float = 0.75
+    phi_V: float = 0.95
+    phi_M: float = 0.15
+    phi_B: float = 0.10
+    chi_C: float = 0.55
+    chi_P: float = 0.55
+    omega_O_given_C: float = 0.45
+
+
+@dataclass(frozen=True)
+class DivisionParameters:
+    lambda_amp_ceiling: np.ndarray = field(default_factory=lambda: np.zeros(N_SPECIES, dtype=float))
+    c0: np.ndarray = field(default_factory=lambda: np.zeros(N_SPECIES, dtype=float))
+    cR: np.ndarray = field(default_factory=lambda: np.zeros(N_SPECIES, dtype=float))
+    cC: np.ndarray = field(default_factory=lambda: np.zeros(N_SPECIES, dtype=float))
+    cP: np.ndarray = field(default_factory=lambda: np.zeros(N_SPECIES, dtype=float))
+    tau: float = 0.85
+    delta: np.ndarray = field(default_factory=lambda: np.array([0.9, 0.9, 0.9], dtype=float))
+    rho_U: float = 0.60
+    rho_R: float = 0.55
+    rho_V: float = 0.55
+    Omega_U: np.ndarray = field(default_factory=lambda: np.diag(np.array([0.05, 0.05, 0.05], dtype=float)))
+    sigma_R0: float = 0.10
+    sigma_V0: float = 0.10
+    zeta_0: float = -1.50
+    zeta_R: float = 0.55
+    zeta_M: float = 0.55
+    zeta_a: float = 0.35
+    zeta_m: float = 0.25
+
+
+@dataclass(frozen=True)
+class TransitionGeneratorParameters:
+    base_edges: Dict[tuple[int, int], float] = field(
+        default_factory=lambda: {
+            (NPC, OPC): 0.25,
+            (OPC, NPC): 0.25,
+            (OPC, AC): 0.20,
+            (AC, OPC): 0.20,
+            (AC, MES): 0.22,
+            (MES, AC): 0.22,
+            (NPC, AC): 0.08,
+            (AC, NPC): 0.08,
+        }
     )
-    mu_surv = (
-        MU_SURV_BASE
-        + MU_SURV_BY_EXPR[x]
-        - MU_SURV_BY_SEN[s]
-        + MU_SURV_BY_ENV[e]
+    gamma_edges: Dict[tuple[int, int], float] = field(
+        default_factory=lambda: {
+            (NPC, OPC): 1.0,
+            (OPC, NPC): 1.0,
+            (OPC, AC): 1.0,
+            (AC, OPC): 1.0,
+            (AC, MES): 1.0,
+            (MES, AC): 1.0,
+            (NPC, AC): 0.65,
+            (AC, NPC): 0.65,
+        }
     )
-    return np.array([mu_ddr, mu_surv])
-
-# Mean-reversion matrix B_{e,m} (relaxation rate)
-# For simplicity, use scalar * identity (isotropic relaxation)
-B_RELAX_RATE = 0.7  # eigenvalue magnitude
-def get_B(e, c, s, x):
-    """State-dependent relaxation matrix."""
-    return B_RELAX_RATE * np.eye(P_DIM)
-
-# Diffusion strength (diagonal)
-SIGMA_DIFFUSION = np.array([0.25, 0.2])
-def get_Sigma(e, c, s, x):
-    """State-dependent diffusion (diagonal)."""
-    return SIGMA_DIFFUSION
 
 
-# 3. CTMC SWITCHING RATES (Baseline, without drug)
+@dataclass(frozen=True)
+class SimulationParameters:
+    dt: float = 0.1
+    t_max: float = 72.0
+    record_interval: float = 1.0
+    n_init: int = 80
+    target_population_size: int | None = None
+    max_pop_size: int = 5000
+    random_seed: int = 42
 
 
-# Maximum switching rates (used for bounded parameterization)
-Q_MAX_CYCLE = 1.0      # cell-cycle transitions
-Q_MAX_SEN = 0.1        # senescence transitions
-Q_MAX_EXPR = 0.05      # expression program switches
+@dataclass(frozen=True)
+class ModelParameters:
+    exposure: ExposureParameters = field(default_factory=ExposureParameters)
+    landscape: StateLandscapeParameters = field(default_factory=StateLandscapeParameters)
+    stress_survival: StressSurvivalParameters = field(default_factory=StressSurvivalParameters)
+    cycle: CycleTransitionParameters = field(default_factory=CycleTransitionParameters)
+    turnover_window: TurnoverWindowParameters = field(default_factory=TurnoverWindowParameters)
+    turnover: Dict[str, TurnoverSpeciesParameters] = field(
+        default_factory=lambda: {
+            "MYC": TurnoverSpeciesParameters(0.26, 0.12, -1.10, 0.90, 0.65, 0.10, 0.10, -1.25, 0.45, 0.55, 0.18, 0.18),
+            "CDK4": TurnoverSpeciesParameters(0.23, 0.12, -1.15, 0.85, 0.60, 0.16, 0.08, -1.25, 0.45, 0.52, 0.22, 0.14),
+            "PDGFRA": TurnoverSpeciesParameters(0.23, 0.12, -1.15, 0.85, 0.60, 0.08, 0.16, -1.25, 0.45, 0.52, 0.14, 0.22),
+        }
+    )
+    hazard: HazardParameters = field(default_factory=HazardParameters)
+    division: DivisionParameters = field(default_factory=DivisionParameters)
+    generator: TransitionGeneratorParameters = field(default_factory=TransitionGeneratorParameters)
+    simulation: SimulationParameters = field(default_factory=SimulationParameters)
 
-# Cell-cycle transition baseline rates (G0 <-> G1 -> S -> G2M -> G1)
-CYCLE_RATES = {
-    (0, 1): 0.2,   # G0 -> G1
-    (1, 0): 0.05,  # G1 -> G0 (quiescence entry)
-    (1, 2): 0.3,   # G1 -> S
-    (2, 3): 0.4,   # S -> G2M
-    # G2M -> G1 handled by division
-}
 
-# Senescence progression rates (normal -> pre-sen -> senescent)
-SEN_RATES = {
-    (0, 1): 0.01,  # normal -> pre-senescent
-    (1, 2): 0.05,  # pre-senescent -> senescent
-}
+PARAMS = ModelParameters()
 
-# Expression program switch rates (sparse, biology-constrained)
-EXPR_RATES = {
-    (0, 1): 0.02,  # basal -> MYC
-    (0, 2): 0.02,  # basal -> TP53
-    (1, 3): 0.01,  # MYC -> MYC_TP53
-    (2, 3): 0.01,  # TP53 -> MYC_TP53
+
+DEFAULT_INPUT_SCHEDULES: Dict[str, Callable[[float], float]] = {
+    "u_C": lambda _t: 0.0,
+    "u_P": lambda _t: 0.0,
+    "a": lambda _t: 0.0,
+    "m": lambda _t: 0.0,
 }
 
 
-# 4. DIVISION AND DEATH HAZARDS
+def sample_initial_cycle_state(rng: np.random.Generator) -> int:
+    return int(rng.choice([Q, G1, S, G2M], p=[0.15, 0.55, 0.20, 0.10]))
 
 
-# Maximum hazard rates (for bounded sigmoid parameterization)
-LAMBDA_DIV_MAX = 0.5   # max division rate per unit time
-LAMBDA_DEATH_MAX = 0.3 # max death rate per unit time
-
-# Division hazard parameters (depends on cycle phase)
-# Only G2M phase can divide
-DIV_HAZARD_BY_CYCLE = {
-    0: 0.0,   # G0: no division
-    1: 0.0,   # G1: no division
-    2: 0.0,   # S: no division
-    3: 0.8,   # G2M: high division competence
-}
-
-# Death hazard parameters (baseline + senescence effect)
-DEATH_HAZARD_BASE = 0.1
-DEATH_HAZARD_SEN_MULT = {0: 1.0, 1: 1.5, 2: 5.0}  # senescence multiplier
-DEATH_BETA_DDR_BY_EXPR = np.array([0.5, 0.7, 0.2, 0.3])
-DEATH_BETA_SURV = 0.5
-
-# Senescence DDR effect
-SEN_DDR_EFFECT = 0.2
-
-# Age-dependence for hazards (Gompertz-like or constant)
-USE_AGE_DEPENDENT_HAZARD = False
-AGE_HAZARD_SCALE = 0.1  # how strongly age affects hazard
+def sample_initial_copy_numbers(rng: np.random.Generator) -> np.ndarray:
+    mean = np.array([5.5, 6.5, 6.0], dtype=float)
+    copies = rng.poisson(mean).astype(int)
+    validate_copy_vector(copies)
+    return copies
 
 
-# 5. ecDNA DYNAMICS PARAMETERS
+def sample_initial_soft_state(rng: np.random.Generator) -> np.ndarray:
+    composition = rng.dirichlet(np.array([3.0, 2.8, 1.6, 1.4], dtype=float))
+    validate_simplex(composition)
+    return composition
 
 
-# Inter-division gain/loss (optional, can be disabled)
-ENABLE_INTERDIV_ECDNA = True
-
-# Bounded gain/loss rates (per unit time)
-MU_GAIN_MAX = 0.12
-MU_LOSS_MAX = 0.2
-
-# Gain rate logits
-GAIN_ETA_BASE = -2.0
-GAIN_ETA_K = 0.3
-GAIN_ETA_MYC = 0.6
-GAIN_ETA_DDR_HUMP = 2.6
-DDR_HUMP_THETA1 = 0.0
-DDR_HUMP_THETA2 = 1.1
-DDR_HUMP_WIDTH = 0.4
-
-# Loss rate logits
-LOSS_ETA_BASE = -1.5
-LOSS_ETA_K = 0.3
-LOSS_ETA_DDR = 0.9
-LOSS_ETA_SURV = 0.4
-
-# ecDNA effect on fitness (optional)
-# Division: inverted-U (Gaussian) relationship with ecDNA
-ECDNA_OPTIMAL_COPIES = 10      # optimal ecDNA copy number for division (peak of inverted-U)
-ECDNA_FITNESS_WIDTH = 20       # width parameter (sigma) of the Gaussian curve
-ECDNA_FITNESS_PEAK = 1.5       # peak fitness multiplier at optimal ecDNA (>1 means enhanced division)
-ECDNA_FITNESS_BASELINE = 0.5   # baseline fitness when ecDNA=0 or very high
-
-# Death: linear relationship with ecDNA (higher ecDNA -> higher death risk)
-ECDNA_DEATH_EFFECT = 0.01      # per-copy death rate increase
-
-
-# 6. DIVISION KERNEL PARAMETERS
-
-
-# Amplification distribution g^amp: A_j ~ Poisson(lambda_amp * k_j)
-# or A_j ~ NegBin, etc.
-AMP_LAMBDA_PER_COPY = 0.1  # mean extra copies per existing copy
-
-# Post-segregation loss probability
-LOSS_PROB_POST_SEG = 0.02  # probability each copy is lost after segregation
-
-# Daughter phenotype initialization
-# Y_daughter ~ N(Y_parent, sigma^2 * I)
-DAUGHTER_Y_NOISE_STD = 0.1
-
-# Daughter cycle phase reset probabilities (from G2M -> new phase)
-DAUGHTER_CYCLE_PROBS = {1: 0.95, 0: 0.05}  # mostly G1, small chance G0
-
-
-# 7. TREATMENT / DRUG PARAMETERS
-
-
-# Drug effect parameterization: Hill/Emax form
-# r_c(z;u) = r_{c,0}(z) * (1 - Emax * u^n / (EC50^n + u^n))
-
-class DrugParams:
-    """Parameters for a single drug affecting specific channels."""
-    def __init__(self, name, emax, ec50, hill_n, targets):
-        self.name = name
-        self.emax = emax      # maximum effect (0-1 for inhibition)
-        self.ec50 = ec50      # half-maximal concentration
-        self.hill_n = hill_n  # Hill coefficient
-        self.targets = targets  # dict: {channel: effect_type}
-
-# Example drugs
-DRUGS = {
-    "cell_cycle_inhibitor": DrugParams(
-        name="CDK_inhibitor",
-        emax=0.9,
-        ec50=1.0,
-        hill_n=2,
-        targets={"div": "inhibit", "cycle_G1S": "inhibit"}
-    ),
-    "senolytic": DrugParams(
-        name="Senolytic",
-        emax=0.8,
-        ec50=0.5,
-        hill_n=1.5,
-        targets={"death_sen": "activate"}
-    ),
-    "ecdna_destabilizer": DrugParams(
-        name="ecDNA_destab",
-        emax=0.7,
-        ec50=1.0,
-        hill_n=2,
-        targets={"amp": "inhibit", "loss": "activate"}
-    ),
-}
-
-# Default drug concentration schedule
-DRUG_SCHEDULE = {
-    "cell_cycle_inhibitor": lambda t: 0.0,  # no drug by default
-    "senolytic": lambda t: 0.0,
-    "ecdna_destabilizer": lambda t: 0.0,
-}
-
-
-# 8. SIMULATION PARAMETERS
-
-
-# Random seed for reproducibility
-RANDOM_SEED = 42
-
-# Simulation time
-T_MAX = 100000.0  # total simulation time
-
-# Initial population
-N_INIT = 100   # initial number of cells
-
-# Initial state distribution
-def sample_initial_state(rng):
-    """Sample initial state for a single cell."""
-    e = 0  # baseline environment
-    c = rng.choice([1, 2, 3], p=[0.5, 0.3, 0.2])  # mostly G1
-    s = 0  # normal (not senescent)
-    x = rng.choice([0, 1, 2, 3], p=[0.7, 0.15, 0.1, 0.05])  # mostly basal
-    #k = rng.poisson(5, size=J_ECDNA)  # Poisson-distributed ecDNA
-    #k = np.clip(k, 2, K_MAX)
-    k = rng.integers(20, 101, size=J_ECDNA)  # Uniform distribution [2, K_MAX]
-    a = rng.exponential(5)  # age from last division
-    y = rng.normal(0, 0.5, size=P_DIM)  # phenotype
-    return e, c, s, x, k, a, y
-
-# Maximum population size (for memory management)
-MAX_POP_SIZE = 100000
-
-# Recording interval for time series
-RECORD_INTERVAL = 1.0
-
-
-# 9. DERIVED QUANTITIES (computed from above)
-
-
-# Total number of discrete cell states M
-N_CYCLE = len(CYCLE_STATES)
-N_SEN = len(SEN_STATES)
-N_EXPR = len(EXPR_STATES)
-N_M = N_CYCLE * N_SEN * N_EXPR
-
-# Total number of types (without ecDNA)
-N_ENV = len(ENV_STATES)
-
-def m_to_tuple(m_idx):
-    """Convert flat M index to (c, s, x) tuple."""
-    x = m_idx % N_EXPR
-    s = (m_idx // N_EXPR) % N_SEN
-    c = m_idx // (N_EXPR * N_SEN)
-    return c, s, x
-
-def tuple_to_m(c, s, x):
-    """Convert (c, s, x) tuple to flat M index."""
-    return c * (N_SEN * N_EXPR) + s * N_EXPR + x
+def sample_initial_age(rng: np.random.Generator) -> float:
+    return float(rng.exponential(scale=2.0))

@@ -1,565 +1,619 @@
 """
-ecDNA Copy-Number Kinetics Model - Ogata Thinning Simulation
-Exact event-driven simulation with bounded intensities.
+Approximate hybrid continuous-time simulation for the ecDNA v4 model.
 """
 
-import heapq
-import numpy as np
-from typing import List, Dict, Tuple, Optional
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from cell import Cell, CellPopulation
-from dynamics import JumpIntensities, apply_flow, apply_transition, lazy_apply_flow, batch_lazy_apply_flow
-from division import DivisionKernel
-import config as cfg
+import heapq
+from pathlib import Path
+import csv
+import json
+
+import numpy as np
+
+import v4_config as cfg
+import v4_dynamics as dyn
+from v4_cell import Cell, CellPopulation
+from v4_division import DivisionKernel
 
 
 @dataclass
 class SimulationResult:
-    """Container for simulation results."""
-    times: List[float] = field(default_factory=list)
-    population_sizes: List[int] = field(default_factory=list)
-    ecdna_means: List[float] = field(default_factory=list)
-    ecdna_stds: List[float] = field(default_factory=list)
-    state_compositions: List[Dict] = field(default_factory=list)
-    events: List[Tuple] = field(default_factory=list)
-    sister_correlations: List[float] = field(default_factory=list)
-    ecdna_distributions: List[np.ndarray] = field(default_factory=list)  # Full ecDNA distribution at each time point
-    fitness_snapshots: List[List[Dict]] = field(default_factory=list)  # Per-cell fitness data at each time point
-    thinning_records: List[Dict] = field(default_factory=list)  # Ogata thinning diagnostics per accepted event
+    times: list[float] = field(default_factory=list)
+    population_sizes: list[int] = field(default_factory=list)
+    state_fractions: list[np.ndarray] = field(default_factory=list)
+    cycle_fractions: list[np.ndarray] = field(default_factory=list)
+    bulk_copy_means: list[np.ndarray] = field(default_factory=list)
+    mean_stress: list[float] = field(default_factory=list)
+    mean_survival: list[float] = field(default_factory=list)
+    mean_division_hazard: list[float] = field(default_factory=list)
+    mean_death_hazard: list[float] = field(default_factory=list)
+    exposures: list[dict] = field(default_factory=list)
+    observations: list[dict] = field(default_factory=list)
+    cell_snapshots: list[list[dict]] = field(default_factory=list)
+    ecdna_distributions: list[np.ndarray] = field(default_factory=list)
+    events: list[tuple[float, str, int, dict]] = field(default_factory=list)
+    stop_time: float | None = None
+    stop_reason: str = ""
 
-    def save_as_csv(self, base_dir: str):
-        """Save simulation results to CSV files in the specified directory."""
-        import csv
-        import json
-        from pathlib import Path
-        
-        dir_path = Path(base_dir)
-        dir_path.mkdir(parents=True, exist_ok=True)
-        
-        # 1. Summary Time Series
-        with open(dir_path / 'time_series_summary.csv', 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['time', 'population_size', 'ecdna_mean', 'ecdna_std'])
-            for t, n, m, s in zip(self.times, self.population_sizes, self.ecdna_means, self.ecdna_stds):
-                writer.writerow([t, n, m, s])
-                
-        # 2. ecDNA Distributions (Long format)
-        with open(dir_path / 'ecdna_distributions.csv', 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['time', 'cell_index', 'ecdna_copy_number'])
-            for t, dist in zip(self.times, self.ecdna_distributions):
-                if len(dist) > 0:
-                    for idx, val in enumerate(dist):
-                        writer.writerow([t, idx, val])
+    def save_as_csv(self, base_dir: str | Path) -> None:
+        output_dir = Path(base_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        # 3. Fitness Landscape Snapshots
-        with open(dir_path / 'fitness_landscape.csv', 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['time', 'cell_index', 'ecdna', 'cycle', 'sen', 'expr', 'div_rate', 'death_rate', 'net_rate', 'y'])
-            for t, snapshot in zip(self.times, self.fitness_snapshots):
-                for idx, cell_data in enumerate(snapshot):
-                    y_val = cell_data.get('y', [])
-                    y_str = json.dumps(y_val) if isinstance(y_val, list) else str(y_val)
-                    writer.writerow([
-                        t, idx, 
-                        cell_data.get('ecdna'), 
-                        cell_data.get('cycle'), 
-                        cell_data.get('sen'), 
-                        cell_data.get('expr'),
-                        cell_data.get('div_rate'),
-                        cell_data.get('death_rate'),
-                        cell_data.get('net_rate'),
-                        y_str
-                    ])
+        with open(output_dir / "summary.csv", "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                [
+                    "time",
+                    "population_size",
+                    "npc_fraction",
+                    "opc_fraction",
+                    "ac_fraction",
+                    "mes_fraction",
+                    "mean_myc",
+                    "mean_cdk4",
+                    "mean_pdgfra",
+                    "mean_stress",
+                    "mean_survival",
+                    "mean_division_hazard",
+                    "mean_death_hazard",
+                    "D_C",
+                    "D_P",
+                    "a",
+                    "m",
+                ]
+            )
+            for idx, time in enumerate(self.times):
+                writer.writerow(
+                    [
+                        time,
+                        self.population_sizes[idx],
+                        *self.state_fractions[idx].tolist(),
+                        *self.bulk_copy_means[idx].tolist(),
+                        self.mean_stress[idx],
+                        self.mean_survival[idx],
+                        self.mean_division_hazard[idx],
+                        self.mean_death_hazard[idx],
+                        self.exposures[idx]["D_C"],
+                        self.exposures[idx]["D_P"],
+                        self.exposures[idx]["a"],
+                        self.exposures[idx]["m"],
+                    ]
+                )
 
-        # 4. Events Log (Detailed with pre/post states)
-        with open(dir_path / 'events_log.csv', 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                'time', 'event_type', 'cell_id',
-                'pre_e', 'pre_c', 'pre_s', 'pre_x', 'pre_k', 'pre_a',
-                'post_e', 'post_c', 'post_s', 'post_x', 'post_k', 'post_a',
-                'd1_id', 'd1_e', 'd1_c', 'd1_s', 'd1_x', 'd1_k', 'd1_a',
-                'd2_id', 'd2_e', 'd2_c', 'd2_s', 'd2_x', 'd2_k', 'd2_a',
-            ])
-            for event in self.events:
-                t, etype, cid, details = event
-                pre = details.get('state_pre', {})
-                post = details.get('state_post', {})
-                d1 = details.get('d1_state', {})
-                d2 = details.get('d2_state', {})
-                writer.writerow([
-                    t, etype, cid,
-                    pre.get('e'), pre.get('c'), pre.get('s'), pre.get('x'), 
-                    json.dumps(pre.get('k')), pre.get('a'),
-                    post.get('e') if post else None, post.get('c') if post else None,
-                    post.get('s') if post else None, post.get('x') if post else None,
-                    json.dumps(post.get('k')) if post else None, post.get('a') if post else None,
-                    details.get('d1_id'), d1.get('e'), d1.get('c'), d1.get('s'), d1.get('x'),
-                    json.dumps(d1.get('k')) if d1 else None, d1.get('a'),
-                    details.get('d2_id'), d2.get('e'), d2.get('c'), d2.get('s'), d2.get('x'),
-                    json.dumps(d2.get('k')) if d2 else None, d2.get('a'),
-                ])
+        with open(output_dir / "snapshots.jsonl", "w", encoding="utf-8") as handle:
+            for time, snapshot in zip(self.times, self.cell_snapshots):
+                handle.write(json.dumps({"time": time, "cells": snapshot}) + "\n")
 
-        # 5. Sister Correlations
-        with open(dir_path / 'sister_correlations.csv', 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['correlation_coefficient'])
-            for val in self.sister_correlations:
-                writer.writerow([val])
-                
-        print(f"Simulation results saved to CSV files in {dir_path}")
+        with open(output_dir / "events.jsonl", "w", encoding="utf-8") as handle:
+            for time, event_type, cell_id, details in self.events:
+                handle.write(json.dumps({"time": time, "event_type": event_type, "cell_id": cell_id, "details": details}) + "\n")
 
 
-class OgataThinningSimulator:
-    """
-    Exact simulation using Ogata thinning algorithm
-    
-    The algorithm:
-    1. Compute dominating bound r̄
-    2. Sample Δ ~ Exp(r̄)
-    3. Propagate along deterministic flow
-    4. Evaluate true intensity r(z(t'); u(t'))
-    5. Accept with probability r/r̄
-    6. If accepted, choose channel and apply transition
-    """
-    
-    def __init__(self, 
-                 drug_schedule: Dict = None,
-                 env_schedule: callable = None,
-                 seed: int = None):
-        """
-        Initialize simulator.
-        
-        Args:
-            drug_schedule: Time-dependent drug concentrations
-            env_schedule: Function E(t) -> int for deterministic environment switching
-            seed: Random seed for reproducibility
-        """
-        self.rng = np.random.default_rng(seed or cfg.RANDOM_SEED)
-        self.drug_schedule = drug_schedule or cfg.DRUG_SCHEDULE
-        self.env_schedule = env_schedule  # None means no deterministic env switching
-        self.intensities = JumpIntensities(self.drug_schedule)
-        self.division_kernel = DivisionKernel(self.rng, self.drug_schedule)
-        
-        # Compute global dominating bound
-        self.r_bar = self.intensities.compute_dominating_bound()
-    
-    
-    # Ogata Thinning for Single Cell
-    
-    
-    def sample_next_event(self, cell: Cell, t_start: float, t_max: float
-                          ) -> Tuple[Optional[float], Optional[str], Optional[dict], Optional[dict], Optional[dict]]:
-        """
-        Sample next event time and type for a single cell using Ogata thinning.
-        
-        Note: This method works on a COPY of the cell to simulate flow propagation
-        without modifying the original cell's state.
-        
-        Args:
-            cell: Cell to sample event for (will not be modified)
-            t_start: Start time for sampling (should match cell.last_update_time)
-            t_max: Maximum time horizon
-        
-        Returns:
-            (event_time, channel_type, params, flow_state, thinning_stats)
-            or (None, None, None, None, None)
-        """
+class HybridOgataSimulator:
+    def __init__(self, input_schedules: dict[str, callable] | None = None, seed: int | None = None):
+        self.params = cfg.PARAMS
+        self.seed = self.params.simulation.random_seed if seed is None else seed
+        self.rng = np.random.default_rng(self.seed)
+        self.input_schedules = dict(cfg.DEFAULT_INPUT_SCHEDULES)
+        if input_schedules is not None:
+            self.input_schedules.update(input_schedules)
+        self.division_kernel = DivisionKernel(self.rng)
+        self.r_bar = self.compute_dominating_bound()
+
+    def compute_dominating_bound(self) -> float:
+        cycle_bound = (
+            self.params.cycle.qbar_G1S
+            + self.params.cycle.qbar_G1Q
+            + self.params.cycle.qbar_QG1
+            + self.params.cycle.qbar_SG2M
+        )
+        turnover_bound = 0.0
+        for species_params in self.params.turnover.values():
+            turnover_bound += species_params.gain_ceiling + species_params.loss_ceiling
+        hazard_bound = self.params.hazard.lambda_div_ceiling + self.params.hazard.lambda_death_ceiling
+        bound = cycle_bound + turnover_bound + hazard_bound
+        cfg.require(bound > 0.0, "Dominating bound must be strictly positive.")
+        return float(bound)
+
+    def build_context(self, time: float, D_C: float, D_P: float) -> dyn.ReplicateContext:
+        return dyn.ReplicateContext(
+            time=time,
+            u_C=float(self.input_schedules["u_C"](time)),
+            u_P=float(self.input_schedules["u_P"](time)),
+            D_C=D_C,
+            D_P=D_P,
+            astrocytic_cue=float(self.input_schedules["a"](time)),
+            mesenchymal_cue=float(self.input_schedules["m"](time)),
+        )
+
+    def print_monitor_line(self, time: float, summary: dict, event_counts: dict[str, int], label: str) -> None:
+        state_text = ", ".join(
+            f"{name}={summary['state_fractions'][idx]:.2f}"
+            for idx, name in enumerate(cfg.STATE_NAMES)
+        )
+        cycle_text = ", ".join(
+            f"{name}={summary['cycle_fractions'][idx]:.2f}"
+            for idx, name in enumerate(cfg.CYCLE_NAMES)
+        )
+        copy_text = ", ".join(
+            f"{name}={summary['bulk_copy_means'][idx]:.2f}"
+            for idx, name in enumerate(cfg.SPECIES)
+        )
+        event_text = ", ".join(f"{name}={count}" for name, count in sorted(event_counts.items())) if event_counts else "none"
+        print(
+            f"[monitor:{label}] "
+            f"t={time:.2f} "
+            f"pop={summary['population_size']} "
+            f"states[{state_text}] "
+            f"cycle[{cycle_text}] "
+            f"ecDNA[{copy_text}] "
+            f"R={summary['mean_stress']:.3f} "
+            f"V={summary['mean_survival']:.3f} "
+            f"haz_div={summary['mean_division_hazard']:.3f} "
+            f"haz_death={summary['mean_death_hazard']:.3f} "
+            f"events[{event_text}]"
+        )
+
+    def exposure_step(self, current_exposure: float, dose: float, decay: float, conversion: float, dt: float) -> float:
+        if decay <= 1e-12:
+            next_value = current_exposure + conversion * dose * dt
+        else:
+            exp_decay = np.exp(-decay * dt)
+            next_value = current_exposure * exp_decay + (conversion * dose / decay) * (1.0 - exp_decay)
+        cfg.require(next_value >= -1e-10, "Integrated exposure must remain non-negative.")
+        return max(0.0, float(next_value))
+
+    def advance_cell_to_time(self, cell: Cell, target_time: float, rng: np.random.Generator | None = None) -> dyn.ReplicateContext:
+        active_rng = self.rng if rng is None else rng
+        cfg.require(target_time >= cell.last_update_time, "Cannot move a cell backwards in time.")
+
+        current_time = cell.last_update_time
+        current_D_C = cell.last_D_C
+        current_D_P = cell.last_D_P
+
+        while current_time < target_time - 1e-12:
+            step = min(self.params.simulation.dt, target_time - current_time)
+            midpoint = current_time + 0.5 * step
+            u_C_mid = float(self.input_schedules["u_C"](midpoint))
+            u_P_mid = float(self.input_schedules["u_P"](midpoint))
+            a_mid = float(self.input_schedules["a"](midpoint))
+            m_mid = float(self.input_schedules["m"](midpoint))
+
+            next_D_C = self.exposure_step(current_D_C, u_C_mid, self.params.exposure.k_C, self.params.exposure.eta_C, step)
+            next_D_P = self.exposure_step(current_D_P, u_P_mid, self.params.exposure.k_P, self.params.exposure.eta_P, step)
+
+            midpoint_context = dyn.ReplicateContext(
+                time=midpoint,
+                u_C=u_C_mid,
+                u_P=u_P_mid,
+                D_C=0.5 * (current_D_C + next_D_C),
+                D_P=0.5 * (current_D_P + next_D_P),
+                astrocytic_cue=a_mid,
+                mesenchymal_cue=m_mid,
+            )
+            dyn.update_continuous_state(cell, midpoint_context, step, active_rng)
+            current_time += step
+            current_D_C = next_D_C
+            current_D_P = next_D_P
+
+        cell.last_update_time = float(target_time)
+        cell.last_D_C = float(current_D_C)
+        cell.last_D_P = float(current_D_P)
+        return self.build_context(target_time, current_D_C, current_D_P)
+
+    def synchronize_population_to_time(self, population: CellPopulation, target_time: float) -> dyn.ReplicateContext:
+        context = self.build_context(target_time, self.params.exposure.D_C0, self.params.exposure.D_P0)
+        for cell in population.cells:
+            context = self.advance_cell_to_time(cell, target_time, self.rng)
+        if population.cells:
+            context = self.build_context(target_time, population.cells[0].last_D_C, population.cells[0].last_D_P)
+        return context
+
+    def projection_rng(self, cell: Cell, target_time: float) -> np.random.Generator:
+        time_bits = int(np.float64(target_time).view(np.uint64))
+        last_bits = int(np.float64(cell.last_update_time).view(np.uint64))
+        seed_value = (
+            int(self.seed)
+            ^ ((cell.cell_id + 1) * 0x9E3779B185EBCA87)
+            ^ (time_bits * 0xC2B2AE3D27D4EB4F)
+            ^ (last_bits * 0x165667B19E3779F9)
+        ) & ((1 << 63) - 1)
+        return np.random.default_rng(seed_value)
+
+    def project_cell_for_observation(self, cell: Cell, target_time: float) -> tuple[Cell, dyn.ReplicateContext]:
+        if target_time <= cell.last_update_time + 1e-12:
+            return cell, self.build_context(target_time, cell.last_D_C, cell.last_D_P)
+        projected_cell = cell.copy()
+        projection_context = self.advance_cell_to_time(
+            projected_cell,
+            target_time,
+            rng=self.projection_rng(cell, target_time),
+        )
+        return projected_cell, projection_context
+
+    def sample_next_event(
+        self,
+        cell: Cell,
+        t_start: float,
+        t_max: float,
+    ) -> tuple[float | None, str | None, Cell | None, dict | None]:
         current_t = t_start
-        temp_cell = cell.copy()  # work on copy for flow propagation
-        
+        temp_cell = cell.copy()
         proposals = 0
+
         while current_t < t_max:
-            # Step 1-2: Sample candidate time from dominating process
-            delta = self.rng.exponential(1.0 / self.r_bar)
+            delta = float(self.rng.exponential(1.0 / self.r_bar))
             candidate_t = current_t + delta
             proposals += 1
-            
+
             if candidate_t >= t_max:
-                # No event before t_max
-                return None, None, None, None, None
-            
-            # Step 3: Propagate temp_cell along deterministic flow
-            apply_flow(temp_cell, delta, rng=self.rng)
-            
-            # Step 4: Evaluate true intensity
-            channels, total_rate = self.intensities.compute_all_rates(temp_cell, candidate_t)
-            
-            # Step 5: Accept/reject
+                return None, None, None, None
+
+            context = self.advance_cell_to_time(temp_cell, candidate_t, self.rng)
+            derived = dyn.compute_derived_quantities(temp_cell, context)
+            rates = dyn.compute_all_event_rates(temp_cell, derived, context)
+            total_rate = float(sum(rates.values()))
             accept_prob = total_rate / self.r_bar
-            
-            if self.rng.random() < accept_prob:
-                # Accepted! Choose channel
-                if total_rate > 0:
-                    rates = [r for _, _, r in channels]
-                    channel_idx = self.rng.choice(len(channels), p=np.array(rates) / total_rate)
-                    channel_type, params, _ = channels[channel_idx]
-                    
-                    flow_state = {"a": temp_cell.a, "y": temp_cell.y.copy()}
-                    thinning_stats = {"proposals": proposals, "accept_prob": accept_prob}
-                    return candidate_t, channel_type, params, flow_state, thinning_stats
-            
-            # Rejected, continue from candidate_t
+
+            if total_rate > 0.0 and self.rng.random() < accept_prob:
+                names = list(rates.keys())
+                probabilities = np.array([rates[name] for name in names], dtype=float) / total_rate
+                selected_event = str(self.rng.choice(names, p=probabilities))
+                return (
+                    candidate_t,
+                    selected_event,
+                    temp_cell,
+                    {"proposals": proposals, "accept_prob": accept_prob, "total_rate": total_rate},
+                )
+
             current_t = candidate_t
-        
-        return None, None, None, None, None
 
+        return None, None, None, None
 
-    # Population Simulation with Lazy Flow
+    def simulate(
+        self,
+        population: CellPopulation | None = None,
+        t_max: float | None = None,
+        record_interval: float | None = None,
+        target_population_size: int | None = None,
+        max_pop_size: int | None = None,
+        verbose: bool = True,
+    ) -> SimulationResult:
+        final_time = self.params.simulation.t_max if t_max is None else t_max
+        snapshot_interval = self.params.simulation.record_interval if record_interval is None else record_interval
+        target_pop_size = (
+            self.params.simulation.target_population_size if target_population_size is None else target_population_size
+        )
+        hard_pop_limit = self.params.simulation.max_pop_size if max_pop_size is None else max_pop_size
+        cfg.require(final_time > 0.0, "Simulation t_max must be strictly positive.")
+        cfg.require(snapshot_interval > 0.0, "Record interval must be strictly positive.")
+        cfg.require(hard_pop_limit > 0, "Population hard limit must be strictly positive.")
+        if target_pop_size is not None:
+            cfg.require(target_pop_size > 0, "Target population size must be strictly positive.")
+            cfg.require(
+                target_pop_size <= hard_pop_limit,
+                "Target population size cannot exceed the hard population limit.",
+            )
 
-    def simulate(self, 
-                 population: CellPopulation = None,
-                 t_max: float = None,
-                 record_interval: float = None,
-                 max_pop: int = None,
-                 verbose: bool = True) -> SimulationResult:
-        """
-        Run population simulation with lazy flow updates.
-        
-        Key optimization: Cells are only updated (flow applied) when:
-        1. Their event is about to be processed
-        2. A record time is reached (all cells synchronized)
-        
-        Args:
-            population: Initial population (created if None)
-            t_max: Maximum simulation time
-            record_interval: Interval for recording time series
-            max_pop: Maximum population size
-            verbose: Print progress
-            
-        Returns:
-            SimulationResult with time series and events
-        """
-        # Defaults
-        t_max = t_max or cfg.T_MAX
-        record_interval = record_interval or cfg.RECORD_INTERVAL
-        max_pop = max_pop or cfg.MAX_POP_SIZE
-        
-        # Initialize population
         if population is None:
             population = CellPopulation(self.rng)
-            population.initialize(cfg.N_INIT)
-        
-        # Initialize last_update_time for all cells
+            population.initialize(self.params.simulation.n_init)
+
         for cell in population.cells:
             cell.last_update_time = 0.0
-        
-        # Results container
+            cell.last_D_C = self.params.exposure.D_C0
+            cell.last_D_P = self.params.exposure.D_P0
+
         result = SimulationResult()
-        
-        # Current simulation time (logical clock)
-        t = 0.0
-        next_record = record_interval  # First record after interval (t=0 recorded below)
-        last_env = None
-        
-        # Apply initial env_schedule if provided
-        if self.env_schedule is not None:
-            last_env = self.env_schedule(t)
-            for cell in population.cells:
-                cell.e = last_env
-        
-        # Record initial state at t=0
-        self._record_state(result, t, population)
-        
+        time = 0.0
+        next_record = snapshot_interval
+        initial_context = self.build_context(time, self.params.exposure.D_C0, self.params.exposure.D_P0)
+        event_counts: dict[str, int] = {}
         if verbose:
-            print(f"Starting simulation: {population.size()} cells, t_max={t_max}")
-        
-        # Prepare event heap: (event_time, cell_id, channel, params, version, flow_state, thinning_stats)
-        event_heap: List[Tuple[float, int, str, dict, int, dict, dict]] = []
-        cell_versions: Dict[int, int] = {}
-        cell_lookup: Dict[int, Cell] = {cell.cell_id: cell for cell in population.cells}
-        
-        def schedule_cell_event(cell: Cell, from_time: float):
-            """Schedule next event for a cell starting from from_time."""
-            cell_id = cell.cell_id
-            event_t, channel, params, flow_state, thinning_stats = self.sample_next_event(cell, from_time, t_max)
-            version = cell_versions.get(cell_id, 0) + 1
-            cell_versions[cell_id] = version
-            if event_t is not None:
-                heapq.heappush(event_heap, (event_t, cell_id, channel, params, version, flow_state, thinning_stats))
-        
-        def resample_all_events(from_time: float):
-            """Resample events for all cells from given time."""
+            print(
+                "Simulation start: "
+                f"t_max={final_time:.2f}, "
+                f"record_interval={snapshot_interval:.2f}, "
+                f"target_population_size={target_pop_size}, "
+                f"max_pop_size={hard_pop_limit}, "
+                f"n_init={population.size()}"
+            )
+        initial_summary = self.record_state(result, population, time, fallback_context=initial_context)
+        if verbose:
+            self.print_monitor_line(time, initial_summary, event_counts, label="initial")
+
+        event_heap: list[tuple[float, int, str, int, Cell, dict]] = []
+        cell_versions: dict[int, int] = {}
+        cell_lookup: dict[int, Cell] = {cell.cell_id: cell for cell in population.cells}
+
+        def population_stop_reason() -> str | None:
+            size = population.size()
+            if target_pop_size is not None and size >= target_pop_size:
+                return "target_population_size"
+            if size >= hard_pop_limit:
+                return "max_pop_size"
+            return None
+
+        def set_stop(reason: str, stop_time: float) -> None:
+            result.stop_reason = reason
+            result.stop_time = float(stop_time)
+
+        def record_terminal_state(stop_time: float, label: str, fallback_context: dyn.ReplicateContext | None = None) -> None:
+            if result.times and stop_time <= result.times[-1] + 1e-12:
+                return
+            summary = self.record_state(result, population, stop_time, fallback_context=fallback_context)
+            if verbose:
+                self.print_monitor_line(stop_time, summary, event_counts, label=label)
+
+        initial_stop_reason = population_stop_reason()
+        if initial_stop_reason is not None:
+            set_stop(initial_stop_reason, time)
+            if verbose:
+                print(f"Stopping immediately at t={time:.2f}: {initial_stop_reason} reached.")
+            result.events = population.events.copy()
+            return result
+
+        def schedule_cell_event(cell: Cell, from_time: float) -> None:
+            event_time, event_name, flow_cell, thinning_stats = self.sample_next_event(cell, from_time, final_time)
+            version = cell_versions.get(cell.cell_id, 0) + 1
+            cell_versions[cell.cell_id] = version
+            if event_time is not None and event_name is not None and flow_cell is not None:
+                heapq.heappush(event_heap, (event_time, cell.cell_id, event_name, version, flow_cell, thinning_stats or {}))
+
+        def resample_all_events(from_time: float) -> None:
             event_heap.clear()
-            for cell in population.cells:
-                schedule_cell_event(cell, from_time)
-        
-        # Initialize heap with all cells
-        resample_all_events(t)
-        
-        # Main simulation loop
-        event_count = 0
-        
-        while t < t_max and population.size() > 0:
-            # Check population size limit
-            if population.size() >= max_pop:
+            for live_cell in population.cells:
+                schedule_cell_event(live_cell, from_time)
+
+        resample_all_events(time)
+
+        while time < final_time and population.size() > 0:
+            stop_reason = population_stop_reason()
+            if stop_reason is not None:
+                set_stop(stop_reason, time)
+                if population.size() > 0:
+                    record_terminal_state(time, label="stop")
                 if verbose:
-                    print(f"Population limit reached at t={t:.2f}")
+                    print(f"Stopping at t={time:.2f}: {stop_reason} reached.")
                 break
-            
-            # Find next valid event
-            next_event_t = np.inf
+
+            next_event_time = final_time
             next_cell = None
-            next_channel = None
-            next_params = None
-            next_flow_state = None
-            next_thinning_stats = None
-            
+            next_event_name = None
+            next_flow_cell = None
+            next_event_entry: tuple[float, int, str, int, Cell, dict] | None = None
+
             while event_heap:
-                event_t, cell_id, channel, params, version, flow_state, thinning_stats = heapq.heappop(event_heap)
+                event_entry = heapq.heappop(event_heap)
+                event_time, cell_id, event_name, version, flow_cell, _stats = event_entry
                 if cell_versions.get(cell_id) != version:
-                    continue  # Stale event, skip
-                cell = cell_lookup.get(cell_id)
-                if cell is None:
-                    continue  # Cell removed, skip
-                next_event_t = event_t
-                next_cell = cell
-                next_channel = channel
-                next_params = params
-                next_flow_state = flow_state
-                next_thinning_stats = thinning_stats
+                    continue
+                live_cell = cell_lookup.get(cell_id)
+                if live_cell is None:
+                    continue
+                next_event_entry = event_entry
+                next_event_time = event_time
+                next_cell = live_cell
+                next_event_name = event_name
+                next_flow_cell = flow_cell
                 break
-            
-            if next_cell is None:
-                # No more events before t_max
-                next_event_t = t_max
-            
-            # Handle record times before the next event
-            resample_needed = False
-            while next_record <= min(next_event_t, t_max):
-                # Synchronize all cells to record time (lazy update)
-                batch_lazy_apply_flow(population.cells, next_record, rng=self.rng)
-                
-                # Update environment at record time
-                if self.env_schedule is not None:
-                    e_new = self.env_schedule(next_record)
-                    if e_new != last_env:
-                        for cell in population.cells:
-                            cell.e = e_new
-                        last_env = e_new
-                
-                # Update logical time
-                t = next_record
-                
-                # Record state
-                self._record_state(result, next_record, population)
-                next_record += record_interval
-                resample_needed = True
+
+            if next_record <= min(next_event_time, final_time):
+                if next_event_entry is not None:
+                    heapq.heappush(event_heap, next_event_entry)
+                summary = self.record_state(result, population, next_record)
+                if verbose:
+                    self.print_monitor_line(next_record, summary, event_counts, label="snapshot")
+                next_record += snapshot_interval
+                continue
+
+            if next_cell is None or next_event_name is None or next_flow_cell is None:
                 break
-            
-            if resample_needed:
-                resample_all_events(t)
-                continue  # Restart loop with new events
-            
-            if next_cell is None:
-                # No event, we've recorded up to t_max
-                break
-            
-            # Process the event
-            # Only update the cell that has the event (lazy flow)
-            if next_flow_state is not None:
-                next_cell.a = next_flow_state["a"]
-                next_cell.y = next_flow_state["y"]
-                next_cell.last_update_time = next_event_t
-            else:
-                lazy_apply_flow(next_cell, next_event_t, rng=self.rng)
-            
-            # Update environment at event time if needed
-            env_changed = False
-            if self.env_schedule is not None:
-                e_new = self.env_schedule(next_event_t)
-                if e_new != last_env:
-                    # Environment change at event time
-                    # Update all cells' environment (but not their flow state)
-                    for cell in population.cells:
-                        cell.e = e_new
-                    last_env = e_new
-                    env_changed = True
-            
-            # Update logical time
-            t = next_event_t
-            
-            # Process event
-            self._process_event(population, next_cell, next_channel, next_params, t, result)
-            event_count += 1
-            
-            if next_thinning_stats:
-                result.thinning_records.append({
-                    "time": t,
-                    "cell_id": next_cell.cell_id,
-                    "channel": next_channel,
-                    "proposals": next_thinning_stats.get("proposals", 0),
-                    "accept_prob": next_thinning_stats.get("accept_prob", 0.0),
-                })
-            
-            # Update lookup/cache after event
-            if next_channel == "division":
-                # Parent removed, two daughters added
+
+            next_cell.overwrite_state_from(next_flow_cell, validate=False)
+            time = next_event_time
+            event_context = self.build_context(time, next_cell.last_D_C, next_cell.last_D_P)
+            state_pre = next_cell.get_state_dict()
+
+            if next_event_name == "death":
+                population.remove_cell(next_cell)
+                event_counts["death"] = event_counts.get("death", 0) + 1
+                population.log_event(time, "death", next_cell.cell_id, {"state_pre": state_pre})
                 cell_lookup.pop(next_cell.cell_id, None)
                 cell_versions.pop(next_cell.cell_id, None)
-                # Get new daughters (last two added)
-                new_cells = population.cells[-2:]
-                for new_cell in new_cells:
-                    cell_lookup[new_cell.cell_id] = new_cell
-                    new_cell.last_update_time = t  # Daughters start at current time
-            elif next_channel == "death":
-                # Cell removed
+                if population.size() == 0:
+                    record_terminal_state(time, label="extinction", fallback_context=event_context)
+                continue
+
+            if next_event_name == "division":
+                daughter_one, daughter_two = self.division_kernel.divide(next_cell, event_context)
+                daughter_one.last_update_time = time
+                daughter_one.last_D_C = next_cell.last_D_C
+                daughter_one.last_D_P = next_cell.last_D_P
+                daughter_two.last_update_time = time
+                daughter_two.last_D_C = next_cell.last_D_C
+                daughter_two.last_D_P = next_cell.last_D_P
+
+                population.remove_cell(next_cell)
+                daughter_one = population.add_cell(daughter_one)
+                daughter_two = population.add_cell(daughter_two)
+                event_counts["division"] = event_counts.get("division", 0) + 1
+                population.log_event(
+                    time,
+                    "division",
+                    next_cell.cell_id,
+                    {
+                        "state_pre": state_pre,
+                        "daughter_one": daughter_one.get_state_dict(),
+                        "daughter_two": daughter_two.get_state_dict(),
+                    },
+                )
+
                 cell_lookup.pop(next_cell.cell_id, None)
                 cell_versions.pop(next_cell.cell_id, None)
-            else:
-                # Cell state changed, update lookup
-                cell_lookup[next_cell.cell_id] = next_cell
-            
-            # Reschedule events
-            if env_changed:
-                # Environment changed: resample all events
-                resample_all_events(t)
-            else:
-                if next_channel == "division":
-                    # Schedule events for new daughters
-                    for new_cell in population.cells[-2:]:
-                        schedule_cell_event(new_cell, t)
-                elif next_channel == "death":
-                    pass  # Cell is gone, no new event
-                else:
-                    # Reschedule for the cell that just had an event
-                    schedule_cell_event(next_cell, t)
-            
-            # Progress update
-            if verbose and event_count % 1000 == 0:
-                print(f"t={t:.2f}, pop={population.size()}, events={event_count}")
-        
-        # Final recording if not already at a record time
-        if result.times and result.times[-1] < t:
-            batch_lazy_apply_flow(population.cells, t, rng=self.rng)
-            self._record_state(result, t, population)
-        
-        # Copy events to result for lineage analysis
+                cell_lookup[daughter_one.cell_id] = daughter_one
+                cell_lookup[daughter_two.cell_id] = daughter_two
+                schedule_cell_event(daughter_one, time)
+                schedule_cell_event(daughter_two, time)
+                stop_reason = population_stop_reason()
+                if stop_reason is not None:
+                    set_stop(stop_reason, time)
+                    record_terminal_state(time, label="stop", fallback_context=event_context)
+                    if verbose:
+                        print(f"Stopping at t={time:.2f}: {stop_reason} reached after division.")
+                    break
+                continue
+
+            dyn.apply_nonterminal_event(next_cell, next_event_name)
+            next_cell.last_update_time = time
+            next_cell.last_D_C = next_flow_cell.last_D_C
+            next_cell.last_D_P = next_flow_cell.last_D_P
+            event_counts[next_event_name] = event_counts.get(next_event_name, 0) + 1
+            population.log_event(
+                time,
+                next_event_name,
+                next_cell.cell_id,
+                {
+                    "state_pre": state_pre,
+                    "state_post": next_cell.get_state_dict(),
+                },
+            )
+            cell_lookup[next_cell.cell_id] = next_cell
+            schedule_cell_event(next_cell, time)
+
         result.events = population.events.copy()
-        
-        if verbose:
-            print(f"Simulation complete: t={t:.2f}, pop={population.size()}, events={event_count}")
-        
+        if result.stop_reason == "":
+            if population.size() == 0:
+                set_stop("population_extinction", time)
+            else:
+                set_stop("t_max", final_time)
+        if population.size() > 0 and result.times and result.times[-1] < final_time - 1e-12 and result.stop_reason == "t_max":
+            final_summary = self.record_state(result, population, final_time)
+            if verbose:
+                self.print_monitor_line(final_time, final_summary, event_counts, label="final")
         return result
-    
-    def _process_event(self, population: CellPopulation, cell: Cell, 
-                       channel: str, params: dict, t: float, result: SimulationResult):
-        """Process a single event with full state tracking."""
-        
-        # Capture pre-event state
-        state_pre = cell.get_state_dict()
-        
-        if channel == "division":
-            # Division: remove parent, add two daughters
-            daughter1, daughter2 = self.division_kernel.divide(cell, t)
-            
-            population.remove_cell(cell)
-            population.add_cell(daughter1)
-            population.add_cell(daughter2)
-            
-            # Log event with full states
-            population.log_event(t, "division", cell.cell_id, {
-                "state_pre": state_pre,
-                "state_post": None,  # Parent no longer exists
-                "d1_id": daughter1.cell_id,
-                "d2_id": daughter2.cell_id,
-                "d1_state": daughter1.get_state_dict(),
-                "d2_state": daughter2.get_state_dict(),
-            })
-            
-            # Record sister correlation
-            from division import compute_sister_correlation
-            corr = compute_sister_correlation(daughter1.k, daughter2.k)
-            result.sister_correlations.append(corr)
-            
-        elif channel == "death":
-            # Death: remove cell
-            population.remove_cell(cell)
-            population.log_event(t, "death", cell.cell_id, {
-                "state_pre": state_pre,
-                "state_post": None,  # Cell no longer exists
-            })
-            
-        else:
-            # State transition (cycle, sen, expr, ecdna_gain, ecdna_loss)
-            apply_transition(cell, channel, params)
-            state_post = cell.get_state_dict()
-            population.log_event(t, channel, cell.cell_id, {
-                "state_pre": state_pre,
-                "state_post": state_post,
-                **params,  # Include transition-specific params (e.g., j for ecdna)
-            })
-    
-    def _record_state(self, result: SimulationResult, t: float, population: CellPopulation):
-        """Record current population state."""
-        result.times.append(t)
-        summary = population.get_summary()
-        result.population_sizes.append(summary["n"])
-        result.ecdna_means.append(summary.get("ecdna_mean", 0))
-        result.ecdna_stds.append(summary.get("ecdna_std", 0))
-        result.state_compositions.append(summary)
-        # Record full ecDNA distribution for heterogeneity analysis
-        if population.cells:
-            ecdna_dist = np.array([c.total_ecdna() for c in population.cells])
-            result.ecdna_distributions.append(ecdna_dist)
-            
-            # Record per-cell fitness data for fitness landscape analysis
-            fitness_data = []
-            for cell in population.cells:
-                k_total = cell.total_ecdna()
-                div_rate = self.intensities.division_hazard(cell, t, k_total=k_total)
-                death_rate = self.intensities.death_hazard(cell, t)
-                fitness_data.append({
-                    'ecdna': k_total,
-                    'cycle': cell.c,
-                    'sen': cell.s,
-                    'expr': cell.x,
-                    'div_rate': div_rate,
-                    'death_rate': death_rate,
-                    'net_rate': div_rate - death_rate,
-                    'y': cell.y.tolist() if hasattr(cell.y, 'tolist') else list(cell.y)
-                })
-            result.fitness_snapshots.append(fitness_data)
-        else:
-            result.ecdna_distributions.append(np.array([]))
-            result.fitness_snapshots.append([])
+
+    def summarize_observed_cells(
+        self,
+        observed_cells: list[tuple[Cell, dyn.DerivedQuantities]],
+    ) -> dict:
+        if not observed_cells:
+            return {
+                "population_size": 0,
+                "state_fractions": np.zeros(cfg.N_STATES),
+                "cycle_fractions": np.zeros(cfg.N_CYCLE),
+                "bulk_copy_means": np.zeros(cfg.N_SPECIES),
+                "mean_stress": 0.0,
+                "mean_survival": 0.0,
+                "mean_division_hazard": 0.0,
+                "mean_death_hazard": 0.0,
+            }
+
+        state_totals = np.zeros(cfg.N_STATES, dtype=float)
+        cycle_counts = np.zeros(cfg.N_CYCLE, dtype=float)
+        copy_totals = np.zeros(cfg.N_SPECIES, dtype=float)
+        stress_total = 0.0
+        survival_total = 0.0
+        division_total = 0.0
+        death_total = 0.0
+        for observed_cell, derived in observed_cells:
+            state_totals += observed_cell.soft_state
+            cycle_counts[observed_cell.cycle_state] += 1.0
+            copy_totals += observed_cell.copy_numbers
+            stress_total += observed_cell.stress
+            survival_total += observed_cell.survival
+            cell_context = self.build_context(observed_cell.last_update_time, observed_cell.last_D_C, observed_cell.last_D_P)
+            division_total += dyn.compute_division_hazard(observed_cell, derived, cell_context)
+            death_total += dyn.compute_death_hazard(observed_cell, derived, cell_context)
+
+        count = float(len(observed_cells))
+        return {
+            "population_size": int(count),
+            "state_fractions": state_totals / count,
+            "cycle_fractions": cycle_counts / count,
+            "bulk_copy_means": copy_totals / count,
+            "mean_stress": float(stress_total / count),
+            "mean_survival": float(survival_total / count),
+            "mean_division_hazard": float(division_total / count),
+            "mean_death_hazard": float(death_total / count),
+        }
+
+    def record_state(
+        self,
+        result: SimulationResult,
+        population: CellPopulation,
+        time: float,
+        fallback_context: dyn.ReplicateContext | None = None,
+    ) -> dict:
+        observed_cells: list[tuple[Cell, dyn.DerivedQuantities]] = []
+        snapshot: list[dict] = []
+        distribution_rows = []
+        context = fallback_context
+        for live_cell in population.cells:
+            observed_cell, context = self.project_cell_for_observation(live_cell, time)
+            derived = dyn.compute_derived_quantities(observed_cell, context)
+            observed_cells.append((observed_cell, derived))
+            snapshot.append(
+                {
+                    "cell_id": observed_cell.cell_id,
+                    "cycle_state": cfg.CYCLE_NAMES[observed_cell.cycle_state],
+                    "copy_numbers": observed_cell.copy_numbers.tolist(),
+                    "soft_state": observed_cell.soft_state.tolist(),
+                    "stress": float(observed_cell.stress),
+                    "survival": float(observed_cell.survival),
+                    "division_hazard": dyn.compute_division_hazard(observed_cell, derived, context),
+                    "death_hazard": dyn.compute_death_hazard(observed_cell, derived, context),
+                    "local_transition_generator": dyn.compute_local_transition_generator(derived.logits).tolist(),
+                }
+            )
+            distribution_rows.append(observed_cell.copy_numbers.copy())
+
+        if context is None:
+            context = self.build_context(time, self.params.exposure.D_C0, self.params.exposure.D_P0)
+
+        summary = self.summarize_observed_cells(observed_cells)
+        result.times.append(float(time))
+        result.population_sizes.append(int(summary["population_size"]))
+        result.state_fractions.append(summary["state_fractions"])
+        result.cycle_fractions.append(summary["cycle_fractions"])
+        result.bulk_copy_means.append(summary["bulk_copy_means"])
+        result.mean_stress.append(summary["mean_stress"])
+        result.mean_survival.append(summary["mean_survival"])
+        result.mean_division_hazard.append(summary["mean_division_hazard"])
+        result.mean_death_hazard.append(summary["mean_death_hazard"])
+        result.exposures.append({"D_C": context.D_C, "D_P": context.D_P, "a": context.astrocytic_cue, "m": context.mesenchymal_cue})
+        result.observations.append(
+            {
+                "flow_fractions": summary["state_fractions"].tolist(),
+                "bulk_copy_means": summary["bulk_copy_means"].tolist(),
+                "count_prediction": int(summary["population_size"]),
+            }
+        )
+        result.cell_snapshots.append(snapshot)
+        result.ecdna_distributions.append(np.array(distribution_rows, dtype=int) if distribution_rows else np.zeros((0, cfg.N_SPECIES), dtype=int))
+        return summary
 
 
-def run_simulation(t_max: float = None, 
-                   n_init: int = None,
-                   drug_schedule: Dict = None,
-                   env_schedule: callable = None,
-                   seed: int = None,
-                   max_pop: int = None,
-                   verbose: bool = True) -> SimulationResult:
-    """
-    Run a simulation with default or custom parameters.
-    
-    Args:
-        t_max: Maximum simulation time
-        n_init: Initial population size
-        drug_schedule: Drug concentration functions
-        env_schedule: Function E(t) -> int for deterministic environment switching
-        seed: Random seed
-        max_pop: Maximum population size (termination condition)
-        verbose: Print progress
-        
-    Returns:
-        SimulationResult
-    """
-    # Create simulator
-    sim = OgataThinningSimulator(drug_schedule=drug_schedule, env_schedule=env_schedule, seed=seed)
-    
-    # Create population
-    rng = np.random.default_rng(seed or cfg.RANDOM_SEED)
-    pop = CellPopulation(rng)
-    pop.initialize(n_init or cfg.N_INIT)
-    
-    # Run
-    return sim.simulate(
-        population=pop,
-        t_max=t_max or cfg.T_MAX,
-        max_pop=max_pop,
-        verbose=verbose
+def run_simulation(
+    t_max: float | None = None,
+    n_init: int | None = None,
+    input_schedules: dict[str, callable] | None = None,
+    seed: int | None = None,
+    record_interval: float | None = None,
+    target_population_size: int | None = None,
+    max_pop_size: int | None = None,
+    verbose: bool = True,
+) -> SimulationResult:
+    simulator = HybridOgataSimulator(input_schedules=input_schedules, seed=seed)
+    population = CellPopulation(np.random.default_rng(cfg.PARAMS.simulation.random_seed if seed is None else seed))
+    population.initialize(cfg.PARAMS.simulation.n_init if n_init is None else n_init)
+    return simulator.simulate(
+        population=population,
+        t_max=cfg.PARAMS.simulation.t_max if t_max is None else t_max,
+        record_interval=record_interval,
+        target_population_size=target_population_size,
+        max_pop_size=max_pop_size,
+        verbose=verbose,
     )
