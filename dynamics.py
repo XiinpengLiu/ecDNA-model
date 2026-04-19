@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-import v4_config as cfg
+import config as cfg
 
 
 @dataclass(frozen=True)

@@ -11,8 +11,8 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import numpy as np
 
-import v4_config as cfg
-from v4_simulation import SimulationResult
+import config as cfg
+from simulation import SimulationResult
 
 STATE_COLORS = ("#2563eb", "#16a34a", "#f59e0b", "#dc2626")
 

@@ -7,8 +7,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import v4_config as cfg
-from v4_sweep import ScreeningEngine, ScreeningExecutionPlan
+import config as cfg
+from sweep import ScreeningEngine, ScreeningExecutionPlan
 
 
 def build_parser() -> argparse.ArgumentParser:

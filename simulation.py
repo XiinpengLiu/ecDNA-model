@@ -12,10 +12,10 @@ import json
 
 import numpy as np
 
-import v4_config as cfg
-import v4_dynamics as dyn
-from v4_cell import Cell, CellPopulation
-from v4_division import DivisionKernel
+import config as cfg
+import dynamics as dyn
+from cell import Cell, CellPopulation
+from division import DivisionKernel
 
 
 @dataclass

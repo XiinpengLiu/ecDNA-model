@@ -4,9 +4,9 @@ Main entry point for the ecDNA v4 simulation program.
 
 from pathlib import Path
 
-from v4_plotting import plot_event_summary, plot_lineage_state_paths, plot_observation_proxies, plot_results
-from v4_simulation import run_simulation
-from v4_treatment import compute_bulk_copy_trends, compute_growth_rate, compute_terminal_event_counts
+from plotting import plot_event_summary, plot_lineage_state_paths, plot_observation_proxies, plot_results
+from simulation import run_simulation
+from treatment import compute_bulk_copy_trends, compute_growth_rate, compute_terminal_event_counts
 
 
 def main() -> None:

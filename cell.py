@@ -9,10 +9,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-import v4_config as cfg
+import config as cfg
 
 if TYPE_CHECKING:
-    import v4_dynamics as dyn
+    import dynamics as dyn
 
 
 @dataclass(eq=False)
@@ -137,7 +137,7 @@ class CellPopulation:
         return len(self.cells)
 
     def initialize(self, n: int | None = None) -> None:
-        import v4_dynamics as dyn
+        import dynamics as dyn
 
         target_n = cfg.PARAMS.simulation.n_init if n is None else n
         base_context = dyn.ReplicateContext(
@@ -175,7 +175,7 @@ class CellPopulation:
         self.events.append((time, event_type, cell_id, details or {}))
 
     def summary(self, context: "dyn.ReplicateContext") -> dict:
-        import v4_dynamics as dyn
+        import dynamics as dyn
 
         if not self.cells:
             return {

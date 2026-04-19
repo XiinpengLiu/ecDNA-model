@@ -27,9 +27,9 @@ matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 import numpy as np
 
-import v4_config as cfg
-from v4_simulation import SimulationResult, run_simulation
-from v4_treatment import compute_bulk_copy_trends, compute_growth_rate, compute_terminal_event_counts
+import config as cfg
+from simulation import SimulationResult, run_simulation
+from treatment import compute_bulk_copy_trends, compute_growth_rate, compute_terminal_event_counts
 
 
 UNTREATED_SCHEDULES = {"u_C": lambda _t: 0.0, "u_P": lambda _t: 0.0, "a": lambda _t: 0.0, "m": lambda _t: 0.0}
@@ -40,7 +40,7 @@ PARALLEL_DEBUG_PRINT = True
 
 
 def _progress_print(message: str) -> None:
-    print(f"[v4_sweep] {message}", flush=True)
+    print(f"[sweep] {message}", flush=True)
 
 
 def _debug_print(message: str) -> None:

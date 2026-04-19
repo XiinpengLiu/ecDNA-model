@@ -9,7 +9,7 @@ from typing import Callable
 
 import numpy as np
 
-from v4_simulation import SimulationResult, run_simulation
+from simulation import SimulationResult, run_simulation
 
 
 @dataclass(frozen=True)
