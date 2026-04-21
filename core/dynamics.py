@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ecdna_model import config as cfg
+import config as cfg
 
 
 @dataclass(frozen=True)

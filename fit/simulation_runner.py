@@ -8,10 +8,10 @@ import copy
 from dataclasses import dataclass, replace
 from typing import Iterable
 
-from ecdna_model import config as cfg
-from ecdna_model.core.simulation import SimulationResult, run_simulation
-from ecdna_model.fit.data import CanonicalFitDataset
-from ecdna_model.fit.parameter_registry import ParameterBundle
+import config as cfg
+from core.simulation import SimulationResult, run_simulation
+from fit.data import CanonicalFitDataset
+from fit.parameter_registry import ParameterBundle
 
 
 def _default_record_times() -> tuple[float, ...]:

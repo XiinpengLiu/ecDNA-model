@@ -14,11 +14,11 @@ from typing import Iterable
 
 import numpy as np
 
-from ecdna_model import config as cfg
-from ecdna_model.core import dynamics as dyn
-from ecdna_model.core import observation as obs
-from ecdna_model.core.cell import Cell, CellPopulation
-from ecdna_model.core.division import DivisionKernel
+import config as cfg
+from core import dynamics as dyn
+from core import observation as obs
+from core.cell import Cell, CellPopulation
+from core.division import DivisionKernel
 
 
 @dataclass

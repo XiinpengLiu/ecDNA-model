@@ -8,8 +8,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ecdna_model import config as cfg
-from ecdna_model.fit.parameter_registry import (
+import config as cfg
+from fit.parameter_registry import (
     FitParameterSpec,
     ParameterBoundsError,
     ParameterBundle,

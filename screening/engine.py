@@ -27,9 +27,9 @@ matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 import numpy as np
 
-from ecdna_model import config as cfg
-from ecdna_model.analysis.treatment import compute_bulk_copy_trends, compute_growth_rate, compute_terminal_event_counts
-from ecdna_model.core.simulation import SimulationResult, run_simulation
+import config as cfg
+from analysis.treatment import compute_bulk_copy_trends, compute_growth_rate, compute_terminal_event_counts
+from core.simulation import SimulationResult, run_simulation
 
 
 UNTREATED_SCHEDULES = {"u_C": lambda _t: 0.0, "u_P": lambda _t: 0.0, "a": lambda _t: 0.0, "m": lambda _t: 0.0}

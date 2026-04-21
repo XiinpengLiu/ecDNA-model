@@ -7,8 +7,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from ecdna_model import config as cfg
-from ecdna_model.screening.engine import ScreeningEngine, ScreeningExecutionPlan
+import config as cfg
+from screening.engine import ScreeningEngine, ScreeningExecutionPlan
 
 
 def build_parser() -> argparse.ArgumentParser:

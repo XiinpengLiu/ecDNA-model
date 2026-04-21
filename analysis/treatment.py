@@ -9,7 +9,7 @@ from typing import Callable
 
 import numpy as np
 
-from ecdna_model.core.simulation import SimulationResult, run_simulation
+from core.simulation import SimulationResult, run_simulation
 
 
 @dataclass(frozen=True)

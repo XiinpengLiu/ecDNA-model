@@ -10,10 +10,10 @@ from typing import Iterable
 
 import numpy as np
 
-from ecdna_model import config as cfg
-from ecdna_model.core.simulation import SimulationResult
-from ecdna_model.fit.data import CanonicalFitDataset, EcTAGRecord, QPCDRRecord
-from ecdna_model.fit.simulation_runner import SimulationRunSet
+import config as cfg
+from core.simulation import SimulationResult
+from fit.data import CanonicalFitDataset, EcTAGRecord, QPCDRRecord
+from fit.simulation_runner import SimulationRunSet
 
 
 TAIL_THRESHOLDS = (8, 16)

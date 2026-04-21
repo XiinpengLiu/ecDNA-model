@@ -7,15 +7,15 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
-from ecdna_model import config as cfg
-from ecdna_model.analysis.plotting import (
+import config as cfg
+from analysis.plotting import (
     plot_event_summary,
     plot_lineage_state_paths,
     plot_observation_proxies,
     plot_results,
 )
-from ecdna_model.analysis.treatment import compute_bulk_copy_trends, compute_growth_rate, compute_terminal_event_counts
-from ecdna_model.core.simulation import run_simulation
+from analysis.treatment import compute_bulk_copy_trends, compute_growth_rate, compute_terminal_event_counts
+from core.simulation import run_simulation
 
 
 def main() -> None:
