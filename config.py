@@ -1,5 +1,5 @@
 """
-Configuration and shared math utilities for the ecDNA v4 model.
+Configuration and shared math utilities for the ecDNA model.
 """
 
 from __future__ import annotations
@@ -36,6 +36,9 @@ Q = CYCLE_INDEX["Q"]
 G1 = CYCLE_INDEX["G1"]
 S = CYCLE_INDEX["S"]
 G2M = CYCLE_INDEX["G2M"]
+
+EMPIRICAL_WEEK1 = "empirical_week1"
+PARAMETRIC = "parametric"
 
 HELMERT_SUBMATRIX = np.array(
     [
@@ -115,6 +118,19 @@ def validate_cycle_state(cycle_state: int) -> None:
     require(cycle_state in range(N_CYCLE), f"Invalid cycle state index: {cycle_state}.")
 
 
+def validate_probability_vector(values: np.ndarray, *, name: str, expected_shape: tuple[int, ...]) -> None:
+    values = np.asarray(values, dtype=float)
+    require(values.shape == expected_shape, f"{name} must have shape {expected_shape}, got {values.shape}.")
+    require(np.all(np.isfinite(values)), f"{name} must be finite.")
+    require(np.all(values >= 0.0), f"{name} must be non-negative.")
+    total = float(np.sum(values))
+    require(abs(total - 1.0) <= 1e-8, f"{name} must sum to 1, got {total}.")
+
+
+def _weekly_record_times() -> tuple[float, ...]:
+    return tuple(float(week) for week in range(1, 11))
+
+
 @dataclass(frozen=True)
 class ExposureParameters:
     k_C: float = 0.25
@@ -125,8 +141,12 @@ class ExposureParameters:
     D_P0: float = 0.0
     nu_C: float = 0.85
     nu_P: float = 0.85
-    burden_weights: np.ndarray = field(default_factory=lambda: np.array([0.65, 0.70, 0.70], dtype=float))
-    proliferative_weights: np.ndarray = field(default_factory=lambda: np.array([0.95, 0.75], dtype=float))
+    burden_weights: np.ndarray = field(
+        default_factory=lambda: np.array([0.3170731707, 0.3414634146, 0.3414634146], dtype=float)
+    )
+    proliferative_weights: np.ndarray = field(
+        default_factory=lambda: np.array([0.5588235294, 0.4411764706], dtype=float)
+    )
 
 
 @dataclass(frozen=True)
@@ -237,6 +257,8 @@ class HazardParameters:
     chi_C: float = 0.55
     chi_P: float = 0.55
     omega_O_given_C: float = 0.45
+    min_division_age: float = 0.25
+    age_gate_slope: float = 6.0
 
 
 @dataclass(frozen=True)
@@ -291,13 +313,19 @@ class TransitionGeneratorParameters:
 
 @dataclass(frozen=True)
 class SimulationParameters:
-    dt: float = 0.1
-    t_max: float = 72.0
-    record_interval: float = 1.0
+    dt: float = 0.01
+    time_unit: str = "week"
+    record_times: tuple[float, ...] = field(default_factory=_weekly_record_times)
+    t_max: float = 10.0
     n_init: int = 80
     target_population_size: int | None = None
-    max_pop_size: int = 5000
+    max_pop_size: int = 500000
     random_seed: int = 42
+    fitting_mode: bool = False
+    record_full_snapshots: bool = False
+    record_events: bool = False
+    record_histograms: bool = True
+    max_cells_saved_per_snapshot: int = 1000
 
 
 @dataclass(frozen=True)
@@ -320,7 +348,35 @@ class ModelParameters:
     simulation: SimulationParameters = field(default_factory=SimulationParameters)
 
 
-PARAMS = ModelParameters()
+@dataclass(frozen=True)
+class ObservationParameters:
+    qpcdr_intercept: np.ndarray = field(default_factory=lambda: np.zeros(N_SPECIES, dtype=float))
+    qpcdr_slope: np.ndarray = field(default_factory=lambda: np.ones(N_SPECIES, dtype=float))
+    qpcdr_sigma: np.ndarray = field(default_factory=lambda: np.full(N_SPECIES, 0.25, dtype=float))
+    ecTAG_detection_efficiency: np.ndarray = field(default_factory=lambda: np.ones(N_SPECIES, dtype=float))
+    ecTAG_background: np.ndarray = field(default_factory=lambda: np.full(N_SPECIES, 0.10, dtype=float))
+    ecTAG_overdispersion: np.ndarray = field(default_factory=lambda: np.full(N_SPECIES, 0.15, dtype=float))
+    ecTAG_max_observed: int = 30
+    flow_overdispersion: float = 0.0
+    sort_purity_matrix: np.ndarray = field(default_factory=lambda: np.eye(N_STATES, dtype=float))
+    count_overdispersion: float = 0.0
+
+
+@dataclass(frozen=True)
+class InitializationParameters:
+    mode: str = PARAMETRIC
+    parametric_copy_number_mean: np.ndarray = field(default_factory=lambda: np.array([5.5, 6.5, 6.0], dtype=float))
+    parametric_state_dirichlet_alpha: np.ndarray = field(default_factory=lambda: np.array([3.0, 2.8, 1.6, 1.4], dtype=float))
+    cycle_probabilities: np.ndarray = field(default_factory=lambda: np.array([0.15, 0.55, 0.20, 0.10], dtype=float))
+    age_scale: float = 2.0
+    empirical_flow_fractions: np.ndarray | None = None
+    empirical_sorted_copy_distributions: dict[str, np.ndarray] | None = None
+    empirical_soft_state_concentration: float = 25.0
+
+
+DEFAULT_MODEL_PARAMETERS = ModelParameters()
+DEFAULT_OBSERVATION_PARAMETERS = ObservationParameters()
+DEFAULT_INITIALIZATION_PARAMETERS = InitializationParameters()
 
 
 DEFAULT_INPUT_SCHEDULES: Dict[str, Callable[[float], float]] = {
@@ -331,22 +387,314 @@ DEFAULT_INPUT_SCHEDULES: Dict[str, Callable[[float], float]] = {
 }
 
 
-def sample_initial_cycle_state(rng: np.random.Generator) -> int:
-    return int(rng.choice([Q, G1, S, G2M], p=[0.15, 0.55, 0.20, 0.10]))
+def _validate_finite_vector(values: np.ndarray, *, shape: tuple[int, ...], name: str) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    require(values.shape == shape, f"{name} must have shape {shape}, got {values.shape}.")
+    require(np.all(np.isfinite(values)), f"{name} must be finite.")
+    return values
 
 
-def sample_initial_copy_numbers(rng: np.random.Generator) -> np.ndarray:
-    mean = np.array([5.5, 6.5, 6.0], dtype=float)
-    copies = rng.poisson(mean).astype(int)
+def validate_simulation_parameters(params: SimulationParameters) -> None:
+    require(bool(params.time_unit), "Simulation time_unit must be non-empty.")
+    require(params.dt > 0.0, "Simulation dt must be strictly positive.")
+    require(params.t_max > 0.0, "Simulation t_max must be strictly positive.")
+    require(params.n_init > 0, "Simulation n_init must be strictly positive.")
+    require(params.max_pop_size > 0, "Simulation max_pop_size must be strictly positive.")
+    record_times = np.asarray(params.record_times, dtype=float)
+    require(record_times.ndim == 1 and record_times.size > 0, "Simulation record_times must be a non-empty 1D sequence.")
+    require(np.all(np.isfinite(record_times)), "Simulation record_times must be finite.")
+    require(np.all(record_times >= 0.0), "Simulation record_times must be non-negative.")
+    require(np.all(np.diff(record_times) > 0.0), "Simulation record_times must be strictly increasing.")
+    require(abs(float(record_times[-1]) - params.t_max) <= 1e-8, "Simulation t_max must equal the final record time.")
+    if params.target_population_size is not None:
+        require(params.target_population_size > 0, "Simulation target_population_size must be strictly positive.")
+        require(
+            params.target_population_size <= params.max_pop_size,
+            "Simulation target_population_size cannot exceed max_pop_size.",
+        )
+    if params.fitting_mode:
+        require(params.target_population_size is None, "target_population_size is forbidden when fitting_mode=True.")
+    require(params.max_cells_saved_per_snapshot > 0, "Simulation max_cells_saved_per_snapshot must be strictly positive.")
+
+
+def validate_model_parameters(params: ModelParameters) -> None:
+    exposure = params.exposure
+    _validate_finite_vector(exposure.burden_weights, shape=(N_SPECIES,), name="exposure.burden_weights")
+    _validate_finite_vector(exposure.proliferative_weights, shape=(2,), name="exposure.proliferative_weights")
+    require(np.all(exposure.burden_weights >= 0.0), "Exposure burden_weights must be non-negative.")
+    require(np.all(exposure.proliferative_weights >= 0.0), "Exposure proliferative_weights must be non-negative.")
+    validate_probability_vector(exposure.burden_weights, name="exposure.burden_weights", expected_shape=(N_SPECIES,))
+    validate_probability_vector(
+        exposure.proliferative_weights,
+        name="exposure.proliferative_weights",
+        expected_shape=(2,),
+    )
+    for value_name in ("k_C", "k_P", "eta_C", "eta_P", "D_C0", "D_P0", "nu_C", "nu_P"):
+        value = float(getattr(exposure, value_name))
+        require(np.isfinite(value) and value >= 0.0, f"Exposure parameter {value_name} must be finite and non-negative.")
+
+    landscape = params.landscape
+    for field_name in ("alpha", "gamma_M", "gamma_C", "gamma_P", "eta_a", "eta_m", "xi_B"):
+        _validate_finite_vector(getattr(landscape, field_name), shape=(N_STATES,), name=f"landscape.{field_name}")
+    B_U = _validate_finite_vector(landscape.B_U, shape=(LATENT_DIM, LATENT_DIM), name="landscape.B_U")
+    eigenvalues = np.linalg.eigvalsh(B_U)
+    require(np.all(eigenvalues > 0.0), "landscape.B_U must be positive definite.")
+    require(landscape.sigma_0 >= 0.0, "landscape.sigma_0 must be non-negative.")
+    require(landscape.sigma_M >= 0.0, "landscape.sigma_M must be non-negative.")
+
+    stress_survival = params.stress_survival
+    for field_name in (
+        "alpha_R",
+        "r_B",
+        "r_S",
+        "r_C",
+        "r_P",
+        "r_m",
+        "b_R",
+        "sigma_R",
+        "alpha_V",
+        "v_M",
+        "v_A",
+        "v_Q",
+        "v_R",
+        "v_C",
+        "v_P",
+        "v_a",
+        "b_V",
+        "sigma_V",
+    ):
+        value = float(getattr(stress_survival, field_name))
+        require(np.isfinite(value), f"stress_survival.{field_name} must be finite.")
+    require(stress_survival.b_R >= 0.0, "stress_survival.b_R must be non-negative.")
+    require(stress_survival.sigma_R >= 0.0, "stress_survival.sigma_R must be non-negative.")
+    require(stress_survival.b_V >= 0.0, "stress_survival.b_V must be non-negative.")
+    require(stress_survival.sigma_V >= 0.0, "stress_survival.sigma_V must be non-negative.")
+
+    cycle = params.cycle
+    for field_name in (
+        "qbar_G1S",
+        "qbar_G1Q",
+        "qbar_QG1",
+        "qbar_SG2M",
+        "beta_0",
+        "beta_P",
+        "beta_NO",
+        "beta_R",
+        "beta_V",
+        "beta_C",
+        "beta_Pg",
+        "gamma_0",
+        "gamma_M",
+        "gamma_R",
+        "gamma_m",
+        "gamma_V",
+        "delta_0",
+        "delta_P",
+        "delta_V",
+        "delta_NO",
+        "delta_R",
+        "delta_m",
+        "kappa_0",
+        "kappa_R",
+        "kappa_V",
+    ):
+        value = float(getattr(cycle, field_name))
+        require(np.isfinite(value), f"cycle.{field_name} must be finite.")
+    for field_name in ("qbar_G1S", "qbar_G1Q", "qbar_QG1", "qbar_SG2M"):
+        require(float(getattr(cycle, field_name)) >= 0.0, f"cycle.{field_name} must be non-negative.")
+
+    turnover_window = params.turnover_window
+    require(turnover_window.eta_1 > 0.0, "turnover_window.eta_1 must be strictly positive.")
+    require(turnover_window.eta_2 > 0.0, "turnover_window.eta_2 must be strictly positive.")
+    require(turnover_window.r_L < turnover_window.r_U, "turnover_window.r_L must be smaller than r_U.")
+
+    require(set(params.turnover.keys()) == set(SPECIES), "turnover parameters must be present for every species.")
+    for species_name in SPECIES:
+        species_params = params.turnover[species_name]
+        for field_name in (
+            "gain_ceiling",
+            "loss_ceiling",
+            "a0",
+            "a_R",
+            "a_prol",
+            "a_C",
+            "a_P",
+            "b0",
+            "b_R",
+            "b_V",
+            "b_C",
+            "b_P",
+        ):
+            value = float(getattr(species_params, field_name))
+            require(np.isfinite(value), f"turnover.{species_name}.{field_name} must be finite.")
+        require(species_params.gain_ceiling >= 0.0, f"turnover.{species_name}.gain_ceiling must be non-negative.")
+        require(species_params.loss_ceiling >= 0.0, f"turnover.{species_name}.loss_ceiling must be non-negative.")
+
+    hazard = params.hazard
+    for field_name in (
+        "lambda_div_ceiling",
+        "lambda_death_ceiling",
+        "theta_0",
+        "theta_P",
+        "theta_NO",
+        "theta_R",
+        "theta_V",
+        "B_star",
+        "chi_B",
+        "phi_0",
+        "phi_R",
+        "phi_V",
+        "phi_M",
+        "phi_B",
+        "chi_C",
+        "chi_P",
+        "omega_O_given_C",
+        "min_division_age",
+        "age_gate_slope",
+    ):
+        value = float(getattr(hazard, field_name))
+        require(np.isfinite(value), f"hazard.{field_name} must be finite.")
+    require(hazard.lambda_div_ceiling >= 0.0, "hazard.lambda_div_ceiling must be non-negative.")
+    require(hazard.lambda_death_ceiling >= 0.0, "hazard.lambda_death_ceiling must be non-negative.")
+    require(hazard.chi_B >= 0.0, "hazard.chi_B must be non-negative.")
+    require(hazard.B_star >= 0.0, "hazard.B_star must be non-negative.")
+    require(hazard.min_division_age >= 0.0, "hazard.min_division_age must be non-negative.")
+    require(hazard.age_gate_slope > 0.0, "hazard.age_gate_slope must be strictly positive.")
+    require(0.0 <= hazard.omega_O_given_C <= 1.0, "hazard.omega_O_given_C must lie in [0, 1].")
+
+    division = params.division
+    for field_name in ("lambda_amp_ceiling", "c0", "cR", "cC", "cP", "delta"):
+        _validate_finite_vector(getattr(division, field_name), shape=(N_SPECIES,), name=f"division.{field_name}")
+    Omega_U = _validate_finite_vector(division.Omega_U, shape=(LATENT_DIM, LATENT_DIM), name="division.Omega_U")
+    omega_eigs = np.linalg.eigvalsh(Omega_U)
+    require(np.all(omega_eigs >= -1e-10), "division.Omega_U must be positive semidefinite.")
+    require(np.all(division.lambda_amp_ceiling >= 0.0), "division.lambda_amp_ceiling must be non-negative.")
+    require(division.tau >= 0.0, "division.tau must be non-negative.")
+    require(division.sigma_R0 >= 0.0, "division.sigma_R0 must be non-negative.")
+    require(division.sigma_V0 >= 0.0, "division.sigma_V0 must be non-negative.")
+    for field_name in ("rho_U", "rho_R", "rho_V"):
+        value = float(getattr(division, field_name))
+        require(0.0 <= value <= 1.0, f"division.{field_name} must lie in [0, 1].")
+    for field_name in ("zeta_0", "zeta_R", "zeta_M", "zeta_a", "zeta_m"):
+        value = float(getattr(division, field_name))
+        require(np.isfinite(value), f"division.{field_name} must be finite.")
+
+    validate_simulation_parameters(params.simulation)
+
+
+def validate_observation_parameters(params: ObservationParameters) -> None:
+    for field_name in (
+        "qpcdr_intercept",
+        "qpcdr_slope",
+        "qpcdr_sigma",
+        "ecTAG_detection_efficiency",
+        "ecTAG_background",
+        "ecTAG_overdispersion",
+    ):
+        _validate_finite_vector(getattr(params, field_name), shape=(N_SPECIES,), name=f"observation.{field_name}")
+    purity = _validate_finite_vector(params.sort_purity_matrix, shape=(N_STATES, N_STATES), name="observation.sort_purity_matrix")
+    require(np.all(purity >= 0.0), "observation.sort_purity_matrix must be non-negative.")
+    column_sums = np.sum(purity, axis=0)
+    require(np.allclose(column_sums, 1.0, atol=1e-8), "Each column of sort_purity_matrix must sum to 1.")
+    require(np.all(params.qpcdr_sigma >= 0.0), "observation.qpcdr_sigma must be non-negative.")
+    require(np.all(params.ecTAG_detection_efficiency >= 0.0), "observation.ecTAG_detection_efficiency must be non-negative.")
+    require(np.all(params.ecTAG_background >= 0.0), "observation.ecTAG_background must be non-negative.")
+    require(np.all(params.ecTAG_overdispersion >= 0.0), "observation.ecTAG_overdispersion must be non-negative.")
+    require(params.ecTAG_max_observed > 0, "observation.ecTAG_max_observed must be strictly positive.")
+    require(params.flow_overdispersion >= 0.0, "observation.flow_overdispersion must be non-negative.")
+    require(params.count_overdispersion >= 0.0, "observation.count_overdispersion must be non-negative.")
+
+
+def validate_initialization_parameters(params: InitializationParameters) -> None:
+    require(params.mode in (PARAMETRIC, EMPIRICAL_WEEK1), f"Unsupported initialization mode: {params.mode}.")
+    _validate_finite_vector(
+        params.parametric_copy_number_mean,
+        shape=(N_SPECIES,),
+        name="initialization.parametric_copy_number_mean",
+    )
+    _validate_finite_vector(
+        params.parametric_state_dirichlet_alpha,
+        shape=(N_STATES,),
+        name="initialization.parametric_state_dirichlet_alpha",
+    )
+    validate_probability_vector(
+        params.cycle_probabilities,
+        name="initialization.cycle_probabilities",
+        expected_shape=(N_CYCLE,),
+    )
+    require(np.all(params.parametric_copy_number_mean > 0.0), "parametric_copy_number_mean must be strictly positive.")
+    require(
+        np.all(params.parametric_state_dirichlet_alpha > 0.0),
+        "parametric_state_dirichlet_alpha must be strictly positive.",
+    )
+    require(params.age_scale > 0.0, "initialization.age_scale must be strictly positive.")
+    require(
+        params.empirical_soft_state_concentration > 0.0,
+        "initialization.empirical_soft_state_concentration must be strictly positive.",
+    )
+
+    if params.mode != EMPIRICAL_WEEK1:
+        return
+
+    require(params.empirical_flow_fractions is not None, "empirical_flow_fractions is required in empirical_week1 mode.")
+    validate_probability_vector(
+        np.asarray(params.empirical_flow_fractions, dtype=float),
+        name="initialization.empirical_flow_fractions",
+        expected_shape=(N_STATES,),
+    )
+    require(
+        params.empirical_sorted_copy_distributions is not None,
+        "empirical_sorted_copy_distributions is required in empirical_week1 mode.",
+    )
+    require(
+        set(params.empirical_sorted_copy_distributions.keys()) == set(STATE_NAMES),
+        "empirical_sorted_copy_distributions must contain every state gate.",
+    )
+    for state_name, values in params.empirical_sorted_copy_distributions.items():
+        matrix = np.asarray(values)
+        require(matrix.ndim == 2 and matrix.shape[1] == N_SPECIES, f"{state_name} empirical copy matrix must have shape (n, {N_SPECIES}).")
+        require(matrix.shape[0] > 0, f"{state_name} empirical copy matrix must be non-empty.")
+        require(np.issubdtype(matrix.dtype, np.integer), f"{state_name} empirical copy matrix must be integer-valued.")
+        require(np.all(matrix >= 0), f"{state_name} empirical copy matrix must be non-negative.")
+
+
+def sample_initial_cycle_state(rng: np.random.Generator, initialization: InitializationParameters) -> int:
+    return int(rng.choice(np.arange(N_CYCLE), p=np.asarray(initialization.cycle_probabilities, dtype=float)))
+
+
+def sample_initial_copy_numbers(rng: np.random.Generator, initialization: InitializationParameters, gate_index: int | None = None) -> np.ndarray:
+    if initialization.mode == EMPIRICAL_WEEK1:
+        require(gate_index is not None, "empirical_week1 initialization requires a sampled gate index.")
+        require(initialization.empirical_sorted_copy_distributions is not None, "Missing empirical copy distributions.")
+        gate_name = STATE_NAMES[gate_index]
+        copy_pool = np.asarray(initialization.empirical_sorted_copy_distributions[gate_name], dtype=int)
+        row_index = int(rng.integers(copy_pool.shape[0]))
+        copies = copy_pool[row_index].astype(int, copy=True)
+        validate_copy_vector(copies)
+        return copies
+    copies = rng.poisson(np.asarray(initialization.parametric_copy_number_mean, dtype=float)).astype(int)
     validate_copy_vector(copies)
     return copies
 
 
-def sample_initial_soft_state(rng: np.random.Generator) -> np.ndarray:
-    composition = rng.dirichlet(np.array([3.0, 2.8, 1.6, 1.4], dtype=float))
+def sample_initial_soft_state(rng: np.random.Generator, initialization: InitializationParameters, gate_index: int | None = None) -> np.ndarray:
+    if initialization.mode == EMPIRICAL_WEEK1:
+        require(gate_index is not None, "empirical_week1 initialization requires a sampled gate index.")
+        alpha = np.ones(N_STATES, dtype=float)
+        alpha[gate_index] = float(initialization.empirical_soft_state_concentration)
+        composition = rng.dirichlet(alpha)
+    else:
+        composition = rng.dirichlet(np.asarray(initialization.parametric_state_dirichlet_alpha, dtype=float))
     validate_simplex(composition)
     return composition
 
 
-def sample_initial_age(rng: np.random.Generator) -> float:
-    return float(rng.exponential(scale=2.0))
+def sample_initial_age(rng: np.random.Generator, initialization: InitializationParameters) -> float:
+    return float(rng.exponential(scale=initialization.age_scale))
+
+
+def sample_initial_gate(rng: np.random.Generator, initialization: InitializationParameters) -> int | None:
+    if initialization.mode != EMPIRICAL_WEEK1:
+        return None
+    require(initialization.empirical_flow_fractions is not None, "Missing empirical flow fractions.")
+    return int(rng.choice(np.arange(N_STATES), p=np.asarray(initialization.empirical_flow_fractions, dtype=float)))

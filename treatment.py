@@ -1,5 +1,5 @@
 """
-Treatment protocols and summary metrics for the ecDNA v4 model.
+Treatment protocols and summary metrics.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from simulation import SimulationResult, run_simulation
 class TreatmentProtocol:
     name: str
     schedules: dict[str, Callable[[float], float]]
-    duration: float = 72.0
+    duration: float = 10.0
 
 
 def constant_input(value: float, start: float = 0.0, end: float = np.inf) -> Callable[[float], float]:
@@ -33,11 +33,11 @@ PROTOCOLS = {
     ),
     "cdk4_inhibition": TreatmentProtocol(
         name="CDK4 inhibitor",
-        schedules={"u_C": constant_input(1.0, start=12.0), "u_P": lambda _t: 0.0, "a": lambda _t: 0.0, "m": lambda _t: 0.1},
+        schedules={"u_C": constant_input(1.0, start=2.0), "u_P": lambda _t: 0.0, "a": lambda _t: 0.0, "m": lambda _t: 0.1},
     ),
     "pdgfra_inhibition": TreatmentProtocol(
         name="PDGFRA inhibitor",
-        schedules={"u_C": lambda _t: 0.0, "u_P": constant_input(1.0, start=12.0), "a": lambda _t: 0.0, "m": lambda _t: 0.1},
+        schedules={"u_C": lambda _t: 0.0, "u_P": constant_input(1.0, start=2.0), "a": lambda _t: 0.0, "m": lambda _t: 0.1},
     ),
     "mesenchymal_pressure": TreatmentProtocol(
         name="Mesenchymal cue",
@@ -45,7 +45,7 @@ PROTOCOLS = {
     ),
     "astrocytic_plus_cdk4i": TreatmentProtocol(
         name="Astrocytic cue plus CDK4 inhibitor",
-        schedules={"u_C": constant_input(1.0, start=12.0), "u_P": lambda _t: 0.0, "a": constant_input(0.8, start=0.0), "m": lambda _t: 0.0},
+        schedules={"u_C": constant_input(1.0, start=2.0), "u_P": lambda _t: 0.0, "a": constant_input(0.8, start=0.0), "m": lambda _t: 0.0},
     ),
 }
 
@@ -55,7 +55,13 @@ class InSilicoTrial:
         self.base_seed = base_seed
         self.results: dict[str, list[SimulationResult]] = {}
 
-    def run_protocol(self, protocol: TreatmentProtocol, n_replicates: int = 1, n_init: int | None = None, verbose: bool = True) -> list[SimulationResult]:
+    def run_protocol(
+        self,
+        protocol: TreatmentProtocol,
+        n_replicates: int = 1,
+        n_init: int | None = None,
+        verbose: bool = True,
+    ) -> list[SimulationResult]:
         outputs: list[SimulationResult] = []
         for replicate in range(n_replicates):
             result = run_simulation(
@@ -63,6 +69,7 @@ class InSilicoTrial:
                 n_init=n_init,
                 input_schedules=protocol.schedules,
                 seed=self.base_seed + replicate,
+                record_interval=1.0,
                 verbose=verbose,
             )
             outputs.append(result)
@@ -70,7 +77,7 @@ class InSilicoTrial:
         return outputs
 
 
-def compute_growth_rate(result: SimulationResult, window: float = 12.0) -> float:
+def compute_growth_rate(result: SimulationResult, window: float = 2.0) -> float:
     times = np.asarray(result.times, dtype=float)
     populations = np.asarray(result.population_sizes, dtype=float)
     if len(times) < 2:

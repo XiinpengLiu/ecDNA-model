@@ -11,7 +11,7 @@ from __future__ import annotations
 import copy
 from concurrent.futures import ProcessPoolExecutor
 import csv
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import itertools
 import json
 import math
@@ -84,7 +84,7 @@ class InitializationOverride:
 @dataclass(frozen=True)
 class ScreeningExecutionPlan:
     protocol_name: str = "untreated"
-    t_max: float = 72.0
+    t_max: float = 10.0
     record_interval: float = 1.0
     n_init: int = 80
     target_population_size: int | None = 500
@@ -306,6 +306,7 @@ def _make_spec(
 
 def build_parameter_specs() -> dict[str, ParameterSpec]:
     specs: dict[str, ParameterSpec] = {}
+    base_params = cfg.DEFAULT_MODEL_PARAMETERS
 
     def register(spec: ParameterSpec) -> None:
         cfg.require(spec.path not in specs, f"Duplicate parameter path in whitelist: {spec.path}")
@@ -317,7 +318,7 @@ def build_parameter_specs() -> dict[str, ParameterSpec]:
             group="validation_only",
             container_steps=("simulation",),
             field_name="dt",
-            default_value=float(cfg.PARAMS.simulation.dt),
+            default_value=float(base_params.simulation.dt),
             mode="log",
         )
     )
@@ -332,49 +333,49 @@ def build_parameter_specs() -> dict[str, ParameterSpec]:
     register(_make_spec(path="init_age_scale", group="init", container_steps=("initialization",), field_name="age_scale", default_value=2.0, mode="log"))
 
     for index, name in enumerate(cfg.SPECIES):
-        register(_make_spec(path=f"exposure.burden_weights[{name}]", group="landscape_exposure", container_steps=("exposure",), field_name="burden_weights", index=(index,), default_value=float(cfg.PARAMS.exposure.burden_weights[index]), mode="log"))
+        register(_make_spec(path=f"exposure.burden_weights[{name}]", group="landscape_exposure", container_steps=("exposure",), field_name="burden_weights", index=(index,), default_value=float(base_params.exposure.burden_weights[index]), mode="log"))
     for index, label in enumerate(("MYC", "CDK4")):
-        register(_make_spec(path=f"exposure.proliferative_weights[{label}]", group="landscape_exposure", container_steps=("exposure",), field_name="proliferative_weights", index=(index,), default_value=float(cfg.PARAMS.exposure.proliferative_weights[index]), mode="log"))
+        register(_make_spec(path=f"exposure.proliferative_weights[{label}]", group="landscape_exposure", container_steps=("exposure",), field_name="proliferative_weights", index=(index,), default_value=float(base_params.exposure.proliferative_weights[index]), mode="log"))
 
     for field_name, mode in (("alpha", "additive"), ("gamma_M", "signed_ratio"), ("gamma_C", "signed_ratio"), ("gamma_P", "signed_ratio"), ("xi_B", "signed_ratio")):
-        values = getattr(cfg.PARAMS.landscape, field_name)
+        values = getattr(base_params.landscape, field_name)
         for index, state_name in enumerate(cfg.STATE_NAMES):
             register(_make_spec(path=f"landscape.{field_name}[{state_name}]", group="landscape_exposure", container_steps=("landscape",), field_name=field_name, index=(index,), default_value=float(values[index]), mode=mode))
     for index in range(cfg.LATENT_DIM):
-        register(_make_spec(path=f"landscape.B_U[{index},{index}]", group="landscape_exposure", container_steps=("landscape",), field_name="B_U", index=(index, index), default_value=float(cfg.PARAMS.landscape.B_U[index, index]), mode="log"))
-    register(_make_spec(path="landscape.sigma_0", group="landscape_exposure", container_steps=("landscape",), field_name="sigma_0", default_value=float(cfg.PARAMS.landscape.sigma_0), mode="log"))
-    register(_make_spec(path="landscape.sigma_M", group="landscape_exposure", container_steps=("landscape",), field_name="sigma_M", default_value=float(cfg.PARAMS.landscape.sigma_M), mode="log"))
+        register(_make_spec(path=f"landscape.B_U[{index},{index}]", group="landscape_exposure", container_steps=("landscape",), field_name="B_U", index=(index, index), default_value=float(base_params.landscape.B_U[index, index]), mode="log"))
+    register(_make_spec(path="landscape.sigma_0", group="landscape_exposure", container_steps=("landscape",), field_name="sigma_0", default_value=float(base_params.landscape.sigma_0), mode="log"))
+    register(_make_spec(path="landscape.sigma_M", group="landscape_exposure", container_steps=("landscape",), field_name="sigma_M", default_value=float(base_params.landscape.sigma_M), mode="log"))
 
     for field_name, mode in (("alpha_R", "additive"), ("r_B", "signed_ratio"), ("r_S", "signed_ratio"), ("r_m", "signed_ratio"), ("b_R", "log"), ("sigma_R", "log"), ("alpha_V", "additive"), ("v_M", "signed_ratio"), ("v_A", "signed_ratio"), ("v_Q", "signed_ratio"), ("v_R", "signed_ratio"), ("b_V", "log"), ("sigma_V", "log")):
-        register(_make_spec(path=f"stress_survival.{field_name}", group="stress_survival", container_steps=("stress_survival",), field_name=field_name, default_value=float(getattr(cfg.PARAMS.stress_survival, field_name)), mode=mode))
+        register(_make_spec(path=f"stress_survival.{field_name}", group="stress_survival", container_steps=("stress_survival",), field_name=field_name, default_value=float(getattr(base_params.stress_survival, field_name)), mode=mode))
 
     for field_name in ("qbar_G1S", "qbar_G1Q", "qbar_QG1", "qbar_SG2M"):
-        register(_make_spec(path=f"cycle.{field_name}", group="cycle_hazard", container_steps=("cycle",), field_name=field_name, default_value=float(getattr(cfg.PARAMS.cycle, field_name)), mode="log"))
+        register(_make_spec(path=f"cycle.{field_name}", group="cycle_hazard", container_steps=("cycle",), field_name=field_name, default_value=float(getattr(base_params.cycle, field_name)), mode="log"))
     for field_name in ("beta_0", "gamma_0", "delta_0", "kappa_0"):
-        register(_make_spec(path=f"cycle.{field_name}", group="cycle_hazard", container_steps=("cycle",), field_name=field_name, default_value=float(getattr(cfg.PARAMS.cycle, field_name)), mode="additive"))
+        register(_make_spec(path=f"cycle.{field_name}", group="cycle_hazard", container_steps=("cycle",), field_name=field_name, default_value=float(getattr(base_params.cycle, field_name)), mode="additive"))
     for field_name in ("beta_P", "beta_NO", "beta_R", "beta_V", "gamma_M", "gamma_R", "gamma_V", "delta_P", "delta_V", "delta_NO", "delta_R", "kappa_R", "kappa_V"):
-        register(_make_spec(path=f"cycle.{field_name}", group="cycle_hazard", container_steps=("cycle",), field_name=field_name, default_value=float(getattr(cfg.PARAMS.cycle, field_name)), mode="signed_ratio"))
+        register(_make_spec(path=f"cycle.{field_name}", group="cycle_hazard", container_steps=("cycle",), field_name=field_name, default_value=float(getattr(base_params.cycle, field_name)), mode="signed_ratio"))
 
     for field_name, mode in (("lambda_div_ceiling", "log"), ("lambda_death_ceiling", "log"), ("theta_0", "additive"), ("theta_P", "signed_ratio"), ("theta_NO", "signed_ratio"), ("theta_R", "signed_ratio"), ("theta_V", "signed_ratio"), ("B_star", "log"), ("chi_B", "log"), ("phi_0", "additive"), ("phi_R", "signed_ratio"), ("phi_V", "signed_ratio"), ("phi_M", "signed_ratio"), ("phi_B", "signed_ratio")):
-        register(_make_spec(path=f"hazard.{field_name}", group="cycle_hazard", container_steps=("hazard",), field_name=field_name, default_value=float(getattr(cfg.PARAMS.hazard, field_name)), mode=mode))
+        register(_make_spec(path=f"hazard.{field_name}", group="cycle_hazard", container_steps=("hazard",), field_name=field_name, default_value=float(getattr(base_params.hazard, field_name)), mode=mode))
 
     for field_name, mode in (("eta_1", "log"), ("eta_2", "log"), ("r_L", "log"), ("r_U", "log")):
-        register(_make_spec(path=f"turnover_window.{field_name}", group="turnover_division", container_steps=("turnover_window",), field_name=field_name, default_value=float(getattr(cfg.PARAMS.turnover_window, field_name)), mode=mode))
+        register(_make_spec(path=f"turnover_window.{field_name}", group="turnover_division", container_steps=("turnover_window",), field_name=field_name, default_value=float(getattr(base_params.turnover_window, field_name)), mode=mode))
 
     for species_name in cfg.SPECIES:
-        species_params = cfg.PARAMS.turnover[species_name]
+        species_params = base_params.turnover[species_name]
         for field_name, mode in (("gain_ceiling", "log"), ("loss_ceiling", "log"), ("a0", "additive"), ("a_R", "signed_ratio"), ("a_prol", "signed_ratio"), ("b0", "additive"), ("b_R", "signed_ratio"), ("b_V", "signed_ratio")):
             register(_make_spec(path=f"turnover.{species_name}.{field_name}", group="turnover_division", container_steps=("turnover", species_name), field_name=field_name, default_value=float(getattr(species_params, field_name)), mode=mode))
 
-    register(_make_spec(path="division.tau", group="turnover_division", container_steps=("division",), field_name="tau", default_value=float(cfg.PARAMS.division.tau), mode="log"))
+    register(_make_spec(path="division.tau", group="turnover_division", container_steps=("division",), field_name="tau", default_value=float(base_params.division.tau), mode="log"))
     for index, species_name in enumerate(cfg.SPECIES):
-        register(_make_spec(path=f"division.delta[{species_name}]", group="turnover_division", container_steps=("division",), field_name="delta", index=(index,), default_value=float(cfg.PARAMS.division.delta[index]), mode="signed_ratio"))
+        register(_make_spec(path=f"division.delta[{species_name}]", group="turnover_division", container_steps=("division",), field_name="delta", index=(index,), default_value=float(base_params.division.delta[index]), mode="signed_ratio"))
     for field_name in ("rho_U", "rho_R", "rho_V"):
-        register(_make_spec(path=f"division.{field_name}", group="turnover_division", container_steps=("division",), field_name=field_name, default_value=float(getattr(cfg.PARAMS.division, field_name)), mode="probability"))
+        register(_make_spec(path=f"division.{field_name}", group="turnover_division", container_steps=("division",), field_name=field_name, default_value=float(getattr(base_params.division, field_name)), mode="probability"))
     for index in range(cfg.LATENT_DIM):
-        register(_make_spec(path=f"division.Omega_U[{index},{index}]", group="turnover_division", container_steps=("division",), field_name="Omega_U", index=(index, index), default_value=float(cfg.PARAMS.division.Omega_U[index, index]), mode="log"))
+        register(_make_spec(path=f"division.Omega_U[{index},{index}]", group="turnover_division", container_steps=("division",), field_name="Omega_U", index=(index, index), default_value=float(base_params.division.Omega_U[index, index]), mode="log"))
     for field_name, mode in (("sigma_R0", "log"), ("sigma_V0", "log"), ("zeta_0", "additive"), ("zeta_R", "signed_ratio"), ("zeta_M", "signed_ratio")):
-        register(_make_spec(path=f"division.{field_name}", group="turnover_division", container_steps=("division",), field_name=field_name, default_value=float(getattr(cfg.PARAMS.division, field_name)), mode=mode))
+        register(_make_spec(path=f"division.{field_name}", group="turnover_division", container_steps=("division",), field_name=field_name, default_value=float(getattr(base_params.division, field_name)), mode=mode))
     return specs
 
 
@@ -405,20 +406,21 @@ def apply_parameter_overrides(
     *,
     base_params: cfg.ModelParameters | None = None,
 ) -> tuple[cfg.ModelParameters, InitializationOverride]:
-    params_copy = copy.deepcopy(cfg.PARAMS if base_params is None else base_params)
+    params_copy = copy.deepcopy(cfg.DEFAULT_MODEL_PARAMETERS if base_params is None else base_params)
+    init_defaults_source = cfg.DEFAULT_INITIALIZATION_PARAMETERS
     init_defaults = {
-        "init_copy_mean[MYC]": 5.5,
-        "init_copy_mean[CDK4]": 6.5,
-        "init_copy_mean[PDGFRA]": 6.0,
-        "init_state_alpha[NPC-like]": 3.0,
-        "init_state_alpha[OPC-like]": 2.8,
-        "init_state_alpha[AC-like]": 1.6,
-        "init_state_alpha[MES-like]": 1.4,
-        "init_cycle_probs[Q]": 0.15,
-        "init_cycle_probs[G1]": 0.55,
-        "init_cycle_probs[S]": 0.20,
-        "init_cycle_probs[G2M]": 0.10,
-        "init_age_scale": 2.0,
+        "init_copy_mean[MYC]": float(init_defaults_source.parametric_copy_number_mean[cfg.MYC]),
+        "init_copy_mean[CDK4]": float(init_defaults_source.parametric_copy_number_mean[cfg.CDK4]),
+        "init_copy_mean[PDGFRA]": float(init_defaults_source.parametric_copy_number_mean[cfg.PDGFRA]),
+        "init_state_alpha[NPC-like]": float(init_defaults_source.parametric_state_dirichlet_alpha[cfg.NPC]),
+        "init_state_alpha[OPC-like]": float(init_defaults_source.parametric_state_dirichlet_alpha[cfg.OPC]),
+        "init_state_alpha[AC-like]": float(init_defaults_source.parametric_state_dirichlet_alpha[cfg.AC]),
+        "init_state_alpha[MES-like]": float(init_defaults_source.parametric_state_dirichlet_alpha[cfg.MES]),
+        "init_cycle_probs[Q]": float(init_defaults_source.cycle_probabilities[cfg.Q]),
+        "init_cycle_probs[G1]": float(init_defaults_source.cycle_probabilities[cfg.G1]),
+        "init_cycle_probs[S]": float(init_defaults_source.cycle_probabilities[cfg.S]),
+        "init_cycle_probs[G2M]": float(init_defaults_source.cycle_probabilities[cfg.G2M]),
+        "init_age_scale": float(init_defaults_source.age_scale),
     }
     init_values = dict(init_defaults)
     for path, value in overrides.items():
@@ -445,57 +447,16 @@ def apply_parameter_overrides(
     return params_copy, initialization
 
 
-@dataclass
-class RuntimeModelContext:
-    params: cfg.ModelParameters
-    initialization: InitializationOverride
-    _original_params: cfg.ModelParameters | None = field(default=None, init=False, repr=False)
-    _original_sample_cycle: Callable | None = field(default=None, init=False, repr=False)
-    _original_sample_copy: Callable | None = field(default=None, init=False, repr=False)
-    _original_sample_soft_state: Callable | None = field(default=None, init=False, repr=False)
-    _original_sample_age: Callable | None = field(default=None, init=False, repr=False)
-
-    def __enter__(self) -> "RuntimeModelContext":
-        self._original_params = cfg.PARAMS
-        self._original_sample_cycle = cfg.sample_initial_cycle_state
-        self._original_sample_copy = cfg.sample_initial_copy_numbers
-        self._original_sample_soft_state = cfg.sample_initial_soft_state
-        self._original_sample_age = cfg.sample_initial_age
-        cfg.PARAMS = self.params
-
-        cycle_probabilities = self.initialization.cycle_probabilities.copy()
-        copy_number_mean = self.initialization.copy_number_mean.copy()
-        state_dirichlet_alpha = self.initialization.state_dirichlet_alpha.copy()
-        age_scale = float(self.initialization.age_scale)
-
-        def sample_cycle(rng: np.random.Generator) -> int:
-            return int(rng.choice([cfg.Q, cfg.G1, cfg.S, cfg.G2M], p=cycle_probabilities))
-
-        def sample_copy(rng: np.random.Generator) -> np.ndarray:
-            copies = rng.poisson(copy_number_mean).astype(int)
-            cfg.validate_copy_vector(copies)
-            return copies
-
-        def sample_soft_state(rng: np.random.Generator) -> np.ndarray:
-            composition = rng.dirichlet(state_dirichlet_alpha)
-            cfg.validate_simplex(composition)
-            return composition
-
-        def sample_age(rng: np.random.Generator) -> float:
-            return float(rng.exponential(scale=age_scale))
-
-        cfg.sample_initial_cycle_state = sample_cycle
-        cfg.sample_initial_copy_numbers = sample_copy
-        cfg.sample_initial_soft_state = sample_soft_state
-        cfg.sample_initial_age = sample_age
-        return self
-
-    def __exit__(self, exc_type, exc, exc_tb) -> None:
-        cfg.PARAMS = self._original_params  # type: ignore[assignment]
-        cfg.sample_initial_cycle_state = self._original_sample_cycle  # type: ignore[assignment]
-        cfg.sample_initial_copy_numbers = self._original_sample_copy  # type: ignore[assignment]
-        cfg.sample_initial_soft_state = self._original_sample_soft_state  # type: ignore[assignment]
-        cfg.sample_initial_age = self._original_sample_age  # type: ignore[assignment]
+def _to_initialization_parameters(initialization: InitializationOverride) -> cfg.InitializationParameters:
+    params = cfg.InitializationParameters(
+        mode=cfg.PARAMETRIC,
+        parametric_copy_number_mean=initialization.copy_number_mean.copy(),
+        parametric_state_dirichlet_alpha=initialization.state_dirichlet_alpha.copy(),
+        cycle_probabilities=initialization.cycle_probabilities.copy(),
+        age_scale=float(initialization.age_scale),
+    )
+    cfg.validate_initialization_parameters(params)
+    return params
 
 
 def _event_counts(result: SimulationResult) -> tuple[int, int]:
@@ -520,9 +481,9 @@ def _write_trajectory_summary_csv(path: Path, result: SimulationResult) -> None:
     cfg.require(
         len(result.times)
         == len(result.population_sizes)
-        == len(result.mean_stress)
-        == len(result.mean_survival)
-        == len(result.state_fractions),
+        == len(result.mean_stress_scores)
+        == len(result.mean_survival_scores)
+        == len(result.soft_state_fractions),
         "Trajectory summary arrays must have identical lengths.",
     )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -533,14 +494,14 @@ def _write_trajectory_summary_csv(path: Path, result: SimulationResult) -> None:
         )
         writer.writeheader()
         for index, time_value in enumerate(result.times):
-            state_fraction = np.asarray(result.state_fractions[index], dtype=float)
+            state_fraction = np.asarray(result.soft_state_fractions[index], dtype=float)
             cfg.require(state_fraction.shape == (cfg.N_STATES,), "Trajectory state fraction row has invalid shape.")
             writer.writerow(
                 {
                     "time": float(time_value),
                     "population_size": int(result.population_sizes[index]),
-                    "mean_stress": float(result.mean_stress[index]),
-                    "mean_survival": float(result.mean_survival[index]),
+                    "mean_stress": float(result.mean_stress_scores[index]),
+                    "mean_survival": float(result.mean_survival_scores[index]),
                     "npc_fraction": float(state_fraction[cfg.NPC]),
                 }
             )
@@ -574,15 +535,15 @@ def _resolve_parameter_worker_count(task_count: int) -> int:
 def extract_screening_metrics(result: SimulationResult) -> dict[str, float]:
     cfg.require(bool(result.times), "Screening metrics require recorded simulation times.")
     cfg.require(bool(result.population_sizes), "Screening metrics require recorded population sizes.")
-    cfg.require(bool(result.state_fractions), "Screening metrics require recorded state fractions.")
+    cfg.require(bool(result.soft_state_fractions), "Screening metrics require recorded state fractions.")
     cfg.require(bool(result.bulk_copy_means), "Screening metrics require recorded bulk ecDNA means.")
-    cfg.require(bool(result.mean_stress), "Screening metrics require recorded stress values.")
-    cfg.require(bool(result.mean_survival), "Screening metrics require recorded survival values.")
+    cfg.require(bool(result.mean_stress_scores), "Screening metrics require recorded stress values.")
+    cfg.require(bool(result.mean_survival_scores), "Screening metrics require recorded survival values.")
     times = np.asarray(result.times, dtype=float)
     populations = np.asarray(result.population_sizes, dtype=float)
-    stress = np.asarray(result.mean_stress, dtype=float)
-    survival = np.asarray(result.mean_survival, dtype=float)
-    state = np.asarray(result.state_fractions, dtype=float)
+    stress = np.asarray(result.mean_stress_scores, dtype=float)
+    survival = np.asarray(result.mean_survival_scores, dtype=float)
+    state = np.asarray(result.soft_state_fractions, dtype=float)
     bulk = np.asarray(result.bulk_copy_means, dtype=float)
     cfg.require(times.ndim == 1 and len(times) >= 1, "Screening metrics require a one-dimensional time axis.")
     cfg.require(np.all(np.isfinite(times)), "Screening times must be finite.")
@@ -700,17 +661,29 @@ def _evaluate_screening_seed(
         screening_config.protocol_name in protocol_schedules,
         f"Unsupported screening protocol: {screening_config.protocol_name}.",
     )
-    with RuntimeModelContext(params=params, initialization=initialization):
-        result = run_simulation(
-            t_max=screening_config.t_max,
-            seed=seed,
-            n_init=screening_config.n_init,
+    screening_params = replace(
+        params,
+        simulation=replace(
+            params.simulation,
+            time_unit="week",
+            t_max=float(screening_config.t_max),
+            n_init=int(screening_config.n_init),
             target_population_size=screening_config.target_population_size,
-            max_pop_size=screening_config.max_pop_size,
-            input_schedules=protocol_schedules[screening_config.protocol_name],
-            record_interval=screening_config.record_interval,
-            verbose=False,
-        )
+            max_pop_size=int(screening_config.max_pop_size),
+            random_seed=int(seed),
+            fitting_mode=False,
+            record_full_snapshots=False,
+            record_events=True,
+        ),
+    )
+    result = run_simulation(
+        params=screening_params,
+        initialization=_to_initialization_parameters(initialization),
+        seed=seed,
+        input_schedules=protocol_schedules[screening_config.protocol_name],
+        record_interval=screening_config.record_interval,
+        verbose=False,
+    )
     metrics = extract_screening_metrics(result)
     seed_metric = ScreeningSeedMetric(
         candidate_id=candidate_id,

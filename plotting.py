@@ -1,5 +1,5 @@
 """
-Minimal plotting utilities for the ecDNA v4 model.
+Minimal plotting utilities for the ecDNA model.
 """
 
 from __future__ import annotations
@@ -8,11 +8,11 @@ from collections import defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 import numpy as np
 
 import config as cfg
 from simulation import SimulationResult
+
 
 STATE_COLORS = ("#2563eb", "#16a34a", "#f59e0b", "#dc2626")
 
@@ -26,9 +26,9 @@ def _save(fig: plt.Figure, save_path: str | Path | None) -> plt.Figure:
     return fig
 
 
-def plot_results(result: SimulationResult, title: str = "ecDNA v4 simulation", save_path: str | Path | None = None) -> plt.Figure:
+def plot_results(result: SimulationResult, title: str = "ecDNA simulation", save_path: str | Path | None = None) -> plt.Figure:
     times = np.asarray(result.times, dtype=float)
-    state_fractions = np.asarray(result.state_fractions, dtype=float)
+    state_fractions = np.asarray(result.soft_state_fractions, dtype=float)
     bulk = np.asarray(result.bulk_copy_means, dtype=float)
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
@@ -52,8 +52,8 @@ def plot_results(result: SimulationResult, title: str = "ecDNA v4 simulation", s
     axes[1, 0].set_ylabel("Mean copies")
     axes[1, 0].legend(frameon=False, fontsize=8)
 
-    axes[1, 1].plot(times, result.mean_stress, label="Stress", linewidth=2)
-    axes[1, 1].plot(times, result.mean_survival, label="Survival reserve", linewidth=2)
+    axes[1, 1].plot(times, result.mean_stress_scores, label="Stress score", linewidth=2)
+    axes[1, 1].plot(times, result.mean_survival_scores, label="Survival score", linewidth=2)
     axes[1, 1].set_title("Latent stress and survival")
     axes[1, 1].set_xlabel("Time")
     axes[1, 1].legend(frameon=False, fontsize=8)
@@ -65,27 +65,27 @@ def plot_results(result: SimulationResult, title: str = "ecDNA v4 simulation", s
 
 def plot_observation_proxies(result: SimulationResult, save_path: str | Path | None = None) -> plt.Figure:
     times = np.asarray(result.times, dtype=float)
-    bulk = np.asarray(result.bulk_copy_means, dtype=float)
-    counts = np.asarray(result.population_sizes, dtype=float)
+    flow_fractions = np.asarray([snapshot["flow_fractions"] for snapshot in result.observations], dtype=float)
+    qpcdr_means = np.asarray([snapshot["pooled_qpcdr_means"] for snapshot in result.observations], dtype=float)
+    counts = np.asarray([snapshot["observed_count"] for snapshot in result.observations], dtype=float)
 
     fig, axes = plt.subplots(1, 3, figsize=(13, 4))
-    state_fractions = np.asarray(result.state_fractions, dtype=float)
-    axes[0].stackplot(times, state_fractions.T, labels=cfg.STATE_NAMES)
-    axes[0].set_title("Flow/staining proxy")
+    axes[0].stackplot(times, flow_fractions.T, labels=cfg.STATE_NAMES)
+    axes[0].set_title("Observed flow fractions")
     axes[0].set_xlabel("Time")
     axes[0].set_ylabel("Fraction")
 
     for idx, species in enumerate(cfg.SPECIES):
-        axes[1].plot(times, bulk[:, idx], linewidth=2, label=species)
-    axes[1].set_title("qPCR proxy")
+        axes[1].plot(times, qpcdr_means[:, idx], linewidth=2, label=species)
+    axes[1].set_title("Sorted qPCDR proxy")
     axes[1].set_xlabel("Time")
-    axes[1].set_ylabel("Mean copies")
+    axes[1].set_ylabel("Observed signal")
     axes[1].legend(frameon=False, fontsize=8)
 
     axes[2].plot(times, counts, color="#7c3aed", linewidth=2)
-    axes[2].set_title("Cell-count proxy")
+    axes[2].set_title("Observed cell count")
     axes[2].set_xlabel("Time")
-    axes[2].set_ylabel("Predicted count")
+    axes[2].set_ylabel("Count")
 
     fig.tight_layout()
     return _save(fig, save_path)
@@ -97,8 +97,8 @@ def plot_event_summary(result: SimulationResult, save_path: str | Path | None = 
         event_counts[event_type] = event_counts.get(event_type, 0) + 1
 
     fig, ax = plt.subplots(figsize=(8, 4))
-    labels = list(event_counts.keys())
-    values = [event_counts[key] for key in labels]
+    labels = list(event_counts.keys()) if event_counts else ["none"]
+    values = [event_counts[key] for key in labels] if event_counts else [0]
     ax.bar(labels, values, color="#2563eb")
     ax.set_title("Event counts")
     ax.set_ylabel("Count")
@@ -129,11 +129,6 @@ def _sample_terminal_cell_ids(snapshot: list[dict], n_terminal_cells: int) -> li
 
     sampled_indices: list[int] = []
     for raw_index in np.rint(np.linspace(0, len(terminal_ids) - 1, num=n_terminal_cells)).astype(int).tolist():
-        if raw_index not in sampled_indices:
-            sampled_indices.append(raw_index)
-    for raw_index in range(len(terminal_ids)):
-        if len(sampled_indices) >= n_terminal_cells:
-            break
         if raw_index not in sampled_indices:
             sampled_indices.append(raw_index)
     sampled_indices.sort()
@@ -204,9 +199,6 @@ def plot_lineage_state_paths(
         elif event_type == "death" and cell_id in included_cells:
             state_points[cell_id][event_time] = _dominant_state_index(details["state_pre"]["soft_state"])
 
-    for cell_id in included_cells:
-        cfg.require(bool(state_points[cell_id]), f"Missing observed state path for cell {cell_id}.")
-
     leaf_rank = {cell_id: idx for idx, cell_id in enumerate(selected_terminal_ids)}
     filtered_children = {
         cell_id: [child_id for child_id in children_by_parent.get(cell_id, []) if child_id in included_cells]
@@ -241,63 +233,55 @@ def plot_lineage_state_paths(
         y_positions[cell_id] = float(np.mean(child_positions))
         return y_positions[cell_id]
 
-    root_cells = sorted(
-        [cell_id for cell_id in included_cells if parent_by_cell.get(cell_id) not in included_cells],
-        key=leftmost_rank,
-    )
-    cfg.require(bool(root_cells), "Lineage state plot requires at least one root cell in the sampled subgraph.")
-    for root_cell in root_cells:
-        assign_y(root_cell)
+    roots = [cell_id for cell_id in included_cells if parent_by_cell.get(cell_id) is None or parent_by_cell.get(cell_id) not in included_cells]
+    for root in sorted(roots, key=leftmost_rank):
+        assign_y(root)
 
-    time_padding = max(0.5, 0.03 * max(latest_time - float(result.times[0]), 1.0))
-    fig_height = max(4.0, 1.1 * len(selected_terminal_ids) + 2.0)
-    fig, ax = plt.subplots(figsize=(14, fig_height))
+    fig, ax = plt.subplots(figsize=(12, max(4.0, 0.8 * len(selected_terminal_ids) + 2.0)))
+    state_cmap = dict(zip(range(cfg.N_STATES), STATE_COLORS))
 
-    for cell_id in sorted(included_cells, key=leftmost_rank):
-        ordered_points = sorted(state_points[cell_id].items())
-        y_position = y_positions[cell_id]
-        for (start_time, state_idx), (end_time, _) in zip(ordered_points[:-1], ordered_points[1:]):
+    for cell_id in included_cells:
+        points = state_points[cell_id]
+        sorted_times = sorted(points.keys())
+        y = y_positions[cell_id]
+        birth_time = birth_times.get(cell_id, min(sorted_times))
+        end_time = death_times.get(cell_id, division_times.get(cell_id, latest_time))
+
+        if birth_time in points:
+            start_state = points[birth_time]
+        else:
+            earlier_times = [time for time in sorted_times if time <= birth_time]
+            start_state = points[max(earlier_times)] if earlier_times else points[sorted_times[0]]
+
+        ax.hlines(y, birth_time, end_time, color=state_cmap[start_state], linewidth=2.5, alpha=0.45)
+
+        for time in sorted_times:
+            ax.scatter(time, y, s=26, color=state_cmap[points[time]], edgecolors="none", zorder=3)
+
+        parent_id = parent_by_cell.get(cell_id)
+        if parent_id is not None and parent_id in included_cells:
             ax.plot(
-                [start_time, end_time],
-                [y_position, y_position],
-                color=STATE_COLORS[state_idx],
-                linewidth=3.0,
-                solid_capstyle="round",
-                zorder=2,
+                [birth_time, birth_time],
+                [y_positions[parent_id], y],
+                color="#9ca3af",
+                linewidth=1.1,
+                alpha=0.8,
             )
+
         if cell_id in death_times:
-            ax.scatter(death_times[cell_id], y_position, color="#111827", marker="x", s=36, linewidths=1.5, zorder=4)
+            ax.scatter(death_times[cell_id], y, marker="x", s=42, color="#111827", linewidths=1.3, zorder=4)
 
-    for parent_id, child_ids in filtered_children.items():
-        if len(child_ids) < 2:
-            continue
-        division_time = division_times[parent_id]
-        child_y_positions = [y_positions[child_id] for child_id in sorted(child_ids, key=leftmost_rank)]
-        ax.plot(
-            [division_time, division_time],
-            [min(child_y_positions), max(child_y_positions)],
-            color="#6b7280",
-            linewidth=1.5,
-            zorder=1,
-        )
-
-    label_x = latest_time + time_padding
-    for terminal_id in selected_terminal_ids:
-        ax.text(label_x, y_positions[terminal_id], f"cell {terminal_id}", va="center", fontsize=9)
-
-    legend_handles = [Line2D([0], [0], color=STATE_COLORS[idx], lw=3, label=state_name) for idx, state_name in enumerate(cfg.STATE_NAMES)]
-    legend_handles.append(
-        Line2D([0], [0], color="#111827", marker="x", linestyle="None", markersize=6, label="Death")
-    )
-    ax.legend(handles=legend_handles, frameon=False, loc="upper left", ncol=3)
-    ax.set_title(f"{title} (dominant state, n={len(selected_terminal_ids)} terminal cells)")
+    ax.set_yticks([y_positions[cell_id] for cell_id in selected_terminal_ids])
+    ax.set_yticklabels([f"Cell {cell_id}" for cell_id in selected_terminal_ids])
     ax.set_xlabel("Time")
-    ax.set_ylabel("Sampled lineage")
-    ax.set_xlim(float(result.times[0]), latest_time + 4.0 * time_padding)
-    ax.set_ylim(-0.8, max(y_positions.values()) + 0.8)
-    ax.set_yticks([])
-    ax.spines["left"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.grid(axis="x", color="#e5e7eb", linewidth=0.8)
+    ax.set_title(title)
+
+    legend_handles = [
+        plt.Line2D([0], [0], marker="o", color="none", markerfacecolor=STATE_COLORS[idx], markersize=7, label=state_name)
+        for idx, state_name in enumerate(cfg.STATE_NAMES)
+    ]
+    legend_handles.append(plt.Line2D([0], [0], marker="x", color="#111827", linestyle="none", markersize=7, label="Death"))
+    ax.legend(handles=legend_handles, frameon=False, loc="upper left", bbox_to_anchor=(1.01, 1.0))
+
     fig.tight_layout()
     return _save(fig, save_path)

@@ -1,9 +1,13 @@
 """
-Main entry point for the ecDNA v4 simulation program.
+Main entry point for the ecDNA simulation program.
 """
 
+from __future__ import annotations
+
+from dataclasses import replace
 from pathlib import Path
 
+import config as cfg
 from plotting import plot_event_summary, plot_lineage_state_paths, plot_observation_proxies, plot_results
 from simulation import run_simulation
 from treatment import compute_bulk_copy_trends, compute_growth_rate, compute_terminal_event_counts
@@ -13,17 +17,22 @@ def main() -> None:
     output_dir = Path("results_v4")
     output_dir.mkdir(exist_ok=True)
 
-    t_max = 72000
-    target_population_size = 2000
-    max_pop_size = 200000
-    record_interval = 1.0
+    base_params = cfg.DEFAULT_MODEL_PARAMETERS
+    simulation_params = replace(
+        base_params.simulation,
+        time_unit="week",
+        t_max=10.0,
+        record_times=tuple(float(week) for week in range(1, 11)),
+        target_population_size=None,
+        max_pop_size=200000,
+        record_full_snapshots=True,
+        record_events=True,
+    )
+    params = replace(base_params, simulation=simulation_params)
 
     result = run_simulation(
-        t_max=t_max,
+        params=params,
         n_init=80,
-        record_interval=record_interval,
-        target_population_size=target_population_size,
-        max_pop_size=max_pop_size,
         seed=42,
         verbose=True,
     )
@@ -33,14 +42,15 @@ def main() -> None:
     terminal_counts = compute_terminal_event_counts(result)
 
     print("=" * 64)
-    print("ecDNA v4 simulation summary")
+    print("ecDNA simulation summary")
     print("=" * 64)
     print(
         "Simulation limits: "
-        f"t_max={t_max:.1f}, "
-        f"record_interval={record_interval:.1f}, "
-        f"target_population_size={target_population_size}, "
-        f"max_pop_size={max_pop_size}"
+        f"time_unit={params.simulation.time_unit}, "
+        f"t_max={params.simulation.t_max:.1f}, "
+        f"record_times={params.simulation.record_times}, "
+        f"target_population_size={params.simulation.target_population_size}, "
+        f"max_pop_size={params.simulation.max_pop_size}"
     )
     print(f"Stop reason: {result.stop_reason} at t={result.stop_time:.2f}")
     print(f"Final population size: {result.population_sizes[-1]}")

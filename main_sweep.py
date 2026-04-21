@@ -19,7 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for tables, plots, and reports.",
     )
     parser.add_argument("--protocol-name", default="untreated", help="Screening protocol name.")
-    parser.add_argument("--t-max", type=float, default=72.0, help="Simulation end time for screening mode.")
+    parser.add_argument("--t-max", type=float, default=10.0, help="Simulation end time for screening mode.")
     parser.add_argument("--record-interval", type=float, default=1.0, help="Record interval for screening mode.")
     parser.add_argument("--n-init", type=int, default=80, help="Initial population size for screening mode.")
     parser.add_argument(
