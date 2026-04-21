@@ -146,11 +146,14 @@ class CountRecord:
     week: int
     value: float
     replicate_id: str | None = None
+    gate: str | None = None
 
     def __post_init__(self) -> None:
         cfg.require(bool(self.condition), "CountRecord.condition must be non-empty.")
         cfg.require(self.week >= WEEK1, "CountRecord.week must be at least 1.")
         cfg.require(np.isfinite(self.value) and self.value >= 0.0, "CountRecord.value must be finite and non-negative.")
+        if self.gate is not None:
+            cfg.require(self.gate in cfg.STATE_NAMES, f"Invalid count gate {self.gate}.")
 
 
 @dataclass(frozen=True)
@@ -205,6 +208,10 @@ class CanonicalFitDataset:
     ectag: tuple[EcTAGRecord, ...]
     week1_copy_distributions: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
     ectag_hist_max: int | None = None
+    purity_matrix: np.ndarray | None = None
+    purity_sensitivity: tuple[np.ndarray, ...] = ()
+    qpcdr_calibration: dict[str, dict[str, float]] = field(default_factory=dict)
+    batch_column_policy: str = "as-provided"
 
     def __post_init__(self) -> None:
         normalized_conditions = {name: spec for name, spec in self.conditions.items()}
@@ -215,6 +222,15 @@ class CanonicalFitDataset:
         object.__setattr__(self, "qpcdr", tuple(self.qpcdr))
         object.__setattr__(self, "ectag", tuple(self.ectag))
         object.__setattr__(self, "week1_copy_distributions", self._normalize_week1_copy_distributions(self.week1_copy_distributions))
+        if self.purity_matrix is not None:
+            object.__setattr__(self, "purity_matrix", self._normalize_purity_matrix(self.purity_matrix, "purity_matrix"))
+        object.__setattr__(
+            self,
+            "purity_sensitivity",
+            tuple(self._normalize_purity_matrix(matrix, f"purity_sensitivity[{index}]") for index, matrix in enumerate(self.purity_sensitivity)),
+        )
+        object.__setattr__(self, "qpcdr_calibration", dict(self.qpcdr_calibration))
+        cfg.require(bool(self.batch_column_policy), "batch_column_policy must be non-empty.")
         self.validate()
 
     @staticmethod
@@ -238,6 +254,16 @@ class CanonicalFitDataset:
             result[condition] = state_payload
         return result
 
+    @staticmethod
+    def _normalize_purity_matrix(values: np.ndarray, name: str) -> np.ndarray:
+        matrix = np.asarray(values, dtype=float)
+        cfg.require(matrix.shape == (cfg.N_STATES, cfg.N_STATES), f"{name} must have shape ({cfg.N_STATES}, {cfg.N_STATES}).")
+        cfg.require(np.all(np.isfinite(matrix)), f"{name} must be finite.")
+        cfg.require(np.all(matrix >= 0.0), f"{name} must be non-negative.")
+        column_sums = np.sum(matrix, axis=0)
+        cfg.require(np.all(column_sums > 0.0), f"Every {name} column must have positive mass.")
+        return matrix / column_sums
+
     def validate(self) -> None:
         referenced_conditions = set(self.conditions)
         for collection_name, records in (
@@ -250,11 +276,6 @@ class CanonicalFitDataset:
                 condition = getattr(record, "condition")
                 cfg.require(condition in referenced_conditions, f"{collection_name} record references unknown condition {condition}.")
 
-        qpcdr_batches = {record.batch for record in self.qpcdr}
-        cfg.require(
-            len(qpcdr_batches) <= 1,
-            "The current fitting shell supports at most one qPCDR batch. Split batches into separate fits or extend ObservationParameters first.",
-        )
         qpcdr_scales = {record.value_scale for record in self.qpcdr}
         cfg.require(len(qpcdr_scales) <= 1, "qPCDR records must use a single value scale across the dataset.")
 
@@ -303,6 +324,11 @@ class CanonicalFitDataset:
         if not self.qpcdr:
             return DEFAULT_QPCDR_BATCH
         return self.qpcdr[0].batch
+
+    def qpcdr_batches(self) -> tuple[str, ...]:
+        if not self.qpcdr:
+            return (DEFAULT_QPCDR_BATCH,)
+        return tuple(sorted({record.batch for record in self.qpcdr}))
 
     def condition_names(self) -> tuple[str, ...]:
         return tuple(self.conditions.keys())
@@ -443,6 +469,9 @@ class CanonicalFitDataset:
                 for condition, by_state in matrix_payload.items()
             }
 
+        purity_matrix = payload.get("purity_matrix")
+        purity_sensitivity = tuple(np.asarray(matrix, dtype=float) for matrix in payload.get("purity_sensitivity", ()))
+
         return cls(
             conditions=conditions,
             flow=flow,
@@ -451,6 +480,10 @@ class CanonicalFitDataset:
             ectag=ectag,
             week1_copy_distributions=week1_copy_distributions,
             ectag_hist_max=payload.get("ectag_hist_max"),
+            purity_matrix=None if purity_matrix is None else np.asarray(purity_matrix, dtype=float),
+            purity_sensitivity=purity_sensitivity,
+            qpcdr_calibration=payload.get("qpcdr_calibration", {}),
+            batch_column_policy=payload.get("batch_column_policy", "as-provided"),
         )
 
     @classmethod
@@ -514,6 +547,18 @@ class CanonicalFitDataset:
                             replicate_id=replicate_id,
                         )
                     )
+                    sorted_state_counts = observation_snapshot.get("sorted_state_counts", {})
+                    for state_name in cfg.STATE_NAMES:
+                        if state_name in sorted_state_counts:
+                            counts.append(
+                                CountRecord(
+                                    condition=condition_name,
+                                    week=week,
+                                    value=float(sorted_state_counts[state_name]),
+                                    replicate_id=replicate_id,
+                                    gate=state_name,
+                                )
+                            )
 
                     for state_name in cfg.STATE_NAMES:
                         qpcdr_payload = observation_snapshot["sorted_qpcdr"]["values"][state_name]
@@ -572,6 +617,10 @@ class CanonicalFitDataset:
             ectag=tuple(ectag),
             week1_copy_distributions=week1_copy_distributions,
             ectag_hist_max=inferred_hist_max,
+            purity_matrix=None,
+            purity_sensitivity=(),
+            qpcdr_calibration={},
+            batch_column_policy="as-provided",
         )
 
 
@@ -607,6 +656,7 @@ def load_count_csv(path: str | Path) -> tuple[CountRecord, ...]:
                     week=int(raw["week"]),
                     value=float(raw["count"]),
                     replicate_id=raw.get("replicate_id") or None,
+                    gate=raw.get("gate") or None,
                 )
             )
     return tuple(rows)
