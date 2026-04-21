@@ -11,9 +11,9 @@ from typing import Iterable
 import numpy as np
 from scipy.optimize import minimize
 
-import config as cfg
-from fit_data import CanonicalFitDataset
-from fit_diagnostics import (
+from ecdna_model import config as cfg
+from ecdna_model.fit.data import CanonicalFitDataset
+from ecdna_model.fit.diagnostics import (
     FakeDataRecoveryReport,
     PosteriorPredictiveReport,
     PriorPredictiveReport,
@@ -24,10 +24,10 @@ from fit_diagnostics import (
     run_prior_predictive,
     run_profile_likelihood,
 )
-from fit_objective import SyntheticLikelihoodObjective
-from fit_parameter_registry import CATEGORY_STAGE1, CATEGORY_STAGE2, ParameterBundle, ParameterRegistry
-from fit_simulation_runner import FitRunnerConfig, FitSimulationRunner
-from fit_summary import SummaryCollection, summarize_dataset
+from ecdna_model.fit.objective import SyntheticLikelihoodObjective
+from ecdna_model.fit.parameter_registry import CATEGORY_STAGE1, CATEGORY_STAGE2, ParameterBundle, ParameterRegistry
+from ecdna_model.fit.simulation_runner import FitRunnerConfig, FitSimulationRunner
+from ecdna_model.fit.summary import SummaryCollection, summarize_dataset
 
 
 DEFAULT_CLASSIFICATION_PATH = Path("markdown/full_v4_parameter_classification.md")

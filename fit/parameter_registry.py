@@ -12,8 +12,8 @@ from typing import Callable, Iterable, Mapping
 
 import numpy as np
 
-import config as cfg
-from fit_data import CanonicalFitDataset
+from ecdna_model import config as cfg
+from ecdna_model.fit.data import CanonicalFitDataset
 
 
 CATEGORY_FIXED = "fixed"

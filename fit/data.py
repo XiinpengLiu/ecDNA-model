@@ -12,7 +12,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
-import config as cfg
+from ecdna_model import config as cfg
 
 
 WEEK1 = 1
@@ -462,7 +462,7 @@ class CanonicalFitDataset:
         qpcdr_value_scale: str = DEFAULT_QPCDR_SCALE,
         ectag_hist_max: int | None = None,
     ) -> "CanonicalFitDataset":
-        from simulation import SimulationResult
+        from ecdna_model.core.simulation import SimulationResult
 
         normalized_runs: dict[str, tuple[SimulationResult, ...]] = {}
         for condition_name, payload in runs_by_condition.items():

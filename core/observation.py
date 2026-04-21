@@ -9,10 +9,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-import config as cfg
+from ecdna_model import config as cfg
 
 if TYPE_CHECKING:
-    from cell import Cell
+    from ecdna_model.core.cell import Cell
 
 
 @dataclass(frozen=True)

@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import numpy as np
 
-import config as cfg
-import dynamics as dyn
-from cell import Cell
+from ecdna_model import config as cfg
+from ecdna_model.core import dynamics as dyn
+from ecdna_model.core.cell import Cell
 
 
 class DivisionKernel:

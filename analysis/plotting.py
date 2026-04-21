@@ -10,8 +10,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-import config as cfg
-from simulation import SimulationResult
+from ecdna_model import config as cfg
+from ecdna_model.core.simulation import SimulationResult
 
 
 STATE_COLORS = ("#2563eb", "#16a34a", "#f59e0b", "#dc2626")

@@ -8,12 +8,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-import config as cfg
-from fit_data import CanonicalFitDataset
-from fit_parameter_registry import FitParameterSpec, ParameterBoundsError, ParameterBundle, ParameterRegistry
-from fit_simulation_runner import FitSimulationRunner, SimulationRunSet
-from fit_summary import SummaryCollection, mean_summary_collection, summarize_simulation_runset
-from fit_transforms import ParameterVectorAdapter
+from ecdna_model import config as cfg
+from ecdna_model.fit.data import CanonicalFitDataset
+from ecdna_model.fit.parameter_registry import FitParameterSpec, ParameterBoundsError, ParameterBundle, ParameterRegistry
+from ecdna_model.fit.simulation_runner import FitSimulationRunner, SimulationRunSet
+from ecdna_model.fit.summary import SummaryCollection, mean_summary_collection, summarize_simulation_runset
+from ecdna_model.fit.transforms import ParameterVectorAdapter
 
 
 INVALID_OBJECTIVE = 1e18

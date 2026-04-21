@@ -9,10 +9,10 @@ from typing import Callable
 
 import numpy as np
 
-import config as cfg
-from fit_objective import SyntheticLikelihoodArtifacts, SyntheticLikelihoodObjective
-from fit_parameter_registry import FitParameterSpec, ParameterBoundsError, ParameterRegistry
-from fit_summary import SummaryCollection, mean_summary_collection, summarize_simulation_runset
+from ecdna_model import config as cfg
+from ecdna_model.fit.objective import SyntheticLikelihoodArtifacts, SyntheticLikelihoodObjective
+from ecdna_model.fit.parameter_registry import FitParameterSpec, ParameterBoundsError, ParameterRegistry
+from ecdna_model.fit.summary import SummaryCollection, mean_summary_collection, summarize_simulation_runset
 
 
 @dataclass(frozen=True)

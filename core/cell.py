@@ -9,10 +9,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-import config as cfg
+from ecdna_model import config as cfg
 
 if TYPE_CHECKING:
-    import dynamics as dyn
+    from ecdna_model.core import dynamics as dyn
 
 
 @dataclass(eq=False)
@@ -171,7 +171,7 @@ class CellPopulation:
         return len(self.cells)
 
     def initialize(self, n: int | None = None) -> None:
-        import dynamics as dyn
+        from ecdna_model.core import dynamics as dyn
 
         target_n = self.params.simulation.n_init if n is None else n
         base_context = dyn.ReplicateContext(
@@ -212,7 +212,7 @@ class CellPopulation:
         self.events.append((time, event_type, cell_id, details or {}))
 
     def summary(self, context: "dyn.ReplicateContext") -> dict:
-        import dynamics as dyn
+        from ecdna_model.core import dynamics as dyn
 
         if not self.cells:
             return {
