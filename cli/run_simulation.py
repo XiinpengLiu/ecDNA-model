@@ -8,12 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import config as cfg
-from analysis.plotting import (
-    plot_event_summary,
-    plot_lineage_state_paths,
-    plot_observation_proxies,
-    plot_results,
-)
+from analysis.plotting import plot_single_run_diagnostic_suite
 from analysis.treatment import compute_bulk_copy_trends, compute_growth_rate, compute_terminal_event_counts
 from core.simulation import run_simulation
 
@@ -73,10 +68,7 @@ def main() -> None:
     )
 
     result.save_as_csv(output_dir / "simulation_data")
-    plot_results(result, save_path=output_dir / "simulation_summary.png")
-    plot_observation_proxies(result, save_path=output_dir / "observation_proxies.png")
-    plot_event_summary(result, save_path=output_dir / "event_summary.png")
-    plot_lineage_state_paths(result, save_path=output_dir / "lineage_state_paths.png")
+    plot_single_run_diagnostic_suite(result, output_dir)
 
     print(f"Results written to: {output_dir.resolve()}")
 

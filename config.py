@@ -133,34 +133,34 @@ def _weekly_record_times() -> tuple[float, ...]:
 
 @dataclass(frozen=True)
 class ExposureParameters:
-    k_C: float = 0.25
-    k_P: float = 0.25
-    eta_C: float = 1.0
-    eta_P: float = 1.0
+    k_C: float = 0.35
+    k_P: float = 0.35
+    eta_C: float = 0.0025
+    eta_P: float = 0.007
     D_C0: float = 0.0
     D_P0: float = 0.0
-    nu_C: float = 0.85
-    nu_P: float = 0.85
+    nu_C: float = 0.75
+    nu_P: float = 0.35
     burden_weights: np.ndarray = field(
-        default_factory=lambda: np.array([0.3170731707, 0.3414634146, 0.3414634146], dtype=float)
+        default_factory=lambda: np.array([0.36, 0.28, 0.36], dtype=float)
     )
     proliferative_weights: np.ndarray = field(
-        default_factory=lambda: np.array([0.5588235294, 0.4411764706], dtype=float)
+        default_factory=lambda: np.array([0.70, 0.30], dtype=float)
     )
 
 
 @dataclass(frozen=True)
 class StateLandscapeParameters:
-    alpha: np.ndarray = field(default_factory=lambda: np.array([0.25, 0.15, -0.05, -0.25], dtype=float))
-    gamma_M: np.ndarray = field(default_factory=lambda: np.array([0.20, 0.05, 0.00, 0.05], dtype=float))
-    gamma_C: np.ndarray = field(default_factory=lambda: np.array([1.10, 0.15, -0.20, -0.10], dtype=float))
-    gamma_P: np.ndarray = field(default_factory=lambda: np.array([0.05, 1.05, -0.15, -0.10], dtype=float))
+    alpha: np.ndarray = field(default_factory=lambda: np.array([0.25, 0.22, 0.08, 0.05], dtype=float))
+    gamma_M: np.ndarray = field(default_factory=lambda: np.array([0.01, 0.00, 0.00, 0.01], dtype=float))
+    gamma_C: np.ndarray = field(default_factory=lambda: np.array([0.08, 0.02, -0.02, -0.02], dtype=float))
+    gamma_P: np.ndarray = field(default_factory=lambda: np.array([0.02, 0.08, -0.02, -0.02], dtype=float))
     eta_a: np.ndarray = field(default_factory=lambda: np.array([-0.15, -0.10, 1.15, -0.10], dtype=float))
     eta_m: np.ndarray = field(default_factory=lambda: np.array([-0.20, -0.15, -0.10, 1.10], dtype=float))
-    xi_B: np.ndarray = field(default_factory=lambda: np.array([0.10, 0.10, 0.06, 0.12], dtype=float))
+    xi_B: np.ndarray = field(default_factory=lambda: np.array([0.05, 0.05, 0.04, 0.05], dtype=float))
     B_U: np.ndarray = field(default_factory=lambda: np.diag(np.array([0.85, 0.80, 0.75], dtype=float)))
-    sigma_0: float = 0.12
-    sigma_M: float = 0.05
+    sigma_0: float = 0.08
+    sigma_M: float = 0.025
 
 
 @dataclass(frozen=True)
@@ -168,18 +168,18 @@ class StressSurvivalParameters:
     alpha_R: float = 0.05
     r_B: float = 0.18
     r_S: float = 0.45
-    r_C: float = 0.35
-    r_P: float = 0.35
+    r_C: float = 0.12
+    r_P: float = 0.10
     r_m: float = 0.20
     b_R: float = 0.90
     sigma_R: float = 0.12
     alpha_V: float = 0.40
-    v_M: float = 0.45
+    v_M: float = 0.50
     v_A: float = 0.32
     v_Q: float = 0.22
     v_R: float = 0.35
-    v_C: float = 0.18
-    v_P: float = 0.18
+    v_C: float = 0.06
+    v_P: float = 0.05
     v_a: float = 0.24
     b_V: float = 0.85
     sigma_V: float = 0.10
@@ -196,8 +196,8 @@ class CycleTransitionParameters:
     beta_NO: float = 0.65
     beta_R: float = 0.45
     beta_V: float = 0.55
-    beta_C: float = 0.75
-    beta_Pg: float = 0.35
+    beta_C: float = 1.10
+    beta_Pg: float = 0.45
     gamma_0: float = -1.70
     gamma_M: float = 0.65
     gamma_R: float = 0.65
@@ -241,7 +241,7 @@ class TurnoverSpeciesParameters:
 @dataclass(frozen=True)
 class HazardParameters:
     lambda_div_ceiling: float = 0.62
-    lambda_death_ceiling: float = 0.24
+    lambda_death_ceiling: float = 0.18
     theta_0: float = -0.15
     theta_P: float = 1.00
     theta_NO: float = 0.70
@@ -254,9 +254,9 @@ class HazardParameters:
     phi_V: float = 0.95
     phi_M: float = 0.15
     phi_B: float = 0.10
-    chi_C: float = 0.55
-    chi_P: float = 0.55
-    omega_O_given_C: float = 0.45
+    chi_C: float = 0.18
+    chi_P: float = 0.18
+    omega_O_given_C: float = 0.25
     min_division_age: float = 0.25
     age_gate_slope: float = 6.0
 
@@ -268,8 +268,8 @@ class DivisionParameters:
     cR: np.ndarray = field(default_factory=lambda: np.zeros(N_SPECIES, dtype=float))
     cC: np.ndarray = field(default_factory=lambda: np.zeros(N_SPECIES, dtype=float))
     cP: np.ndarray = field(default_factory=lambda: np.zeros(N_SPECIES, dtype=float))
-    tau: float = 0.85
-    delta: np.ndarray = field(default_factory=lambda: np.array([0.9, 0.9, 0.9], dtype=float))
+    tau: float = 1.05
+    delta: np.ndarray = field(default_factory=lambda: np.array([1.0, 1.0, 1.0], dtype=float))
     rho_U: float = 0.60
     rho_R: float = 0.55
     rho_V: float = 0.55
@@ -337,9 +337,9 @@ class ModelParameters:
     turnover_window: TurnoverWindowParameters = field(default_factory=TurnoverWindowParameters)
     turnover: Dict[str, TurnoverSpeciesParameters] = field(
         default_factory=lambda: {
-            "MYC": TurnoverSpeciesParameters(0.26, 0.12, -1.10, 0.90, 0.65, 0.10, 0.10, -1.25, 0.45, 0.55, 0.18, 0.18),
-            "CDK4": TurnoverSpeciesParameters(0.23, 0.12, -1.15, 0.85, 0.60, 0.16, 0.08, -1.25, 0.45, 0.52, 0.22, 0.14),
-            "PDGFRA": TurnoverSpeciesParameters(0.23, 0.12, -1.15, 0.85, 0.60, 0.08, 0.16, -1.25, 0.45, 0.52, 0.14, 0.22),
+            "MYC": TurnoverSpeciesParameters(0.12, 1.20, -1.10, 0.90, 0.65, 0.00, -0.02, -3.20, 0.45, 0.55, 0.05, 0.35),
+            "CDK4": TurnoverSpeciesParameters(0.18, 1.10, -1.15, 0.85, 0.60, -0.05, -0.02, -3.25, 0.45, 0.52, 1.55, 0.15),
+            "PDGFRA": TurnoverSpeciesParameters(0.18, 1.35, -1.15, 0.85, 0.60, 0.00, -0.05, -3.25, 0.45, 0.52, 0.08, 0.90),
         }
     )
     hazard: HazardParameters = field(default_factory=HazardParameters)
@@ -365,10 +365,10 @@ class ObservationParameters:
 @dataclass(frozen=True)
 class InitializationParameters:
     mode: str = PARAMETRIC
-    parametric_copy_number_mean: np.ndarray = field(default_factory=lambda: np.array([5.5, 6.5, 6.0], dtype=float))
-    parametric_state_dirichlet_alpha: np.ndarray = field(default_factory=lambda: np.array([3.0, 2.8, 1.6, 1.4], dtype=float))
+    parametric_copy_number_mean: np.ndarray = field(default_factory=lambda: np.array([50.0, 37.5, 46.0], dtype=float))
+    parametric_state_dirichlet_alpha: np.ndarray = field(default_factory=lambda: np.array([3.4, 3.2, 1.7, 1.6], dtype=float))
     cycle_probabilities: np.ndarray = field(default_factory=lambda: np.array([0.15, 0.55, 0.20, 0.10], dtype=float))
-    age_scale: float = 2.0
+    age_scale: float = 1.0
     empirical_flow_fractions: np.ndarray | None = None
     empirical_sorted_copy_distributions: dict[str, np.ndarray] | None = None
     empirical_soft_state_concentration: float = 25.0
