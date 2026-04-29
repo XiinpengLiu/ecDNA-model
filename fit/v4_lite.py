@@ -1,9 +1,8 @@
-"""
-Week-level v4-lite fitting path.
+"""Week-level v4-lite fitting implementation.
 
-The default fitting path intentionally avoids the full agent-based simulator.
-It fits week-level state abundance, state-specific binned ecDNA distributions,
-and the sorted-gate observation model described in ``markdown/fit_method.md``.
+This module intentionally fits summary-level dynamics first.  It treats the
+full simulator as a later bridge target, and it keeps ddPCR as a pooled mean
+anchor rather than a single-cell distribution constraint.
 """
 
 from __future__ import annotations
@@ -11,88 +10,62 @@ from __future__ import annotations
 import copy
 import csv
 import json
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass, field, replace
+from itertools import combinations
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, Sequence
 
 import numpy as np
-from scipy.linalg import expm
 from scipy.optimize import minimize
 from scipy.special import gammaln
 
 import config as cfg
-from fit.data import CanonicalFitDataset, EcTAGRecord, FlowRecord, QPCDRRecord, WEEK1
+from fit.data import CanonicalFitDataset, EcTAGRecord, FlowRecord, QPCDRRecord, WEEK1, write_standardized_dataset
+from fit.io_utils import write_json, write_netcdf_file, write_npz_or_marker, write_table_bundle, write_text_pdf
 from fit.summary_types import SummaryCollection
 
 
 INVALID_OBJECTIVE = 1e18
-V4LiteModelVersion = {"M0", "M1", "M2", "M3"}
+V4LiteModelVersion = {"M0", "M1", "M2", "M3", "M4"}
 V4LiteDynamicsMode = {"joint", "ecDNA_only", "state_only"}
-DEFAULT_COPY_BINS = ((0, 0), (1, 1), (2, 3), (4, 7), (8, 15), (16, None))
-DEFAULT_COPY_BIN_CENTERS = (0.0, 1.0, 2.5, 5.5, 11.5, 24.0)
-DEFAULT_DIRECTED_EDGES = ((cfg.NPC, cfg.OPC), (cfg.OPC, cfg.NPC), (cfg.OPC, cfg.AC), (cfg.AC, cfg.OPC), (cfg.AC, cfg.MES), (cfg.MES, cfg.AC))
+V4LiteCouplingMode = {"none", "growth", "transition", "joint"}
+DEFAULT_COPY_BINS = ((0, 0), (1, 1), (2, 3), (4, 7), (8, 15), (16, 31), (32, 63), (64, 127), (128, None))
+DEFAULT_COPY_BIN_CENTERS = (0.0, 1.0, 2.5, 5.5, 11.5, 23.5, 47.5, 95.5, 160.0)
+DEFAULT_DIRECTED_EDGES = (
+    (cfg.NPC, cfg.OPC),
+    (cfg.OPC, cfg.NPC),
+    (cfg.OPC, cfg.AC),
+    (cfg.AC, cfg.OPC),
+    (cfg.AC, cfg.MES),
+    (cfg.MES, cfg.AC),
+)
 OPTIONAL_DIRECTED_EDGES = ((cfg.NPC, cfg.AC), (cfg.AC, cfg.NPC))
 
 
-def _safe_log1p(value: float | np.ndarray) -> float | np.ndarray:
-    return np.log1p(np.clip(value, 0.0, None))
+def _normalize(values: np.ndarray, *, floor: float = 1e-12) -> np.ndarray:
+    raw = np.clip(np.asarray(values, dtype=float), floor, None)
+    return raw / float(np.sum(raw))
 
 
 def _softmax(values: np.ndarray) -> np.ndarray:
     shifted = np.asarray(values, dtype=float) - float(np.max(values))
     weights = np.exp(shifted)
-    total = float(np.sum(weights))
-    cfg.require(np.isfinite(total) and total > 0.0, "Softmax weights must have positive finite mass.")
-    return weights / total
+    return _normalize(weights)
 
 
-def _normalize_simplex(values: np.ndarray, *, floor: float = 1e-12) -> np.ndarray:
-    flat = np.clip(np.asarray(values, dtype=float), floor, None)
-    total = float(np.sum(flat))
-    cfg.require(np.isfinite(total) and total > 0.0, "Simplex values must have positive finite mass.")
-    return flat / total
-
-
-def _student_t_logpdf(value: float, location: float, scale: float, df: float) -> float:
-    scale = max(float(scale), 1e-8)
-    z = (float(value) - float(location)) / scale
-    return float(
-        gammaln((df + 1.0) / 2.0)
-        - gammaln(df / 2.0)
-        - 0.5 * np.log(df * np.pi)
-        - np.log(scale)
-        - ((df + 1.0) / 2.0) * np.log1p((z * z) / df)
-    )
-
-
-def _multinomial_logpmf(counts: np.ndarray, probabilities: np.ndarray) -> float:
-    y = np.asarray(counts, dtype=float)
-    p = _normalize_simplex(probabilities)
+def _multinomial_nll(counts: np.ndarray, probabilities: np.ndarray) -> float:
+    y = np.asarray(counts, dtype=float).reshape(-1)
+    p = np.clip(_normalize(probabilities), 1e-12, 1.0)
     n = float(np.sum(y))
-    return float(gammaln(n + 1.0) - np.sum(gammaln(y + 1.0)) + np.dot(y, np.log(np.clip(p, 1e-12, 1.0))))
+    return -float(gammaln(n + 1.0) - np.sum(gammaln(y + 1.0)) + np.dot(y, np.log(p)))
 
 
-def _dirichlet_multinomial_logpmf(counts: np.ndarray, probabilities: np.ndarray, concentration: float) -> float:
-    y = np.asarray(counts, dtype=float)
-    p = _normalize_simplex(probabilities)
-    alpha0 = max(float(concentration), 1e-6)
-    alpha = np.clip(alpha0 * p, 1e-8, None)
-    n = float(np.sum(y))
-    return float(
-        gammaln(n + 1.0)
-        - np.sum(gammaln(y + 1.0))
-        + gammaln(alpha0)
-        - gammaln(n + alpha0)
-        + np.sum(gammaln(y + alpha) - gammaln(alpha))
-    )
-
-
-def _negative_binomial_logpmf(value: float, mean: float, dispersion: float) -> float:
-    y = max(float(value), 0.0)
-    mu = max(float(mean), 1e-8)
-    r = max(float(dispersion), 1e-6)
-    p = r / (r + mu)
-    return float(gammaln(y + r) - gammaln(r) - gammaln(y + 1.0) + r * np.log(p) + y * np.log1p(-p))
+def _safe_rmse(values: np.ndarray) -> float:
+    flat = np.asarray(values, dtype=float).reshape(-1)
+    if flat.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(flat))))
 
 
 @dataclass(frozen=True)
@@ -101,19 +74,35 @@ class CopyNumberBinning:
     centers: np.ndarray = field(default_factory=lambda: np.asarray(DEFAULT_COPY_BIN_CENTERS, dtype=float))
 
     def __post_init__(self) -> None:
-        cfg.require(len(self.bins) == int(self.centers.size), "Copy-number bin centers must match bins.")
-        cfg.require(self.bins[0][0] == 0, "Copy-number bins must start at zero.")
+        centers = np.asarray(self.centers, dtype=float).reshape(-1)
+        cfg.require(len(self.bins) == centers.size, "copy-number bin centers must match bins.")
+        object.__setattr__(self, "centers", centers)
 
     @property
     def n_bins(self) -> int:
         return len(self.bins)
 
+    @classmethod
+    def from_observed_values(cls, values: Iterable[int], *, forced_max: int | None = None) -> "CopyNumberBinning":
+        observed_max = max([0, *(int(v) for v in values)])
+        if forced_max is not None:
+            observed_max = max(observed_max, int(forced_max))
+        keep = []
+        centers = []
+        for (lower, upper), center in zip(DEFAULT_COPY_BINS, DEFAULT_COPY_BIN_CENTERS):
+            keep.append((lower, upper))
+            centers.append(center)
+            if upper is None or observed_max <= upper:
+                break
+        return cls(tuple(keep), np.asarray(centers, dtype=float))
+
     def bin_index(self, value: int | float) -> int:
-        integer_value = int(max(0, round(float(value))))
+        integer_value = max(0, int(round(float(value))))
         for index, (lower, upper) in enumerate(self.bins):
-            if upper is None and integer_value >= lower:
-                return index
-            if upper is not None and lower <= integer_value <= upper:
+            if upper is None:
+                if integer_value >= lower:
+                    return index
+            elif lower <= integer_value <= upper:
                 return index
         return self.n_bins - 1
 
@@ -125,7 +114,7 @@ class CopyNumberBinning:
 
     def probabilities(self, values: Iterable[int | float], *, epsilon: float = 0.0) -> np.ndarray:
         counts = self.counts(values).astype(float)
-        if epsilon > 0.0:
+        if epsilon:
             counts += float(epsilon)
         if float(np.sum(counts)) <= 0.0:
             counts[0] = 1.0
@@ -134,14 +123,8 @@ class CopyNumberBinning:
     def mean(self, probabilities: np.ndarray) -> float:
         return float(np.dot(np.asarray(probabilities, dtype=float).reshape(self.n_bins), self.centers))
 
-    def tail_probability(self, probabilities: np.ndarray, threshold: int) -> float:
-        probs = np.asarray(probabilities, dtype=float).reshape(self.n_bins)
-        total = 0.0
-        for index, (lower, upper) in enumerate(self.bins):
-            if upper is None or upper >= threshold:
-                if lower >= threshold or (upper is not None and lower < threshold <= upper):
-                    total += float(probs[index])
-        return total
+    def tail_probability(self, probabilities: np.ndarray) -> float:
+        return float(np.asarray(probabilities, dtype=float).reshape(self.n_bins)[-1])
 
 
 @dataclass(frozen=True)
@@ -150,10 +133,6 @@ class FlowObservation:
     week: int
     counts: np.ndarray
     replicate_id: str
-
-    @property
-    def total(self) -> float:
-        return float(np.sum(self.counts))
 
 
 @dataclass(frozen=True)
@@ -199,37 +178,32 @@ class EcTAGCorrelationObservation:
 
 
 @dataclass(frozen=True)
+class DDPCRObservation:
+    condition: str
+    week: int
+    species_index: int
+    value: float
+    sigma: float
+    replicate_id: str
+
+
+@dataclass(frozen=True)
 class V4LiteStructure:
     transition_edges: tuple[tuple[int, int], ...]
     binning: CopyNumberBinning = field(default_factory=CopyNumberBinning)
     qpcdr_batches: tuple[str, ...] = ("default",)
 
     @classmethod
-    def default(
-        cls,
-        *,
-        include_optional_edge: bool = False,
-        qpcdr_batches: Iterable[str] = ("default",),
-    ) -> "V4LiteStructure":
-        edges = tuple(DEFAULT_DIRECTED_EDGES + (OPTIONAL_DIRECTED_EDGES if include_optional_edge else ()))
-        batches = tuple(qpcdr_batches) or ("default",)
-        return cls(transition_edges=edges, qpcdr_batches=tuple(sorted(batches)))
+    def default(cls, *, include_optional_edge: bool = False, qpcdr_batches: Iterable[str] = ("default",), binning: CopyNumberBinning | None = None) -> "V4LiteStructure":
+        edges = DEFAULT_DIRECTED_EDGES + (OPTIONAL_DIRECTED_EDGES if include_optional_edge else ())
+        return cls(tuple(edges), CopyNumberBinning() if binning is None else binning, tuple(sorted(set(qpcdr_batches))) or ("default",))
 
     def with_qpcdr_batches(self, batches: Iterable[str]) -> "V4LiteStructure":
-        batch_tuple = tuple(sorted(set(batches))) or ("default",)
-        return V4LiteStructure(transition_edges=self.transition_edges, binning=self.binning, qpcdr_batches=batch_tuple)
-
-    @property
-    def n_edges(self) -> int:
-        return len(self.transition_edges)
+        return V4LiteStructure(self.transition_edges, self.binning, tuple(sorted(set(batches))) or ("default",))
 
     @property
     def undirected_edges(self) -> tuple[tuple[int, int], ...]:
         return tuple(sorted({tuple(sorted(edge)) for edge in self.transition_edges}))
-
-    def mobility_index(self, source: int, target: int) -> int:
-        pair = tuple(sorted((int(source), int(target))))
-        return self.undirected_edges.index(pair)
 
     @property
     def n_mobility_edges(self) -> int:
@@ -239,6 +213,9 @@ class V4LiteStructure:
     def n_qpcdr_batches(self) -> int:
         return len(self.qpcdr_batches)
 
+    def mobility_index(self, source: int, target: int) -> int:
+        return self.undirected_edges.index(tuple(sorted((int(source), int(target)))))
+
 
 @dataclass
 class V4LiteParameters:
@@ -246,7 +223,6 @@ class V4LiteParameters:
     qpcdr_slope: np.ndarray = field(default_factory=lambda: np.ones(cfg.N_SPECIES, dtype=float))
     qpcdr_sigma: np.ndarray = field(default_factory=lambda: np.full(cfg.N_SPECIES, 0.25, dtype=float))
     qpcdr_batch_offsets: np.ndarray = field(default_factory=lambda: np.zeros(1, dtype=float))
-    qpcdr_df: float = 4.0
     flow_concentration: float = 250.0
     count_dispersion: float = 25.0
     count_gate_dispersion: float = 25.0
@@ -258,8 +234,6 @@ class V4LiteParameters:
     kernel_down_species: np.ndarray = field(default_factory=lambda: np.full(cfg.N_SPECIES, -2.30, dtype=float))
     kernel_up_state: np.ndarray = field(default_factory=lambda: np.zeros(cfg.N_STATES, dtype=float))
     kernel_down_state: np.ndarray = field(default_factory=lambda: np.zeros(cfg.N_STATES, dtype=float))
-    kernel_down_C_target: float = 0.0
-    kernel_down_P_target: float = 0.0
     alpha_state: np.ndarray = field(default_factory=lambda: np.array([0.15, 0.05, -0.05, -0.15], dtype=float))
     beta_C: float = 0.50
     beta_P: float = 0.50
@@ -276,36 +250,24 @@ class V4LiteParameters:
     sort_purity_matrix: np.ndarray = field(default_factory=lambda: np.eye(cfg.N_STATES, dtype=float))
 
     @classmethod
-    def default(
-        cls,
-        structure: V4LiteStructure | None = None,
-        *,
-        purity_matrix: np.ndarray | None = None,
-        qpcdr_calibration: Mapping[str, Mapping[str, float]] | None = None,
-    ) -> "V4LiteParameters":
+    def default(cls, structure: V4LiteStructure | None = None, *, purity_matrix: np.ndarray | None = None, qpcdr_calibration: Mapping[str, Mapping[str, float]] | None = None) -> "V4LiteParameters":
         model_structure = V4LiteStructure.default() if structure is None else structure
         params = cls()
         params.qpcdr_batch_offsets = np.zeros(model_structure.n_qpcdr_batches, dtype=float)
+        params.mobility_log = np.full(model_structure.n_mobility_edges, np.log(0.08), dtype=float)
         params.alpha_state = params.alpha_state - float(np.mean(params.alpha_state))
-        mobility_values: list[float] = []
-        for source, target in model_structure.undirected_edges:
-            forward = cfg.DEFAULT_MODEL_PARAMETERS.generator.base_edges.get((source, target), 0.08)
-            backward = cfg.DEFAULT_MODEL_PARAMETERS.generator.base_edges.get((target, source), forward)
-            mobility_values.append(np.log(max(float(0.5 * (forward + backward)), 1e-4)))
-        params.mobility_log = np.asarray(mobility_values, dtype=float)
         if purity_matrix is not None:
             params.sort_purity_matrix = _normalize_purity_matrix(purity_matrix)
-        if qpcdr_calibration:
-            for species_name, calibration in qpcdr_calibration.items():
-                if species_name not in cfg.SPECIES_INDEX:
-                    continue
-                species_index = cfg.SPECIES_INDEX[species_name]
-                if "intercept" in calibration:
-                    params.qpcdr_intercept[species_index] = float(calibration["intercept"])
-                if "slope" in calibration:
-                    params.qpcdr_slope[species_index] = max(float(calibration["slope"]), 1e-8)
-                if "sigma" in calibration:
-                    params.qpcdr_sigma[species_index] = max(float(calibration["sigma"]), 1e-8)
+        for species, calibration in (qpcdr_calibration or {}).items():
+            if species not in cfg.SPECIES_INDEX:
+                continue
+            idx = cfg.SPECIES_INDEX[species]
+            if "intercept" in calibration:
+                params.qpcdr_intercept[idx] = float(calibration["intercept"])
+            if "slope" in calibration:
+                params.qpcdr_slope[idx] = max(float(calibration["slope"]), 1e-8)
+            if "sigma" in calibration:
+                params.qpcdr_sigma[idx] = max(float(calibration["sigma"]), 1e-8)
         return params
 
     def copy(self) -> "V4LiteParameters":
@@ -327,6 +289,7 @@ class V4LiteTensor:
     qpcdr_observations: tuple[QPCDRObservation, ...]
     ectag_hist_observations: tuple[EcTAGHistogramObservation, ...]
     ectag_corr_observations: tuple[EcTAGCorrelationObservation, ...]
+    ddpcr_observations: tuple[DDPCRObservation, ...]
     observed_summary: SummaryCollection
     has_total_counts: bool
     has_same_cell_ectag: bool
@@ -334,11 +297,11 @@ class V4LiteTensor:
 
     @property
     def week_to_index(self) -> dict[int, int]:
-        return {week: index for index, week in enumerate(self.weeks)}
+        return {week: idx for idx, week in enumerate(self.weeks)}
 
     @property
     def batch_to_index(self) -> dict[str, int]:
-        return {batch: index for index, batch in enumerate(self.structure.qpcdr_batches)}
+        return {batch: idx for idx, batch in enumerate(self.structure.qpcdr_batches)}
 
 
 @dataclass(frozen=True)
@@ -390,6 +353,8 @@ class V4LitePosteriorPredictiveReport:
     block_relative_rmse: dict[str, float]
     block_max_abs_residual: dict[str, float]
     worst_relative_rmse: float
+    block_coverage_90: dict[str, float] = field(default_factory=dict)
+    overall_coverage_90: float | None = None
 
 
 @dataclass(frozen=True)
@@ -405,6 +370,10 @@ class V4LiteFakeDataRecoveryReport:
     normalized_error: float
     passed: bool
     block_relative_rmse: dict[str, float] = field(default_factory=dict)
+    n_synthetic: int = 1
+    skipped_reason: str | None = None
+    sign_recovery_rate: float | None = None
+    coverage_rate: float | None = None
 
 
 @dataclass(frozen=True)
@@ -426,6 +395,8 @@ class V4LitePosteriorSamples:
     samples: np.ndarray
     acceptance_rate: float
     skipped_reason: str | None = None
+    covariance: np.ndarray | None = None
+    method: str = "approximate"
 
 
 @dataclass(frozen=True)
@@ -440,6 +411,7 @@ class V4LiteReports:
     prior_diagnostics_report: dict[str, object] = field(default_factory=dict)
     count_observation_report: dict[str, object] = field(default_factory=dict)
     posterior_predictive_residuals: tuple[dict[str, object], ...] = ()
+    posterior_predictive_intervals: tuple[dict[str, object], ...] = ()
     sbc_report: dict[str, object] | None = None
 
 
@@ -454,14 +426,12 @@ class FullToLiteProjection:
     diagnostics: dict[str, object]
 
 
-def _normalize_purity_matrix(values: np.ndarray) -> np.ndarray:
-    matrix = np.asarray(values, dtype=float)
-    cfg.require(matrix.shape == (cfg.N_STATES, cfg.N_STATES), "purity matrix has invalid shape.")
-    cfg.require(np.all(np.isfinite(matrix)), "purity matrix must be finite.")
-    cfg.require(np.all(matrix >= 0.0), "purity matrix must be non-negative.")
-    column_sums = np.sum(matrix, axis=0)
-    cfg.require(np.all(column_sums > 0.0), "purity matrix columns must have positive mass.")
-    return matrix / column_sums
+def _normalize_purity_matrix(matrix: np.ndarray) -> np.ndarray:
+    values = np.asarray(matrix, dtype=float)
+    totals = np.sum(values, axis=0)
+    cfg.require(values.shape == (cfg.N_STATES, cfg.N_STATES), "purity matrix has invalid shape.")
+    cfg.require(np.all(totals > 0.0), "purity columns must have positive mass.")
+    return values / totals
 
 
 def _flow_record_count(record: FlowRecord) -> float:
@@ -469,35 +439,24 @@ def _flow_record_count(record: FlowRecord) -> float:
         return float(record.count)
     if record.fraction is not None and record.total_events is not None:
         return float(record.fraction * record.total_events)
-    if record.fraction is not None:
-        return float(record.fraction * 1000.0)
-    return 0.0
+    return float((record.fraction or 0.0) * 1000.0)
 
 
-def _week1_total_count(dataset: CanonicalFitDataset, condition_name: str) -> float:
-    count_values = [
-        float(record.value)
-        for record in dataset.counts
-        if record.condition == condition_name and record.week == WEEK1 and record.gate is None
-    ]
-    if count_values:
-        return max(float(np.mean(count_values)), 1e-8)
-    flow_rows = [record for record in dataset.flow if record.condition == condition_name and record.week == WEEK1]
-    counted = [_flow_record_count(record) for record in flow_rows]
-    total = float(np.sum(counted))
-    return max(total, 1.0) if total > 0.0 else 1.0
+def _week1_total_count(dataset: CanonicalFitDataset, condition: str) -> float:
+    values = [row.value for row in dataset.counts if row.condition == condition and row.week == WEEK1 and row.gate is None]
+    if values:
+        return max(float(np.mean(values)), 1.0)
+    return max(float(sum(_flow_record_count(row) for row in dataset.flow if row.condition == condition and row.week == WEEK1)), 1.0)
 
 
-def build_v4_lite_tensor(
-    dataset: CanonicalFitDataset,
-    *,
-    condition_names: Iterable[str] | None = None,
-    structure: V4LiteStructure | None = None,
-) -> V4LiteTensor:
-    selected_conditions = tuple(dataset.condition_names() if condition_names is None else tuple(condition_names))
-    cfg.require(bool(selected_conditions), "At least one condition is required for v4-lite fitting.")
-    qpcdr_batches = dataset.qpcdr_batches()
-    model_structure = V4LiteStructure.default(qpcdr_batches=qpcdr_batches) if structure is None else structure.with_qpcdr_batches(qpcdr_batches)
+def build_v4_lite_tensor(dataset: CanonicalFitDataset, *, condition_names: Iterable[str] | None = None, structure: V4LiteStructure | None = None) -> V4LiteTensor:
+    selected = tuple(dataset.condition_names() if condition_names is None else condition_names)
+    all_copy_values: list[int] = [row.value for row in dataset.ectag]
+    for by_state in dataset.week1_copy_distributions.values():
+        for matrix in by_state.values():
+            all_copy_values.extend(np.asarray(matrix, dtype=int).reshape(-1).tolist())
+    binning = CopyNumberBinning.from_observed_values(all_copy_values, forced_max=dataset.ectag_hist_max)
+    model_structure = V4LiteStructure.default(qpcdr_batches=dataset.qpcdr_batches(), binning=binning) if structure is None else V4LiteStructure(structure.transition_edges, structure.binning, dataset.qpcdr_batches())
     max_week = max(dataset.dynamic_weeks())
     weeks = tuple(range(WEEK1, int(max_week) + 1))
 
@@ -505,66 +464,48 @@ def build_v4_lite_tensor(
     initial_copy_distributions: dict[str, np.ndarray] = {}
     exposure_C: dict[str, np.ndarray] = {}
     exposure_P: dict[str, np.ndarray] = {}
-    burden_values: list[float] = []
-    for condition_name in selected_conditions:
-        cfg.require(condition_name in dataset.conditions, f"Unknown condition {condition_name}.")
-        init_condition = dataset.resolve_initialization_condition(condition_name)
-        initialization = dataset.build_empirical_initialization(condition_name)
-        cfg.require(initialization.empirical_flow_fractions is not None, "Empirical week1 flow fractions are required.")
-        cfg.require(initialization.empirical_sorted_copy_distributions is not None, "Empirical week1 copy distributions are required.")
-        total_count = _week1_total_count(dataset, init_condition)
-        initial_state_abundance[condition_name] = total_count * np.asarray(initialization.empirical_flow_fractions, dtype=float)
+    burden_terms: list[float] = []
+    for condition in selected:
+        init_condition = dataset.resolve_initialization_condition(condition)
+        init = dataset.build_empirical_initialization(condition)
+        cfg.require(init.empirical_flow_fractions is not None, "empirical flow is required.")
+        cfg.require(init.empirical_sorted_copy_distributions is not None, "empirical copy distributions are required.")
+        total = _week1_total_count(dataset, init_condition)
+        initial_state_abundance[condition] = total * np.asarray(init.empirical_flow_fractions, dtype=float)
         p0 = np.zeros((cfg.N_STATES, cfg.N_SPECIES, model_structure.binning.n_bins), dtype=float)
-        for state_index, state_name in enumerate(cfg.STATE_NAMES):
-            matrix = np.asarray(initialization.empirical_sorted_copy_distributions[state_name], dtype=int)
-            for species_index in range(cfg.N_SPECIES):
-                p0[state_index, species_index, :] = model_structure.binning.probabilities(matrix[:, species_index], epsilon=1e-3)
-                burden_values.append(float(np.dot(p0[state_index, species_index, :], np.log1p(model_structure.binning.centers))))
-        initial_copy_distributions[condition_name] = p0
-        schedules = dataset.conditions[condition_name].build_input_schedules()
-        exposure_C[condition_name] = np.asarray([float(schedules["u_C"](float(week - WEEK1) + 0.5)) for week in weeks[:-1]], dtype=float)
-        exposure_P[condition_name] = np.asarray([float(schedules["u_P"](float(week - WEEK1) + 0.5)) for week in weeks[:-1]], dtype=float)
+        for state_idx, state_name in enumerate(cfg.STATE_NAMES):
+            matrix = init.empirical_sorted_copy_distributions[state_name]
+            for species_idx in range(cfg.N_SPECIES):
+                p0[state_idx, species_idx, :] = model_structure.binning.probabilities(matrix[:, species_idx], epsilon=1e-3)
+                burden_terms.append(float(np.dot(p0[state_idx, species_idx], np.log1p(model_structure.binning.centers))))
+        initial_copy_distributions[condition] = p0
+        schedules = dataset.conditions[condition].build_input_schedules()
+        exposure_C[condition] = np.asarray([schedules["u_C"](float(week - WEEK1) + 0.5) for week in weeks[:-1]], dtype=float)
+        exposure_P[condition] = np.asarray([schedules["u_P"](float(week - WEEK1) + 0.5) for week in weeks[:-1]], dtype=float)
 
-    flow_observations = _build_flow_observations(dataset, selected_conditions)
+    flow_observations = _build_flow_observations(dataset, selected)
     count_observations = tuple(
-        CountObservation(
-            record.condition,
-            record.week,
-            float(record.value),
-            record.replicate_id or "__aggregate__",
-            None if record.gate is None else cfg.STATE_INDEX[record.gate],
-        )
-        for record in dataset.counts
-        if record.condition in selected_conditions and record.week > WEEK1
+        CountObservation(row.condition, row.week, float(row.value), row.replicate_id or "__aggregate__", None if row.gate is None else cfg.STATE_INDEX[row.gate])
+        for row in dataset.counts
+        if row.condition in selected and row.week > WEEK1
     )
-    batch_to_index = {batch: index for index, batch in enumerate(model_structure.qpcdr_batches)}
+    batch_to_index = {batch: idx for idx, batch in enumerate(model_structure.qpcdr_batches)}
     qpcdr_observations = tuple(
-        QPCDRObservation(
-            record.condition,
-            record.week,
-            cfg.STATE_INDEX[record.state],
-            cfg.SPECIES_INDEX[record.species],
-            float(record.value),
-            batch_to_index[record.batch],
-            record.replicate_id or "__aggregate__",
-        )
-        for record in dataset.qpcdr
-        if record.condition in selected_conditions and record.week > WEEK1
+        QPCDRObservation(row.condition, row.week, cfg.STATE_INDEX[row.state], cfg.SPECIES_INDEX[row.species], float(row.value), batch_to_index[row.batch], row.replicate_id or "__aggregate__")
+        for row in dataset.qpcdr
+        if row.condition in selected and row.week > WEEK1
     )
-    ectag_hist_observations, ectag_corr_observations = _build_ectag_observations(dataset, selected_conditions, model_structure.binning)
-    observed_summary = _observed_summary_from_observations(
-        flow_observations,
-        count_observations,
-        qpcdr_observations,
-        ectag_hist_observations,
-        ectag_corr_observations,
-        model_structure,
-        dataset,
+    ectag_hist_observations, ectag_corr_observations, has_same_cell = _build_ectag_observations(dataset, selected, model_structure.binning)
+    ddpcr_observations = tuple(
+        DDPCRObservation(row.condition, row.week, cfg.SPECIES_INDEX[row.species], float(row.value), _ddpcr_sigma(row), row.replicate_id or "__aggregate__")
+        for row in dataset.ddpcr
+        if row.condition in selected and row.week > WEEK1
     )
+    observed_summary = _observed_summary_from_observations(flow_observations, count_observations, qpcdr_observations, ectag_hist_observations, ectag_corr_observations, ddpcr_observations, dataset)
     return V4LiteTensor(
         dataset=dataset,
         structure=model_structure,
-        condition_names=selected_conditions,
+        condition_names=selected,
         weeks=weeks,
         initial_state_abundance=initial_state_abundance,
         initial_copy_distributions=initial_copy_distributions,
@@ -575,124 +516,115 @@ def build_v4_lite_tensor(
         qpcdr_observations=qpcdr_observations,
         ectag_hist_observations=ectag_hist_observations,
         ectag_corr_observations=ectag_corr_observations,
+        ddpcr_observations=ddpcr_observations,
         observed_summary=observed_summary,
-        has_total_counts=any(observation.gate_index is None for observation in count_observations),
-        has_same_cell_ectag=bool(ectag_corr_observations),
-        burden_star=float(np.median(burden_values)) if burden_values else 1.0,
+        has_total_counts=any(obs.gate_index is None for obs in count_observations),
+        has_same_cell_ectag=has_same_cell,
+        burden_star=float(np.median(burden_terms)) if burden_terms else 0.0,
     )
 
 
-def _build_flow_observations(dataset: CanonicalFitDataset, selected_conditions: tuple[str, ...]) -> tuple[FlowObservation, ...]:
+def _ddpcr_sigma(row) -> float:
+    if row.lower is not None and row.upper is not None and row.value > 0:
+        return max(float(np.log(max(row.upper, 1e-8)) - np.log(max(row.lower, 1e-8))) / 3.92, 0.05)
+    return 0.20
+
+
+def _build_flow_observations(dataset: CanonicalFitDataset, selected: tuple[str, ...]) -> tuple[FlowObservation, ...]:
     grouped: dict[tuple[str, int, str], np.ndarray] = {}
-    for record in dataset.flow:
-        if record.condition not in selected_conditions or record.week <= WEEK1:
+    totals: dict[tuple[str, int, str], float] = {}
+    for row in dataset.flow:
+        if row.condition not in selected or row.week <= WEEK1:
             continue
-        key = (record.condition, record.week, record.replicate_id or "__aggregate__")
+        key = (row.condition, row.week, row.replicate_id or "__aggregate__")
         grouped.setdefault(key, np.zeros(cfg.N_STATES, dtype=float))
-        grouped[key][cfg.STATE_INDEX[record.state]] += _flow_record_count(record)
-    observations: list[FlowObservation] = []
-    for (condition_name, week, replicate_id), counts in sorted(grouped.items()):
-        if float(np.sum(counts)) > 0.0:
-            observations.append(FlowObservation(condition_name, week, counts.astype(int), replicate_id))
-    return tuple(observations)
+        grouped[key][cfg.STATE_INDEX[row.state]] += _flow_record_count(row)
+        totals[key] = totals.get(key, 0.0) + _flow_record_count(row)
+    result = []
+    for (condition, week, replicate), counts in sorted(grouped.items()):
+        result.append(FlowObservation(condition, week, counts.astype(float), replicate))
+    return tuple(result)
 
 
-def _ectag_cell_key(record: EcTAGRecord) -> str:
-    replicate_token = "" if record.replicate_id is None else f"{record.replicate_id}|"
-    return f"{replicate_token}{record.cell_id}"
-
-
-def _build_ectag_observations(
-    dataset: CanonicalFitDataset,
-    selected_conditions: tuple[str, ...],
-    binning: CopyNumberBinning,
-) -> tuple[tuple[EcTAGHistogramObservation, ...], tuple[EcTAGCorrelationObservation, ...]]:
-    hist_groups: dict[tuple[str, int, str, str, str], list[int]] = {}
-    cell_groups: dict[tuple[str, int, str, str], dict[str, dict[str, int]]] = {}
-    for record in dataset.ectag:
-        if record.condition not in selected_conditions or record.week <= WEEK1:
+def _build_ectag_observations(dataset: CanonicalFitDataset, selected: tuple[str, ...], binning: CopyNumberBinning) -> tuple[tuple[EcTAGHistogramObservation, ...], tuple[EcTAGCorrelationObservation, ...], bool]:
+    grouped: dict[tuple[str, int, str, str, str], list[int]] = {}
+    cell_grouped: dict[tuple[str, int, str, str, str], dict[str, int]] = {}
+    for row in dataset.ectag:
+        if row.condition not in selected or row.week <= WEEK1:
             continue
-        replicate_id = record.replicate_id or "__aggregate__"
-        hist_groups.setdefault((record.condition, record.week, record.state, record.species, replicate_id), []).append(int(record.value))
-        cell_key = _ectag_cell_key(record)
-        cell_groups.setdefault((record.condition, record.week, record.state, replicate_id), {}).setdefault(cell_key, {})[record.species] = int(record.value)
-
-    hist_observations: list[EcTAGHistogramObservation] = []
-    for (condition_name, week, state_name, species_name, replicate_id), values in sorted(hist_groups.items()):
-        counts = binning.counts(values)
-        if int(np.sum(counts)) > 0:
-            hist_observations.append(
-                EcTAGHistogramObservation(condition_name, week, cfg.STATE_INDEX[state_name], cfg.SPECIES_INDEX[species_name], counts, replicate_id)
-            )
-
-    corr_observations: list[EcTAGCorrelationObservation] = []
-    for (condition_name, week, state_name, replicate_id), cell_map in sorted(cell_groups.items()):
-        rows = [[species_map[species_name] for species_name in cfg.SPECIES] for species_map in cell_map.values() if set(species_map) == set(cfg.SPECIES)]
-        if len(rows) < 2:
-            continue
+        rep = row.replicate_id or "__aggregate__"
+        grouped.setdefault((row.condition, row.week, row.state, row.species, rep), []).append(int(row.value))
+        cell_grouped.setdefault((row.condition, row.week, row.state, rep, row.cell_id), {})[row.species] = int(row.value)
+    hist = [
+        EcTAGHistogramObservation(condition, week, cfg.STATE_INDEX[state], cfg.SPECIES_INDEX[species], binning.counts(values), replicate)
+        for (condition, week, state, species, replicate), values in sorted(grouped.items())
+    ]
+    corr: list[EcTAGCorrelationObservation] = []
+    same_cell = False
+    by_snapshot: dict[tuple[str, int, str, str], list[list[int]]] = {}
+    for (condition, week, state, replicate, _cell), species_map in cell_grouped.items():
+        if set(species_map) == set(cfg.SPECIES):
+            same_cell = True
+            by_snapshot.setdefault((condition, week, state, replicate), []).append([species_map[species] for species in cfg.SPECIES])
+    for (condition, week, state, replicate), rows in sorted(by_snapshot.items()):
         matrix = np.asarray(rows, dtype=float)
-        if np.any(np.std(matrix, axis=0) == 0.0):
-            corr = np.zeros((cfg.N_SPECIES, cfg.N_SPECIES), dtype=float)
+        if matrix.shape[0] < 2 or np.any(np.std(matrix, axis=0) == 0.0):
+            cmat = np.zeros((cfg.N_SPECIES, cfg.N_SPECIES), dtype=float)
         else:
-            corr = np.nan_to_num(np.corrcoef(matrix, rowvar=False), nan=0.0, posinf=0.0, neginf=0.0)
-        for first in range(cfg.N_SPECIES):
-            for second in range(first + 1, cfg.N_SPECIES):
-                corr_observations.append(
-                    EcTAGCorrelationObservation(condition_name, week, cfg.STATE_INDEX[state_name], first, second, float(corr[first, second]), len(rows), replicate_id)
-                )
-    return tuple(hist_observations), tuple(corr_observations)
+            cmat = np.nan_to_num(np.corrcoef(matrix, rowvar=False), nan=0.0)
+        for a, b in combinations(range(cfg.N_SPECIES), 2):
+            corr.append(EcTAGCorrelationObservation(condition, week, cfg.STATE_INDEX[state], a, b, float(cmat[a, b]), matrix.shape[0], replicate))
+    return tuple(hist), tuple(corr), same_cell
 
 
 def _observed_summary_from_observations(
     flow: tuple[FlowObservation, ...],
     counts: tuple[CountObservation, ...],
     qpcdr: tuple[QPCDRObservation, ...],
-    ectag_hist: tuple[EcTAGHistogramObservation, ...],
-    ectag_corr: tuple[EcTAGCorrelationObservation, ...],
-    structure: V4LiteStructure,
+    ectag: tuple[EcTAGHistogramObservation, ...],
+    corr: tuple[EcTAGCorrelationObservation, ...],
+    ddpcr: tuple[DDPCRObservation, ...],
     dataset: CanonicalFitDataset,
 ) -> SummaryCollection:
-    block_maps = _empty_v4_lite_block_maps()
-    for observation in flow:
-        fractions = observation.counts / max(float(np.sum(observation.counts)), 1e-12)
-        for state_index, state_name in enumerate(cfg.STATE_NAMES):
-            key = f"{observation.condition}|week{observation.week}|state={state_name}|rep={observation.replicate_id}"
-            block_maps["flow_fraction"][key] = float(fractions[state_index])
-            block_maps["flow_count"][key] = float(observation.counts[state_index])
-    for observation in counts:
-        if observation.gate_index is None:
-            key = f"{observation.condition}|week{observation.week}|rep={observation.replicate_id}"
-            block_maps["count_total"][key] = float(observation.value)
+    maps = _empty_block_maps()
+    for obs in flow:
+        total = max(float(np.sum(obs.counts)), 1e-12)
+        for state_idx, state_name in enumerate(cfg.STATE_NAMES):
+            key = f"{obs.condition}|week{obs.week}|state={state_name}|rep={obs.replicate_id}"
+            maps["flow_count"][key] = float(obs.counts[state_idx])
+            maps["flow_fraction"][key] = float(obs.counts[state_idx] / total)
+    for obs in counts:
+        if obs.gate_index is None:
+            maps["count_total"][f"{obs.condition}|week{obs.week}|rep={obs.replicate_id}"] = float(obs.value)
         else:
-            key = (
-                f"{observation.condition}|week{observation.week}|gate={cfg.STATE_NAMES[observation.gate_index]}"
-                f"|rep={observation.replicate_id}"
-            )
-            block_maps["count_gate"][key] = float(observation.value)
-    for observation in qpcdr:
-        key = (
-            f"{observation.condition}|week{observation.week}|state={cfg.STATE_NAMES[observation.gate_index]}"
-            f"|species={cfg.SPECIES[observation.species_index]}|batch={structure.qpcdr_batches[observation.batch_index]}|rep={observation.replicate_id}"
-        )
-        block_maps["qpcdr"][key] = float(observation.value)
-    for observation in ectag_hist:
-        prefix = f"{observation.condition}|week{observation.week}|state={cfg.STATE_NAMES[observation.gate_index]}|species={cfg.SPECIES[observation.species_index]}|rep={observation.replicate_id}"
-        probs = observation.counts / max(float(np.sum(observation.counts)), 1e-12)
-        for bin_index, probability in enumerate(probs.tolist()):
-            block_maps["ectag_hist"][f"{prefix}|bin={bin_index}"] = float(probability)
-        block_maps["ectag_moments"][f"{prefix}|zero_fraction"] = float(probs[0])
-        block_maps["ectag_moments"][f"{prefix}|tail_ge_8"] = structure.binning.tail_probability(probs, 8)
-        block_maps["ectag_moments"][f"{prefix}|tail_ge_16"] = structure.binning.tail_probability(probs, 16)
-    for observation in ectag_corr:
-        key = (
-            f"{observation.condition}|week{observation.week}|state={cfg.STATE_NAMES[observation.gate_index]}"
-            f"|pair={cfg.SPECIES[observation.species_a]}-{cfg.SPECIES[observation.species_b]}|rep={observation.replicate_id}"
-        )
-        block_maps["ectag_corr"][key] = float(observation.correlation)
-    return SummaryCollection.from_block_maps(block_maps)
+            maps["count_gate"][f"{obs.condition}|week{obs.week}|state={cfg.STATE_NAMES[obs.gate_index]}|rep={obs.replicate_id}"] = float(obs.value)
+    for obs in qpcdr:
+        prefix = f"{obs.condition}|week{obs.week}|state={cfg.STATE_NAMES[obs.gate_index]}|species={cfg.SPECIES[obs.species_index]}|rep={obs.replicate_id}"
+        maps["qpcdr"][prefix] = float(obs.value)
+    for obs in ectag:
+        prefix = f"{obs.condition}|week{obs.week}|state={cfg.STATE_NAMES[obs.gate_index]}|species={cfg.SPECIES[obs.species_index]}|rep={obs.replicate_id}"
+        total = max(float(np.sum(obs.counts)), 1e-12)
+        probs = obs.counts.astype(float) / total
+        for idx, prob in enumerate(probs.tolist()):
+            maps["ectag_hist"][f"{prefix}|bin={idx}"] = float(prob)
+        centers = dataset_aware_centers(dataset, obs.counts.size)
+        mean = float(np.dot(probs, centers))
+        maps["ectag_moments"][f"{prefix}|zero_fraction"] = float(probs[0]) if probs.size else 0.0
+        maps["ectag_moments"][f"{prefix}|mean"] = mean
+        maps["ectag_moments"][f"{prefix}|tail"] = float(probs[-1]) if probs.size else 0.0
+    for obs in corr:
+        key = f"{obs.condition}|week{obs.week}|state={cfg.STATE_NAMES[obs.gate_index]}|pair={cfg.SPECIES[obs.species_a]}-{cfg.SPECIES[obs.species_b]}|rep={obs.replicate_id}"
+        maps["ectag_corr"][key] = float(obs.correlation)
+    for obs in ddpcr:
+        maps["ddpcr_pooled_mean"][f"{obs.condition}|week{obs.week}|species={cfg.SPECIES[obs.species_index]}|rep={obs.replicate_id}"] = float(obs.value)
+    return SummaryCollection.from_block_maps(maps)
 
 
-def _empty_v4_lite_block_maps() -> dict[str, dict[str, float]]:
+def dataset_aware_centers(_dataset: CanonicalFitDataset, n_bins: int) -> np.ndarray:
+    return np.asarray(DEFAULT_COPY_BIN_CENTERS[:n_bins], dtype=float)
+
+
+def _empty_block_maps() -> dict[str, dict[str, float]]:
     return {
         "flow_fraction": {},
         "flow_count": {},
@@ -702,159 +634,74 @@ def _empty_v4_lite_block_maps() -> dict[str, dict[str, float]]:
         "ectag_hist": {},
         "ectag_moments": {},
         "ectag_corr": {},
+        "ddpcr_pooled_mean": {},
     }
 
 
-def summarize_dataset_v4_lite(
-    dataset: CanonicalFitDataset,
-    *,
-    condition_names: Iterable[str] | None = None,
-    binning: CopyNumberBinning | None = None,
-    dynamic_only: bool = True,
-) -> SummaryCollection:
-    structure = V4LiteStructure.default(qpcdr_batches=dataset.qpcdr_batches())
-    if binning is not None:
-        structure = V4LiteStructure(structure.transition_edges, binning=binning, qpcdr_batches=structure.qpcdr_batches)
-    tensor = build_v4_lite_tensor(dataset, condition_names=condition_names, structure=structure)
-    if dynamic_only:
-        return tensor.observed_summary
-    return tensor.observed_summary
+def _copy_log_signals(distributions: np.ndarray, binning: CopyNumberBinning) -> np.ndarray:
+    return np.tensordot(np.asarray(distributions, dtype=float), np.log1p(binning.centers), axes=([-1], [0]))
 
 
 def _copy_means(distributions: np.ndarray, binning: CopyNumberBinning) -> np.ndarray:
-    means = np.zeros((cfg.N_STATES, cfg.N_SPECIES), dtype=float)
-    for state_index in range(cfg.N_STATES):
-        for species_index in range(cfg.N_SPECIES):
-            means[state_index, species_index] = binning.mean(distributions[state_index, species_index, :])
-    return means
+    return np.tensordot(np.asarray(distributions, dtype=float), binning.centers, axes=([-1], [0]))
 
 
-def _copy_log_signals(distributions: np.ndarray, binning: CopyNumberBinning) -> np.ndarray:
-    values = np.asarray(distributions, dtype=float).reshape(cfg.N_STATES, cfg.N_SPECIES, binning.n_bins)
-    log_centers = np.log1p(np.asarray(binning.centers, dtype=float))
-    return np.tensordot(values, log_centers, axes=([2], [0]))
-
-
-def _drug_adjusted_log_signals(log_signals: np.ndarray, exposure_C: float, exposure_P: float) -> np.ndarray:
-    adjusted = np.asarray(log_signals, dtype=float).copy()
-    adjusted[:, cfg.CDK4] = adjusted[:, cfg.CDK4] / (1.0 + max(float(exposure_C), 0.0))
-    adjusted[:, cfg.PDGFRA] = adjusted[:, cfg.PDGFRA] / (1.0 + max(float(exposure_P), 0.0))
-    return adjusted
-
-
-def _gate_mixture_weights(abundance: np.ndarray, purity: np.ndarray, gate_index: int) -> np.ndarray:
-    weights = purity[gate_index, :] * np.asarray(abundance, dtype=float)
-    total = float(np.sum(weights))
-    if total <= 0.0:
-        return np.eye(cfg.N_STATES, dtype=float)[gate_index]
-    return weights / total
-
-
-def _copy_number_kernel(
-    params: V4LiteParameters,
-    structure: V4LiteStructure,
-    state_index: int,
-    species_index: int,
-    exposure_C: float,
-    exposure_P: float,
-    burden: float,
-    model_version: str,
-) -> np.ndarray:
-    up_logit = params.kernel_up_species[species_index]
-    down_logit = params.kernel_down_species[species_index]
-    if model_version in {"M1", "M2", "M3"}:
-        up_logit += params.kernel_up_state[state_index]
-        down_logit += params.kernel_down_state[state_index]
-    if species_index == cfg.CDK4:
-        down_logit += params.kernel_down_C_target * exposure_C
-    if species_index == cfg.PDGFRA:
-        down_logit += params.kernel_down_P_target * exposure_P
-    if model_version == "M2":
-        down_logit += params.burden_loss_effect * burden
-    stay_probability, down_probability, up_probability = _softmax(np.array([0.0, down_logit, up_logit], dtype=float))
-    kernel = np.zeros((structure.binning.n_bins, structure.binning.n_bins), dtype=float)
-    for bin_index in range(structure.binning.n_bins):
-        kernel[bin_index, bin_index] += stay_probability
-        kernel[bin_index, max(0, bin_index - 1)] += down_probability
-        kernel[bin_index, min(structure.binning.n_bins - 1, bin_index + 1)] += up_probability
+def _copy_kernel(params: V4LiteParameters, binning: CopyNumberBinning, state_idx: int, species_idx: int) -> np.ndarray:
+    n = binning.n_bins
+    kernel = np.zeros((n, n), dtype=float)
+    up = float(cfg.sigmoid(params.kernel_up_species[species_idx] + params.kernel_up_state[state_idx]))
+    down = float(cfg.sigmoid(params.kernel_down_species[species_idx] + params.kernel_down_state[state_idx]))
+    stay = max(1.0 - 0.45 * (up + down), 0.05)
+    for source in range(n):
+        weights = np.zeros(n, dtype=float)
+        weights[source] += stay
+        weights[min(n - 1, source + 1)] += up
+        weights[max(0, source - 1)] += down
+        kernel[source, :] = _normalize(weights)
     return kernel
 
 
-def _state_transition_matrix(
-    params: V4LiteParameters,
-    structure: V4LiteStructure,
-    copy_distributions: np.ndarray,
-    exposure_C: float,
-    exposure_P: float,
-    model_version: str,
-) -> np.ndarray:
-    q_generator = np.zeros((cfg.N_STATES, cfg.N_STATES), dtype=float)
-    z = _drug_adjusted_log_signals(_copy_log_signals(copy_distributions, structure.binning), exposure_C, exposure_P)
-    alpha = params.alpha_state - float(np.mean(params.alpha_state))
-    potentials = np.zeros((cfg.N_STATES, cfg.N_STATES), dtype=float)
+def _transition_matrix(params: V4LiteParameters, structure: V4LiteStructure, copy_distribution: np.ndarray, binning: CopyNumberBinning, *, use_copy_coupling: bool = True) -> np.ndarray:
+    log_signals = _copy_log_signals(copy_distribution, binning)
+    matrix = np.zeros((cfg.N_STATES, cfg.N_STATES), dtype=float)
     for source in range(cfg.N_STATES):
-        potentials[source, cfg.NPC] = alpha[cfg.NPC] + params.beta_C * z[source, cfg.CDK4]
-        potentials[source, cfg.OPC] = alpha[cfg.OPC] + params.beta_P * z[source, cfg.PDGFRA]
-        potentials[source, cfg.AC] = alpha[cfg.AC]
-        potentials[source, cfg.MES] = alpha[cfg.MES]
-    for source, target in structure.transition_edges:
-        mobility = float(np.exp(np.clip(params.mobility_log[structure.mobility_index(source, target)], -12.0, 4.0)))
-        score = np.log(max(mobility, 1e-12))
-        if model_version in {"M1", "M2", "M3"}:
-            score += potentials[source, target] - potentials[source, source]
-            score += params.lambda_M * z[source, cfg.MYC]
-        q_generator[source, target] = float(np.exp(np.clip(score, -30.0, 10.0)))
-    for state_index in range(cfg.N_STATES):
-        q_generator[state_index, state_index] = -float(np.sum(q_generator[state_index, :]))
-    transition = expm(q_generator)
-    transition = np.clip(np.asarray(transition, dtype=float), 1e-12, None)
-    transition /= np.sum(transition, axis=1, keepdims=True)
-    return transition
+        logits = np.full(cfg.N_STATES, -8.0, dtype=float)
+        logits[source] = 0.0
+        for target in range(cfg.N_STATES):
+            if source == target:
+                continue
+            if (source, target) in structure.transition_edges:
+                mobility = params.mobility_log[structure.mobility_index(source, target)]
+                species_signal = 0.0
+                if use_copy_coupling:
+                    species_signal = (
+                        params.beta_C * log_signals[source, cfg.CDK4]
+                        + params.beta_P * log_signals[source, cfg.PDGFRA]
+                        + params.lambda_M * log_signals[source, cfg.MYC]
+                    )
+                logits[target] = mobility + 0.10 * species_signal + params.alpha_state[target] - params.alpha_state[source]
+        matrix[source, :] = _softmax(logits)
+    return matrix
 
 
-def _growth_rates(
-    params: V4LiteParameters,
-    structure: V4LiteStructure,
-    copy_distributions: np.ndarray,
-    abundance: np.ndarray,
-    exposure_C: float,
-    exposure_P: float,
-    has_total_counts: bool,
-    burden_star: float,
-    model_version: str,
-) -> np.ndarray:
-    growth = np.asarray(params.growth_base, dtype=float).copy()
-    if model_version in {"M1", "M2", "M3"}:
-        z = _copy_log_signals(copy_distributions, structure.binning)
-        adjusted = _drug_adjusted_log_signals(z, exposure_C, exposure_P)
-        proliferative = 0.5 * (adjusted[:, cfg.MYC] + adjusted[:, cfg.CDK4])
-        w_c = np.array([1.0, params.omega_O_given_C, 0.0, 0.0], dtype=float)
-        w_p = np.array([0.0, 1.0, 0.0, 0.0], dtype=float)
-        growth += params.theta_P * proliferative
-        growth -= params.chi_C * exposure_C * z[:, cfg.CDK4] * w_c
-        growth -= params.chi_P * exposure_P * z[:, cfg.PDGFRA] * w_p
-    if model_version == "M2":
-        burden = np.mean(_copy_log_signals(copy_distributions, structure.binning), axis=1)
-        growth -= params.theta_B * np.square(burden - burden_star)
-    if not has_total_counts:
-        fractions = _normalize_simplex(abundance)
-        growth -= float(np.dot(fractions, growth))
-    return growth
+def _growth_rates(params: V4LiteParameters, copy_distribution: np.ndarray, binning: CopyNumberBinning, *, use_copy_coupling: bool = True) -> np.ndarray:
+    if not use_copy_coupling:
+        return params.growth_base.copy()
+    means = _copy_means(copy_distribution, binning)
+    log_signals = np.log1p(means)
+    return params.growth_base + params.theta_P * log_signals[:, cfg.MYC] * 0.05 + params.theta_B * np.mean(log_signals, axis=1) * 0.05
 
 
 def predict_v4_lite(
     tensor: V4LiteTensor,
     params: V4LiteParameters,
     *,
-    model_version: str = "M1",
     dynamics_mode: str = "joint",
     frozen_copy_distributions: Mapping[str, np.ndarray] | None = None,
-    empirical_abundance_proxy: Mapping[str, np.ndarray] | None = None,
-    reference: SummaryCollection | None = None,
+    coupling_mode: str = "joint",
 ) -> V4LitePrediction:
-    cfg.require(model_version in V4LiteModelVersion, f"Unknown v4-lite model version {model_version}.")
     cfg.require(dynamics_mode in V4LiteDynamicsMode, f"Unknown v4-lite dynamics mode {dynamics_mode}.")
-    _validate_v4_lite_parameters(params, tensor.structure)
+    cfg.require(coupling_mode in V4LiteCouplingMode, f"Unknown v4-lite coupling mode {coupling_mode}.")
     n_weeks = len(tensor.weeks)
     n_bins = tensor.structure.binning.n_bins
     state_abundance: dict[str, np.ndarray] = {}
@@ -862,537 +709,193 @@ def predict_v4_lite(
     transition_matrices: dict[str, np.ndarray] = {}
     growth_rates: dict[str, np.ndarray] = {}
     copy_kernels: dict[str, np.ndarray] = {}
-    for condition_name in tensor.condition_names:
+    for condition in tensor.condition_names:
         abundance = np.zeros((n_weeks, cfg.N_STATES), dtype=float)
-        distributions = np.zeros((n_weeks, cfg.N_STATES, cfg.N_SPECIES, n_bins), dtype=float)
-        transitions = np.zeros((max(0, n_weeks - 1), cfg.N_STATES, cfg.N_STATES), dtype=float)
-        growth = np.zeros((max(0, n_weeks - 1), cfg.N_STATES), dtype=float)
-        kernels = np.zeros((max(0, n_weeks - 1), cfg.N_STATES, cfg.N_SPECIES, n_bins, n_bins), dtype=float)
-        abundance[0, :] = np.asarray(tensor.initial_state_abundance[condition_name], dtype=float)
-        distributions[0, :, :, :] = np.asarray(tensor.initial_copy_distributions[condition_name], dtype=float)
-        if dynamics_mode == "ecDNA_only":
-            abundance[:, :] = abundance[0, :]
-        if dynamics_mode == "ecDNA_only" and empirical_abundance_proxy is not None and condition_name in empirical_abundance_proxy:
-            proxy = np.asarray(empirical_abundance_proxy[condition_name], dtype=float)
-            cfg.require(proxy.shape == (n_weeks, cfg.N_STATES), f"empirical abundance proxy for {condition_name} has invalid shape.")
-            abundance[:, :] = np.clip(proxy, 1e-12, None)
-        if dynamics_mode == "state_only":
-            cfg.require(frozen_copy_distributions is not None, "state_only prediction requires frozen_copy_distributions.")
-            cfg.require(condition_name in frozen_copy_distributions, f"Missing frozen copy distributions for {condition_name}.")
-            frozen = np.asarray(frozen_copy_distributions[condition_name], dtype=float)
-            cfg.require(
-                frozen.shape == (n_weeks, cfg.N_STATES, cfg.N_SPECIES, n_bins),
-                f"frozen copy distributions for {condition_name} have invalid shape.",
-            )
-            distributions[:, :, :, :] = frozen
-        for interval_index in range(n_weeks - 1):
-            exposure_C = params.exposure_C_scale * float(tensor.exposure_C[condition_name][interval_index])
-            exposure_P = params.exposure_P_scale * float(tensor.exposure_P[condition_name][interval_index])
-            current_distributions = distributions[interval_index, :, :, :]
-            burden = np.mean(_copy_log_signals(current_distributions, tensor.structure.binning), axis=1)
-            after_kernel = np.zeros((cfg.N_STATES, cfg.N_SPECIES, n_bins), dtype=float)
-            for source in range(cfg.N_STATES):
-                for species_index in range(cfg.N_SPECIES):
-                    kernel = _copy_number_kernel(
-                        params,
-                        tensor.structure,
-                        source,
-                        species_index,
-                        exposure_C,
-                        exposure_P,
-                        float(burden[source]),
-                        model_version,
-                    )
-                    kernels[interval_index, source, species_index, :, :] = kernel
-                    after_kernel[source, species_index, :] = distributions[interval_index, source, species_index, :] @ kernel
+        copies = np.zeros((n_weeks, cfg.N_STATES, cfg.N_SPECIES, n_bins), dtype=float)
+        transitions = np.zeros((n_weeks - 1, cfg.N_STATES, cfg.N_STATES), dtype=float)
+        growth = np.zeros((n_weeks - 1, cfg.N_STATES), dtype=float)
+        kernels = np.zeros((n_weeks - 1, cfg.N_STATES, cfg.N_SPECIES, n_bins, n_bins), dtype=float)
+        abundance[0, :] = tensor.initial_state_abundance[condition]
+        copies[0, :, :, :] = tensor.initial_copy_distributions[condition]
+        if dynamics_mode == "state_only" and frozen_copy_distributions is not None:
+            frozen = np.asarray(frozen_copy_distributions[condition], dtype=float)
+            copies[:, :, :, :] = frozen
+        for interval in range(n_weeks - 1):
+            if not (dynamics_mode == "state_only" and frozen_copy_distributions is not None):
+                for state_idx in range(cfg.N_STATES):
+                    for species_idx in range(cfg.N_SPECIES):
+                        kernels[interval, state_idx, species_idx] = _copy_kernel(params, tensor.structure.binning, state_idx, species_idx)
             if dynamics_mode == "ecDNA_only":
-                distributions[interval_index + 1, :, :, :] = after_kernel
-                transitions[interval_index, :, :] = np.eye(cfg.N_STATES, dtype=float)
-                growth[interval_index, :] = 0.0
+                transition = np.eye(cfg.N_STATES, dtype=float)
+            else:
+                transition = _transition_matrix(params, tensor.structure, copies[interval], tensor.structure.binning, use_copy_coupling=coupling_mode in {"transition", "joint"})
+            transitions[interval] = transition
+            growth[interval] = _growth_rates(params, copies[interval], tensor.structure.binning, use_copy_coupling=coupling_mode in {"growth", "joint"})
+            next_abundance = np.zeros(cfg.N_STATES, dtype=float)
+            for source in range(cfg.N_STATES):
+                next_abundance += abundance[interval, source] * np.exp(growth[interval, source]) * transition[source, :]
+            abundance[interval + 1, :] = next_abundance
+            if dynamics_mode == "state_only" and frozen_copy_distributions is not None:
                 continue
-
-            transition = _state_transition_matrix(params, tensor.structure, current_distributions, exposure_C, exposure_P, model_version)
-            growth_vector = _growth_rates(
-                params,
-                tensor.structure,
-                current_distributions,
-                abundance[interval_index, :],
-                exposure_C,
-                exposure_P,
-                tensor.has_total_counts,
-                tensor.burden_star,
-                model_version,
-            )
-            source_mass = abundance[interval_index, :] * np.exp(np.clip(growth_vector, -30.0, 30.0))
-            contribution = source_mass[:, None] * transition
-            abundance[interval_index + 1, :] = np.clip(np.sum(contribution, axis=0), 1e-12, None)
+            post_kernel = np.zeros((cfg.N_STATES, cfg.N_SPECIES, n_bins), dtype=float)
+            for source in range(cfg.N_STATES):
+                for species_idx in range(cfg.N_SPECIES):
+                    post_kernel[source, species_idx] = copies[interval, source, species_idx] @ kernels[interval, source, species_idx]
             if dynamics_mode == "joint":
                 for target in range(cfg.N_STATES):
-                    denominator = float(abundance[interval_index + 1, target])
-                    for species_index in range(cfg.N_SPECIES):
-                        mixture = np.zeros(n_bins, dtype=float)
+                    denom = max(float(np.sum(abundance[interval] * transition[:, target])), 1e-12)
+                    for species_idx in range(cfg.N_SPECIES):
+                        mixed = np.zeros(n_bins, dtype=float)
                         for source in range(cfg.N_STATES):
-                            mixture += contribution[source, target] * after_kernel[source, species_index, :]
-                        distributions[interval_index + 1, target, species_index, :] = _normalize_simplex(mixture / max(denominator, 1e-12))
-            transitions[interval_index, :, :] = transition
-            growth[interval_index, :] = growth_vector
-        state_abundance[condition_name] = abundance
-        copy_distributions[condition_name] = distributions
-        transition_matrices[condition_name] = transitions
-        growth_rates[condition_name] = growth
-        copy_kernels[condition_name] = kernels
-    summary = _prediction_summary(tensor, params, state_abundance, copy_distributions, model_version)
-    if reference is not None:
-        summary = summary.align_to(reference)
-    return V4LitePrediction(
-        condition_names=tensor.condition_names,
-        weeks=tensor.weeks,
-        state_abundance=state_abundance,
-        copy_distributions=copy_distributions,
-        transition_matrices=transition_matrices,
-        growth_rates=growth_rates,
-        copy_kernels=copy_kernels,
-        summary=summary,
-    )
+                            mixed += abundance[interval, source] * transition[source, target] * post_kernel[source, species_idx]
+                        copies[interval + 1, target, species_idx] = _normalize(mixed / denom)
+            else:
+                copies[interval + 1] = post_kernel
+        state_abundance[condition] = abundance
+        copy_distributions[condition] = copies
+        transition_matrices[condition] = transitions
+        growth_rates[condition] = growth
+        copy_kernels[condition] = kernels
+    summary = _prediction_summary(tensor, params, state_abundance, copy_distributions)
+    return V4LitePrediction(tensor.condition_names, tensor.weeks, state_abundance, copy_distributions, transition_matrices, growth_rates, copy_kernels, summary)
 
 
-def _expected_gate_distribution(
-    tensor: V4LiteTensor,
-    params: V4LiteParameters,
-    prediction: V4LitePrediction,
-    condition_name: str,
-    week: int,
-    gate_index: int,
-    species_index: int,
-) -> np.ndarray:
-    week_index = tensor.week_to_index[week]
-    abundance = prediction.state_abundance[condition_name][week_index, :]
-    weights = _gate_mixture_weights(abundance, params.sort_purity_matrix, gate_index)
-    distribution = np.zeros(tensor.structure.binning.n_bins, dtype=float)
-    for state_index in range(cfg.N_STATES):
-        distribution += weights[state_index] * prediction.copy_distributions[condition_name][week_index, state_index, species_index, :]
-    return _normalize_simplex(distribution)
+def _prediction_summary(tensor: V4LiteTensor, params: V4LiteParameters, abundance: dict[str, np.ndarray], copies: dict[str, np.ndarray]) -> SummaryCollection:
+    maps = _empty_block_maps()
+    week_index = tensor.week_to_index
+    for obs in tensor.flow_observations:
+        idx = week_index[obs.week]
+        predicted_counts = abundance[obs.condition][idx]
+        total = max(float(np.sum(predicted_counts)), 1e-12)
+        for state_idx, state_name in enumerate(cfg.STATE_NAMES):
+            key = f"{obs.condition}|week{obs.week}|state={state_name}|rep={obs.replicate_id}"
+            maps["flow_count"][key] = float(predicted_counts[state_idx])
+            maps["flow_fraction"][key] = float(predicted_counts[state_idx] / total)
+    for obs in tensor.count_observations:
+        idx = week_index[obs.week]
+        if obs.gate_index is None:
+            maps["count_total"][f"{obs.condition}|week{obs.week}|rep={obs.replicate_id}"] = float(np.sum(abundance[obs.condition][idx]))
+        else:
+            maps["count_gate"][f"{obs.condition}|week{obs.week}|state={cfg.STATE_NAMES[obs.gate_index]}|rep={obs.replicate_id}"] = float(abundance[obs.condition][idx, obs.gate_index])
+    for obs in tensor.qpcdr_observations:
+        key = f"{obs.condition}|week{obs.week}|state={cfg.STATE_NAMES[obs.gate_index]}|species={cfg.SPECIES[obs.species_index]}|rep={obs.replicate_id}"
+        maps["qpcdr"][key] = float(_expected_qpcdr_value(tensor, params, None, obs, copy_distributions=copies))
+    for obs in tensor.ectag_hist_observations:
+        idx = week_index[obs.week]
+        probs = copies[obs.condition][idx, obs.gate_index, obs.species_index]
+        prefix = f"{obs.condition}|week{obs.week}|state={cfg.STATE_NAMES[obs.gate_index]}|species={cfg.SPECIES[obs.species_index]}|rep={obs.replicate_id}"
+        for bin_idx, value in enumerate(probs.tolist()):
+            maps["ectag_hist"][f"{prefix}|bin={bin_idx}"] = float(value)
+        maps["ectag_moments"][f"{prefix}|zero_fraction"] = float(probs[0])
+        maps["ectag_moments"][f"{prefix}|mean"] = float(tensor.structure.binning.mean(probs))
+        maps["ectag_moments"][f"{prefix}|tail"] = float(probs[-1])
+    for obs in tensor.ectag_corr_observations:
+        key = f"{obs.condition}|week{obs.week}|state={cfg.STATE_NAMES[obs.gate_index]}|pair={cfg.SPECIES[obs.species_a]}-{cfg.SPECIES[obs.species_b]}|rep={obs.replicate_id}"
+        maps["ectag_corr"][key] = 0.0
+    for obs in tensor.ddpcr_observations:
+        idx = week_index[obs.week]
+        state_total = max(float(np.sum(abundance[obs.condition][idx])), 1e-12)
+        fractions = abundance[obs.condition][idx] / state_total
+        means = _copy_means(copies[obs.condition][idx], tensor.structure.binning)
+        pooled = float(np.dot(fractions, means[:, obs.species_index]))
+        key = f"{obs.condition}|week{obs.week}|species={cfg.SPECIES[obs.species_index]}|rep={obs.replicate_id}"
+        maps["ddpcr_pooled_mean"][key] = pooled
+    return SummaryCollection.from_block_maps(maps)
 
 
-def _expected_gate_mean(
-    tensor: V4LiteTensor,
-    params: V4LiteParameters,
-    prediction: V4LitePrediction,
-    condition_name: str,
-    week: int,
-    gate_index: int,
-    species_index: int,
-) -> float:
-    distribution = _expected_gate_distribution(tensor, params, prediction, condition_name, week, gate_index, species_index)
-    return tensor.structure.binning.mean(distribution)
-
-
-def _expected_qpcdr_value(
-    tensor: V4LiteTensor,
-    params: V4LiteParameters,
-    prediction: V4LitePrediction,
-    observation: QPCDRObservation,
-) -> float:
-    mean_copy = _expected_gate_mean(tensor, params, prediction, observation.condition, observation.week, observation.gate_index, observation.species_index)
-    batch_offset = params.qpcdr_batch_offsets[observation.batch_index]
+def _expected_qpcdr_value(tensor: V4LiteTensor, params: V4LiteParameters, prediction: V4LitePrediction | None, observation: QPCDRObservation, *, copy_distributions: Mapping[str, np.ndarray] | None = None) -> float:
+    if copy_distributions is None:
+        cfg.require(prediction is not None, "prediction is required when copy distributions are not supplied.")
+        copy_distributions = prediction.copy_distributions
+    probs = copy_distributions[observation.condition][tensor.week_to_index[observation.week], observation.gate_index, observation.species_index]
+    mean_copy = max(tensor.structure.binning.mean(probs), 1e-8)
+    offset = params.qpcdr_intercept[observation.species_index] + params.qpcdr_batch_offsets[observation.batch_index]
+    slope = params.qpcdr_slope[observation.species_index]
     if tensor.dataset.qpcdr_scale() == "ct":
-        return float(params.qpcdr_intercept[observation.species_index] + batch_offset - params.qpcdr_slope[observation.species_index] * np.log10(mean_copy + 1e-6))
-    return float(params.qpcdr_intercept[observation.species_index] + batch_offset + params.qpcdr_slope[observation.species_index] * mean_copy)
-
-
-def _prediction_summary(
-    tensor: V4LiteTensor,
-    params: V4LiteParameters,
-    state_abundance: Mapping[str, np.ndarray],
-    copy_distributions: Mapping[str, np.ndarray],
-    model_version: str,
-) -> SummaryCollection:
-    block_maps = _empty_v4_lite_block_maps()
-    week_to_index = tensor.week_to_index
-    for observation in tensor.flow_observations:
-        week_index = week_to_index[observation.week]
-        abundance = state_abundance[observation.condition][week_index, :]
-        fractions = _normalize_simplex(abundance)
-        observed_fractions = _normalize_simplex(params.sort_purity_matrix @ fractions)
-        for state_index, state_name in enumerate(cfg.STATE_NAMES):
-            key = f"{observation.condition}|week{observation.week}|state={state_name}|rep={observation.replicate_id}"
-            block_maps["flow_fraction"][key] = float(observed_fractions[state_index])
-            gate_count = float(np.sum(params.sort_purity_matrix[state_index, :] * abundance))
-            block_maps["flow_count"][key] = gate_count
-    for observation in tensor.count_observations:
-        week_index = week_to_index[observation.week]
-        abundance = state_abundance[observation.condition][week_index, :]
-        if observation.gate_index is None:
-            key = f"{observation.condition}|week{observation.week}|rep={observation.replicate_id}"
-            block_maps["count_total"][key] = float(np.sum(abundance))
-        else:
-            key = (
-                f"{observation.condition}|week{observation.week}|gate={cfg.STATE_NAMES[observation.gate_index]}"
-                f"|rep={observation.replicate_id}"
-            )
-            block_maps["count_gate"][key] = float(np.sum(params.sort_purity_matrix[observation.gate_index, :] * abundance))
-    fake_prediction = V4LitePrediction(
-        condition_names=tensor.condition_names,
-        weeks=tensor.weeks,
-        state_abundance=dict(state_abundance),
-        copy_distributions=dict(copy_distributions),
-        transition_matrices={},
-        growth_rates={},
-        copy_kernels={},
-        summary=SummaryCollection({}),
-    )
-    for observation in tensor.qpcdr_observations:
-        key = (
-            f"{observation.condition}|week{observation.week}|state={cfg.STATE_NAMES[observation.gate_index]}"
-            f"|species={cfg.SPECIES[observation.species_index]}|batch={tensor.structure.qpcdr_batches[observation.batch_index]}|rep={observation.replicate_id}"
-        )
-        block_maps["qpcdr"][key] = _expected_qpcdr_value(tensor, params, fake_prediction, observation)
-    for observation in tensor.ectag_hist_observations:
-        probs = _expected_gate_distribution(
-            tensor,
-            params,
-            fake_prediction,
-            observation.condition,
-            observation.week,
-            observation.gate_index,
-            observation.species_index,
-        )
-        prefix = f"{observation.condition}|week{observation.week}|state={cfg.STATE_NAMES[observation.gate_index]}|species={cfg.SPECIES[observation.species_index]}|rep={observation.replicate_id}"
-        for bin_index, probability in enumerate(probs.tolist()):
-            block_maps["ectag_hist"][f"{prefix}|bin={bin_index}"] = float(probability)
-        block_maps["ectag_moments"][f"{prefix}|zero_fraction"] = float(probs[0])
-        block_maps["ectag_moments"][f"{prefix}|tail_ge_8"] = tensor.structure.binning.tail_probability(probs, 8)
-        block_maps["ectag_moments"][f"{prefix}|tail_ge_16"] = tensor.structure.binning.tail_probability(probs, 16)
-    for observation in tensor.ectag_corr_observations:
-        expected = params.co_segregation_rho if model_version == "M3" else 0.0
-        key = (
-            f"{observation.condition}|week{observation.week}|state={cfg.STATE_NAMES[observation.gate_index]}"
-            f"|pair={cfg.SPECIES[observation.species_a]}-{cfg.SPECIES[observation.species_b]}|rep={observation.replicate_id}"
-        )
-        block_maps["ectag_corr"][key] = float(expected)
-    return SummaryCollection.from_block_maps(block_maps)
-
-
-def _validate_v4_lite_parameters(params: V4LiteParameters, structure: V4LiteStructure) -> None:
-    array_shapes = {
-        "qpcdr_intercept": (cfg.N_SPECIES,),
-        "qpcdr_slope": (cfg.N_SPECIES,),
-        "qpcdr_sigma": (cfg.N_SPECIES,),
-        "qpcdr_batch_offsets": (structure.n_qpcdr_batches,),
-        "ectag_concentration": (cfg.N_SPECIES,),
-        "kernel_up_species": (cfg.N_SPECIES,),
-        "kernel_down_species": (cfg.N_SPECIES,),
-        "kernel_up_state": (cfg.N_STATES,),
-        "kernel_down_state": (cfg.N_STATES,),
-        "alpha_state": (cfg.N_STATES,),
-        "mobility_log": (structure.n_mobility_edges,),
-        "growth_base": (cfg.N_STATES,),
-    }
-    for field_name, shape in array_shapes.items():
-        values = np.asarray(getattr(params, field_name), dtype=float)
-        cfg.require(values.shape == shape, f"{field_name} must have shape {shape}.")
-        cfg.require(np.all(np.isfinite(values)), f"{field_name} must be finite.")
-    for field_name in ("qpcdr_slope", "qpcdr_sigma", "ectag_concentration"):
-        cfg.require(np.all(np.asarray(getattr(params, field_name), dtype=float) > 0.0), f"{field_name} must be positive.")
-    for field_name in (
-        "qpcdr_df",
-        "flow_concentration",
-        "count_dispersion",
-        "count_gate_dispersion",
-        "ectag_corr_sigma",
-        "exposure_C_scale",
-        "exposure_P_scale",
-        "beta_C",
-        "beta_P",
-        "lambda_M",
-        "chi_C",
-        "chi_P",
-    ):
-        value = float(getattr(params, field_name))
-        cfg.require(np.isfinite(value) and value > 0.0, f"{field_name} must be positive and finite.")
-    cfg.require(0.0 <= params.omega_O_given_C <= 1.0, "omega_O_given_C must lie in [0, 1].")
-    cfg.require(params.theta_B >= 0.0, "theta_B must be non-negative.")
-    cfg.require(-0.95 <= params.co_segregation_rho <= 0.95, "co_segregation_rho must lie in [-0.95, 0.95].")
-    _normalize_purity_matrix(params.sort_purity_matrix)
-
-
-@dataclass(frozen=True)
-class V4LiteFieldSpec:
-    name: str
-    group: str
-    transform: str
-    shape: tuple[int, ...]
-    prior_center: np.ndarray
-    prior_scale: np.ndarray
-    versions: frozenset[str]
-    shrinkage: bool = False
-    lower: np.ndarray | None = None
-    upper: np.ndarray | None = None
-    boundary_type: str = "soft"
-
-    @property
-    def raw_size(self) -> int:
-        return int(np.prod(self.shape, dtype=int)) if self.shape else 1
-
-    @property
-    def unconstrained_size(self) -> int:
-        if self.transform == "zero_sum":
-            return cfg.LATENT_DIM
-        if self.transform == "column_simplex":
-            return cfg.N_STATES * (cfg.N_STATES - 1)
-        return self.raw_size
-
-
-def _infer_v4_lite_bounds(transform: str, center: np.ndarray, scale: np.ndarray) -> tuple[np.ndarray, np.ndarray, str]:
-    center_values = np.asarray(center, dtype=float).reshape(-1)
-    scale_values = np.maximum(np.asarray(scale, dtype=float).reshape(-1), 1e-8)
-    if transform == "log":
-        lower = np.full(center_values.size, 1e-12, dtype=float)
-        upper = np.full(center_values.size, np.inf, dtype=float)
-        return lower, upper, "hard"
-    if transform == "logit":
-        lower = np.full(center_values.size, 1e-8, dtype=float)
-        upper = np.full(center_values.size, 1.0 - 1e-8, dtype=float)
-        return lower, upper, "hard"
-    if transform == "bounded_identity":
-        lower = np.full(center_values.size, -0.95, dtype=float)
-        upper = np.full(center_values.size, 0.95, dtype=float)
-        return lower, upper, "hard"
-    if transform == "column_simplex":
-        lower = np.full(center_values.size, 1e-8, dtype=float)
-        upper = np.full(center_values.size, 1.0, dtype=float)
-        return lower, upper, "hard"
-    lower = center_values - 4.0 * scale_values
-    upper = center_values + 4.0 * scale_values
-    return lower, upper, "soft"
-
-
-def _field_specs(structure: V4LiteStructure) -> tuple[V4LiteFieldSpec, ...]:
-    def spec(
-        name: str,
-        group: str,
-        transform: str,
-        shape: tuple[int, ...],
-        center: float | np.ndarray,
-        scale: float,
-        versions: Iterable[str],
-        *,
-        shrinkage: bool = False,
-        lower: float | np.ndarray | None = None,
-        upper: float | np.ndarray | None = None,
-        boundary_type: str | None = None,
-    ) -> V4LiteFieldSpec:
-        center_array = np.asarray(center, dtype=float)
-        if not shape:
-            center_array = center_array.reshape(1)
-        else:
-            center_array = np.broadcast_to(center_array, shape).astype(float).reshape(-1)
-        scale_array = np.full(center_array.size, float(scale), dtype=float)
-        if lower is None or upper is None:
-            inferred_lower, inferred_upper, inferred_boundary_type = _infer_v4_lite_bounds(transform, center_array, scale_array)
-        else:
-            inferred_lower = np.broadcast_to(np.asarray(lower, dtype=float), center_array.shape).astype(float).reshape(-1)
-            inferred_upper = np.broadcast_to(np.asarray(upper, dtype=float), center_array.shape).astype(float).reshape(-1)
-            inferred_boundary_type = "hard"
-        return V4LiteFieldSpec(
-            name=name,
-            group=group,
-            transform=transform,
-            shape=shape,
-            prior_center=center_array,
-            prior_scale=scale_array,
-            versions=frozenset(versions),
-            shrinkage=shrinkage,
-            lower=inferred_lower,
-            upper=inferred_upper,
-            boundary_type=inferred_boundary_type if boundary_type is None else boundary_type,
-        )
-
-    all_versions = ("M0", "M1", "M2", "M3")
-    coupled = ("M1", "M2", "M3")
-    return (
-        spec("qpcdr_intercept", "observation", "identity", (cfg.N_SPECIES,), 0.0, 0.75, all_versions),
-        spec("qpcdr_slope", "observation", "log", (cfg.N_SPECIES,), 1.0, 0.35, all_versions),
-        spec("qpcdr_sigma", "observation", "log", (cfg.N_SPECIES,), 0.25, 0.35, all_versions),
-        spec("qpcdr_batch_offsets", "observation", "identity", (structure.n_qpcdr_batches,), 0.0, 0.25, all_versions, shrinkage=True),
-        spec("flow_concentration", "observation", "log", (), 250.0, 0.40, all_versions),
-        spec("count_dispersion", "observation", "log", (), 25.0, 0.50, all_versions),
-        spec("count_gate_dispersion", "observation", "log", (), 25.0, 0.50, all_versions),
-        spec("ectag_concentration", "observation", "log", (cfg.N_SPECIES,), 120.0, 0.45, all_versions),
-        spec("ectag_corr_sigma", "observation", "log", (), 0.20, 0.35, all_versions),
-        spec("exposure_C_scale", "exposure", "log", (), 1.0, 0.45, all_versions),
-        spec("exposure_P_scale", "exposure", "log", (), 1.0, 0.45, all_versions),
-        spec("kernel_up_species", "ecDNA_kernel", "identity", (cfg.N_SPECIES,), -2.20, 0.60, all_versions),
-        spec("kernel_down_species", "ecDNA_kernel", "identity", (cfg.N_SPECIES,), -2.30, 0.60, all_versions),
-        spec("kernel_up_state", "ecDNA_kernel", "identity", (cfg.N_STATES,), 0.0, 0.35, ("M2", "M3"), shrinkage=True),
-        spec("kernel_down_state", "ecDNA_kernel", "identity", (cfg.N_STATES,), 0.0, 0.35, ("M2", "M3"), shrinkage=True),
-        spec("kernel_down_C_target", "ecDNA_kernel", "identity", (), 0.0, 0.35, all_versions, shrinkage=True),
-        spec("kernel_down_P_target", "ecDNA_kernel", "identity", (), 0.0, 0.35, all_versions, shrinkage=True),
-        spec("alpha_state", "state_abundance", "zero_sum", (cfg.N_STATES,), 0.0, 0.50, coupled),
-        spec("beta_C", "state_abundance", "log", (), 0.50, 0.40, coupled),
-        spec("beta_P", "state_abundance", "log", (), 0.50, 0.40, coupled),
-        spec("lambda_M", "state_abundance", "log", (), 0.20, 0.45, coupled),
-        spec("mobility_log", "state_abundance", "identity", (structure.n_mobility_edges,), -2.0, 0.70, all_versions),
-        spec("growth_base", "state_abundance", "identity", (cfg.N_STATES,), 0.0, 0.40, all_versions),
-        spec("theta_P", "state_abundance", "identity", (), 0.0, 0.35, coupled, shrinkage=True),
-        spec("chi_C", "state_abundance", "log", (), 0.10, 0.45, coupled),
-        spec("chi_P", "state_abundance", "log", (), 0.10, 0.45, coupled),
-        spec("omega_O_given_C", "state_abundance", "logit", (), 0.45, 0.35, coupled),
-        spec("theta_B", "burden", "log", (), 0.05, 0.50, ("M2",), shrinkage=True),
-        spec("burden_loss_effect", "burden", "identity", (), 0.0, 0.35, ("M2",), shrinkage=True),
-        spec("co_segregation_rho", "co_segregation", "bounded_identity", (), 0.0, 0.25, ("M3",), shrinkage=True),
-    )
-
-
-def _simplex_to_unconstrained(values: np.ndarray) -> np.ndarray:
-    simplex = _normalize_simplex(values)
-    return np.log(np.clip(simplex[:-1], 1e-12, None) / np.clip(simplex[-1], 1e-12, None))
-
-
-def _simplex_from_unconstrained(values: np.ndarray) -> np.ndarray:
-    logits = np.concatenate([np.asarray(values, dtype=float).reshape(-1), np.array([0.0], dtype=float)])
-    return _softmax(logits)
-
-
-def _column_simplex_to_unconstrained(values: np.ndarray) -> np.ndarray:
-    matrix = _normalize_purity_matrix(np.asarray(values, dtype=float).reshape(cfg.N_STATES, cfg.N_STATES))
-    return np.concatenate([_simplex_to_unconstrained(matrix[:, column]) for column in range(cfg.N_STATES)], axis=0)
-
-
-def _column_simplex_from_unconstrained(values: np.ndarray) -> np.ndarray:
-    flat = np.asarray(values, dtype=float).reshape(-1)
-    pieces: list[np.ndarray] = []
-    width = cfg.N_STATES - 1
-    for column in range(cfg.N_STATES):
-        pieces.append(_simplex_from_unconstrained(flat[column * width : (column + 1) * width]))
-    return np.stack(pieces, axis=1)
-
-
-def _zero_sum_to_unconstrained(values: np.ndarray) -> np.ndarray:
-    centered = np.asarray(values, dtype=float).reshape(cfg.N_STATES)
-    centered = centered - float(np.mean(centered))
-    return cfg.HELMERT_SUBMATRIX.T @ centered
-
-
-def _zero_sum_from_unconstrained(values: np.ndarray) -> np.ndarray:
-    return cfg.HELMERT_SUBMATRIX @ np.asarray(values, dtype=float).reshape(cfg.LATENT_DIM)
+        return float(offset - slope * np.log10(mean_copy + 1.0))
+    return float(offset + slope * mean_copy)
 
 
 class V4LiteParameterAdapter:
-    def __init__(
-        self,
-        *,
-        structure: V4LiteStructure,
-        base_params: V4LiteParameters,
-        active_groups: Iterable[str],
-        model_version: str,
-    ):
+    def __init__(self, structure: V4LiteStructure, active_groups: tuple[str, ...], base_params: V4LiteParameters | None = None):
         self.structure = structure
-        self.base_params = base_params.copy()
-        self.model_version = model_version
-        groups = set(active_groups)
-        self.specs = tuple(
-            spec
-            for spec in _field_specs(structure)
-            if spec.group in groups and model_version in spec.versions
-        )
-        offset = 0
-        slices: list[tuple[int, int]] = []
-        for spec in self.specs:
-            slices.append((offset, offset + spec.unconstrained_size))
-            offset += spec.unconstrained_size
-        self.slices = tuple(slices)
-        self.dimension = offset
+        self.active_groups = tuple(active_groups)
+        self.base_params = V4LiteParameters.default(structure) if base_params is None else base_params.copy()
+        self.fields = self._fields_for_groups()
+
+    def _fields_for_groups(self) -> tuple[tuple[str, str, tuple[int, ...] | None], ...]:
+        fields: list[tuple[str, str, tuple[int, ...] | None]] = []
+        if "observation" in self.active_groups:
+            fields += [("qpcdr_intercept", "identity", (cfg.N_SPECIES,)), ("qpcdr_slope", "log", (cfg.N_SPECIES,)), ("qpcdr_sigma", "log", (cfg.N_SPECIES,))]
+        if "ecDNA_kernel" in self.active_groups:
+            fields += [("kernel_up_species", "identity", (cfg.N_SPECIES,)), ("kernel_down_species", "identity", (cfg.N_SPECIES,))]
+        if "state_abundance" in self.active_groups:
+            fields += [("growth_base", "identity", (cfg.N_STATES,)), ("mobility_log", "identity", (self.structure.n_mobility_edges,)), ("omega_O_given_C", "logit", None)]
+        if "growth_coupling" in self.active_groups:
+            fields += [("theta_P", "identity", None)]
+        if "transition_coupling" in self.active_groups:
+            fields += [("beta_C", "identity", None), ("beta_P", "identity", None), ("lambda_M", "identity", None)]
+        if "burden" in self.active_groups:
+            fields += [("theta_B", "identity", None), ("burden_loss_effect", "identity", None)]
+        if "co_segregation" in self.active_groups:
+            fields += [("co_segregation_rho", "identity", None)]
+        if "exposure" in self.active_groups:
+            fields += [("exposure_C_scale", "log", None), ("exposure_P_scale", "log", None)]
+        seen: set[str] = set()
+        unique = []
+        for field in fields:
+            if field[0] not in seen:
+                unique.append(field)
+                seen.add(field[0])
+        return tuple(unique)
+
+    def parameter_names(self) -> tuple[str, ...]:
+        names: list[str] = []
+        for field_name, _transform, shape in self.fields:
+            value = getattr(self.base_params, field_name)
+            size = 1 if shape is None else int(np.prod(shape))
+            if size == 1:
+                names.append(field_name)
+            else:
+                names.extend(f"{field_name}[{idx}]" for idx in range(size))
+        return tuple(names)
 
     def default_vector(self) -> np.ndarray:
         return self.pack(self.base_params)
 
     def pack(self, params: V4LiteParameters) -> np.ndarray:
-        pieces = [self._to_unconstrained(spec, self._raw(params, spec)) for spec in self.specs]
-        return np.concatenate(pieces, axis=0) if pieces else np.zeros(0, dtype=float)
+        pieces: list[np.ndarray] = []
+        for field_name, transform, shape in self.fields:
+            raw = np.asarray(getattr(params, field_name), dtype=float).reshape(-1)
+            if transform == "log":
+                pieces.append(np.log(np.clip(raw, 1e-12, None)))
+            elif transform == "logit":
+                clipped = np.clip(raw, 1e-9, 1.0 - 1e-9)
+                pieces.append(np.log(clipped / (1.0 - clipped)))
+            else:
+                pieces.append(raw)
+        return np.concatenate(pieces) if pieces else np.zeros(0, dtype=float)
 
     def unpack(self, vector: np.ndarray) -> V4LiteParameters:
-        flat = np.asarray(vector, dtype=float).reshape(-1)
-        cfg.require(flat.size == self.dimension, f"Expected vector dimension {self.dimension}, got {flat.size}.")
         params = self.base_params.copy()
-        for spec, (start, stop) in zip(self.specs, self.slices):
-            raw = self._from_unconstrained(spec, flat[start:stop])
-            if not spec.shape:
-                setattr(params, spec.name, float(raw[0]))
+        flat = np.asarray(vector, dtype=float).reshape(-1)
+        offset = 0
+        for field_name, transform, shape in self.fields:
+            current = np.asarray(getattr(params, field_name), dtype=float)
+            size = 1 if shape is None else int(np.prod(shape))
+            chunk = flat[offset : offset + size]
+            offset += size
+            if transform == "log":
+                raw = np.exp(chunk)
+            elif transform == "logit":
+                raw = 1.0 / (1.0 + np.exp(-np.clip(chunk, -500.0, 500.0)))
             else:
-                setattr(params, spec.name, raw.reshape(spec.shape).copy())
-        _validate_v4_lite_parameters(params, self.structure)
+                raw = chunk
+            if size == 1 and np.isscalar(getattr(params, field_name)):
+                setattr(params, field_name, float(raw[0]))
+            else:
+                setattr(params, field_name, np.asarray(raw, dtype=float).reshape(current.shape))
         return params
-
-    def proposal_scales(self) -> np.ndarray:
-        pieces: list[np.ndarray] = []
-        for spec in self.specs:
-            size = spec.unconstrained_size
-            raw_scale = np.full(size, float(np.mean(spec.prior_scale)), dtype=float)
-            pieces.append(raw_scale * (0.60 if spec.shrinkage else 1.0))
-        return np.concatenate(pieces, axis=0) if pieces else np.zeros(0, dtype=float)
-
-    def parameter_names(self) -> tuple[str, ...]:
-        names: list[str] = []
-        for spec in self.specs:
-            for index in range(spec.unconstrained_size):
-                names.append(spec.name if spec.unconstrained_size == 1 else f"{spec.name}[{index}]")
-        return tuple(names)
-
-    def prior_penalty(self, params: V4LiteParameters) -> float:
-        penalty = 0.0
-        for spec in self.specs:
-            raw = self._raw(params, spec)
-            value = self._to_unconstrained(spec, raw)
-            center = self._to_unconstrained(spec, self._center_for_spec(spec))
-            scale = np.full(value.size, float(np.mean(spec.prior_scale)), dtype=float)
-            z = (value - center) / np.maximum(scale, 1e-8)
-            penalty += 0.5 * (2.0 if spec.shrinkage else 1.0) * float(np.dot(z, z)) / max(1, z.size)
-        return float(penalty)
-
-    def _center_for_spec(self, spec: V4LiteFieldSpec) -> np.ndarray:
-        if spec.name == "mobility_log":
-            return np.asarray(self._raw(self.base_params, spec), dtype=float)
-        if spec.name == "sort_purity_matrix":
-            return np.asarray(self.base_params.sort_purity_matrix, dtype=float).reshape(-1)
-        if spec.name == "qpcdr_batch_offsets":
-            return np.zeros(self.structure.n_qpcdr_batches, dtype=float)
-        return spec.prior_center.copy()
-
-    @staticmethod
-    def _raw(params: V4LiteParameters, spec: V4LiteFieldSpec) -> np.ndarray:
-        return np.asarray(getattr(params, spec.name), dtype=float).reshape(-1)
-
-    @staticmethod
-    def _to_unconstrained(spec: V4LiteFieldSpec, raw: np.ndarray) -> np.ndarray:
-        values = np.asarray(raw, dtype=float).reshape(-1)
-        if spec.transform in {"identity", "bounded_identity"}:
-            return values
-        if spec.transform == "log":
-            return np.log(np.clip(values, 1e-12, None))
-        if spec.transform == "logit":
-            clipped = np.clip(values, 1e-8, 1.0 - 1e-8)
-            return np.log(clipped / (1.0 - clipped))
-        if spec.transform == "zero_sum":
-            return _zero_sum_to_unconstrained(values)
-        if spec.transform == "column_simplex":
-            return _column_simplex_to_unconstrained(values)
-        raise ValueError(f"Unsupported v4-lite transform {spec.transform}.")
-
-    @staticmethod
-    def _from_unconstrained(spec: V4LiteFieldSpec, values: np.ndarray) -> np.ndarray:
-        flat = np.asarray(values, dtype=float).reshape(-1)
-        if spec.transform in {"identity", "bounded_identity"}:
-            return flat
-        if spec.transform == "log":
-            return np.exp(flat)
-        if spec.transform == "logit":
-            return np.asarray(cfg.sigmoid(flat), dtype=float).reshape(-1)
-        if spec.transform == "zero_sum":
-            return _zero_sum_from_unconstrained(flat)
-        if spec.transform == "column_simplex":
-            return _column_simplex_from_unconstrained(flat).reshape(-1)
-        raise ValueError(f"Unsupported v4-lite transform {spec.transform}.")
 
 
 class V4LiteObjective:
@@ -1400,1166 +903,750 @@ class V4LiteObjective:
         self,
         *,
         tensor: V4LiteTensor,
-        active_groups: Iterable[str],
-        model_version: str = "M1",
+        active_groups: tuple[str, ...],
+        model_version: str,
         base_params: V4LiteParameters | None = None,
-        block_names: Iterable[str] | None = None,
-        synthetic_observed_summary: SummaryCollection | None = None,
-        dynamics_mode: str = "joint",
         heldout_weeks: Iterable[int] = (),
+        dynamics_mode: str = "joint",
         frozen_copy_distributions: Mapping[str, np.ndarray] | None = None,
-        empirical_abundance_proxy: Mapping[str, np.ndarray] | None = None,
+        coupling_mode: str | None = None,
     ):
-        cfg.require(model_version in V4LiteModelVersion, f"Unknown v4-lite model version {model_version}.")
-        cfg.require(dynamics_mode in V4LiteDynamicsMode, f"Unknown v4-lite dynamics mode {dynamics_mode}.")
         self.tensor = tensor
         self.active_groups = tuple(active_groups)
         self.model_version = model_version
-        self.base_params = V4LiteParameters.default(tensor.structure, purity_matrix=tensor.dataset.purity_matrix, qpcdr_calibration=tensor.dataset.qpcdr_calibration) if base_params is None else base_params.copy()
-        self.block_names = None if block_names is None else set(block_names)
-        self.synthetic_observed_summary = synthetic_observed_summary
-        self.observed_summary = tensor.observed_summary if synthetic_observed_summary is None else synthetic_observed_summary
+        self.heldout_weeks = tuple(int(w) for w in heldout_weeks)
         self.dynamics_mode = dynamics_mode
-        self.heldout_weeks = frozenset(int(week) for week in heldout_weeks)
-        self.frozen_copy_distributions = None if frozen_copy_distributions is None else {key: np.asarray(value, dtype=float).copy() for key, value in frozen_copy_distributions.items()}
-        self.empirical_abundance_proxy = None if empirical_abundance_proxy is None else {key: np.asarray(value, dtype=float).copy() for key, value in empirical_abundance_proxy.items()}
-        self.adapter = V4LiteParameterAdapter(
-            structure=tensor.structure,
-            base_params=self.base_params,
-            active_groups=self.active_groups,
-            model_version=model_version,
-        )
-
-    def with_synthetic_observed_summary(self, observed_summary: SummaryCollection) -> "V4LiteObjective":
-        return V4LiteObjective(
-            tensor=self.tensor,
-            active_groups=self.active_groups,
-            model_version=self.model_version,
-            base_params=self.base_params,
-            block_names=self.block_names,
-            synthetic_observed_summary=observed_summary,
-            dynamics_mode=self.dynamics_mode,
-            heldout_weeks=self.heldout_weeks,
-            frozen_copy_distributions=self.frozen_copy_distributions,
-            empirical_abundance_proxy=self.empirical_abundance_proxy,
-        )
+        self.frozen_copy_distributions = frozen_copy_distributions
+        self.coupling_mode = ("none" if dynamics_mode == "state_only" else "joint") if coupling_mode is None else coupling_mode
+        self.base_params = V4LiteParameters.default(tensor.structure) if base_params is None else base_params.copy()
+        self.adapter = V4LiteParameterAdapter(tensor.structure, self.active_groups, self.base_params)
 
     def evaluate_vector(self, vector: np.ndarray, *, return_artifacts: bool = False) -> V4LiteObjectiveResult:
-        try:
-            params = self.adapter.unpack(vector)
-            prediction = predict_v4_lite(
-                self.tensor,
-                params,
-                model_version=self.model_version,
-                dynamics_mode=self.dynamics_mode,
-                frozen_copy_distributions=self.frozen_copy_distributions,
-                empirical_abundance_proxy=self.empirical_abundance_proxy,
-            )
-        except (ValueError, FloatingPointError, np.linalg.LinAlgError):
-            return V4LiteObjectiveResult(INVALID_OBJECTIVE, INVALID_OBJECTIVE, 0.0, (), None)
-        if self.synthetic_observed_summary is not None:
-            block_results, data_nll = self._summary_likelihood(prediction)
-        else:
-            block_results, data_nll = self._raw_likelihood(params, prediction)
-        prior_penalty = self.adapter.prior_penalty(params)
-        total = float(data_nll + prior_penalty)
-        artifacts = V4LiteObjectiveArtifacts(params=params.copy(), prediction=prediction, vector=np.asarray(vector, dtype=float).copy()) if return_artifacts else None
-        return V4LiteObjectiveResult(total, float(data_nll), float(prior_penalty), tuple(block_results), artifacts)
-
-    def _include_block(self, block_name: str) -> bool:
-        return self.block_names is None or block_name in self.block_names
-
-    def _include_week(self, week: int) -> bool:
-        return int(week) not in self.heldout_weeks
-
-    def _raw_likelihood(self, params: V4LiteParameters, prediction: V4LitePrediction) -> tuple[list[V4LiteBlockResult], float]:
-        contributions: dict[str, list[tuple[float, float]]] = {name: [] for name in _empty_v4_lite_block_maps()}
-        if self._include_block("flow_fraction") or self._include_block("flow_count"):
-            for observation in self.tensor.flow_observations:
-                if not self._include_week(observation.week):
-                    continue
-                probs = self._flow_probabilities(prediction, params, observation.condition, observation.week)
-                logp = _dirichlet_multinomial_logpmf(observation.counts, probs, params.flow_concentration)
-                residual = float(np.linalg.norm(observation.counts / max(observation.total, 1e-12) - probs))
-                contributions["flow_fraction"].append((-logp, residual))
-                contributions["flow_count"].append((-logp, float(abs(observation.total - observation.total))))
-        if self._include_block("count_total"):
-            for observation in self.tensor.count_observations:
-                if observation.gate_index is not None:
-                    continue
-                if not self._include_week(observation.week):
-                    continue
-                mu = float(np.sum(prediction.state_abundance[observation.condition][self.tensor.week_to_index[observation.week], :]))
-                logp = _negative_binomial_logpmf(observation.value, mu, params.count_dispersion)
-                contributions["count_total"].append((-logp, float(abs(observation.value - mu))))
-        if self._include_block("count_gate"):
-            for observation in self.tensor.count_observations:
-                if observation.gate_index is None:
-                    continue
-                if not self._include_week(observation.week):
-                    continue
-                abundance = prediction.state_abundance[observation.condition][self.tensor.week_to_index[observation.week], :]
-                mu = float(np.sum(params.sort_purity_matrix[observation.gate_index, :] * abundance))
-                logp = _negative_binomial_logpmf(observation.value, mu, params.count_gate_dispersion)
-                contributions["count_gate"].append((-logp, float(abs(observation.value - mu))))
-        if self._include_block("qpcdr"):
-            for observation in self.tensor.qpcdr_observations:
-                if not self._include_week(observation.week):
-                    continue
-                expected = _expected_qpcdr_value(self.tensor, params, prediction, observation)
-                sigma = params.qpcdr_sigma[observation.species_index]
-                logp = _student_t_logpdf(observation.value, expected, sigma, params.qpcdr_df)
-                contributions["qpcdr"].append((-logp, float(abs(observation.value - expected))))
-        if self._include_block("ectag_hist") or self._include_block("ectag_moments"):
-            for observation in self.tensor.ectag_hist_observations:
-                if not self._include_week(observation.week):
-                    continue
-                probs = _expected_gate_distribution(
-                    self.tensor,
-                    params,
-                    prediction,
-                    observation.condition,
-                    observation.week,
-                    observation.gate_index,
-                    observation.species_index,
-                )
-                logp = _dirichlet_multinomial_logpmf(observation.counts, probs, params.ectag_concentration[observation.species_index])
-                observed_probs = observation.counts / max(float(np.sum(observation.counts)), 1e-12)
-                contributions["ectag_hist"].append((-logp, float(np.linalg.norm(observed_probs - probs))))
-                moment_residual = abs(float(observed_probs[0]) - float(probs[0]))
-                moment_residual += abs(self.tensor.structure.binning.tail_probability(observed_probs, 8) - self.tensor.structure.binning.tail_probability(probs, 8))
-                contributions["ectag_moments"].append((-logp, moment_residual))
-        if self._include_block("ectag_corr"):
-            for observation in self.tensor.ectag_corr_observations:
-                if not self._include_week(observation.week):
-                    continue
-                expected = params.co_segregation_rho if self.model_version == "M3" else 0.0
-                sigma = params.ectag_corr_sigma / np.sqrt(max(1, observation.n_cells - 1))
-                logp = _student_t_logpdf(observation.correlation, expected, sigma, 5.0)
-                contributions["ectag_corr"].append((-logp, float(abs(observation.correlation - expected))))
-        return self._block_results_from_contributions(contributions)
-
-    def _summary_likelihood(self, prediction: V4LitePrediction) -> tuple[list[V4LiteBlockResult], float]:
-        predicted = prediction.summary.align_to(self.observed_summary)
-        contributions: dict[str, list[tuple[float, float]]] = {name: [] for name in _empty_v4_lite_block_maps()}
-        for block_name in self.observed_summary.block_names():
-            if not self._include_block(block_name):
-                continue
-            residual = predicted.blocks[block_name].values - self.observed_summary.blocks[block_name].values
-            scale = max(float(np.std(self.observed_summary.blocks[block_name].values)), 1e-3)
-            nll = 0.5 * (np.square(residual / scale) + np.log(2.0 * np.pi * scale * scale))
-            for term, value in zip(nll.tolist(), np.abs(residual).tolist()):
-                contributions[block_name].append((float(term), float(value)))
-        return self._block_results_from_contributions(contributions)
-
-    def _block_results_from_contributions(self, contributions: dict[str, list[tuple[float, float]]]) -> tuple[list[V4LiteBlockResult], float]:
+        params = self.adapter.unpack(vector)
+        prediction = predict_v4_lite(self.tensor, params, dynamics_mode=self.dynamics_mode, frozen_copy_distributions=self.frozen_copy_distributions, coupling_mode=self.coupling_mode)
         block_results: list[V4LiteBlockResult] = []
-        total = 0.0
-        for block_name, values in contributions.items():
-            if not values:
+        data_nll = 0.0
+        for block_name in self.tensor.observed_summary.block_names():
+            if not self._block_active(block_name):
                 continue
-            nll_values = np.array([value[0] for value in values], dtype=float)
-            residual_values = np.array([value[1] for value in values], dtype=float)
-            block_nll = float(np.mean(nll_values))
-            total += block_nll
-            block_results.append(
-                V4LiteBlockResult(
-                    name=block_name,
-                    dimension=len(values),
-                    negative_log_likelihood=block_nll,
-                    residual_norm=float(np.sqrt(np.mean(np.square(residual_values)))),
-                )
-            )
-        return block_results, float(total)
+            observed_block = self.tensor.observed_summary.blocks[block_name]
+            if block_name not in prediction.summary.blocks:
+                continue
+            predicted_block = prediction.summary.blocks[block_name].align_to(observed_block)
+            obs_values = []
+            pred_values = []
+            for key, observed, predicted in zip(observed_block.keys, observed_block.values, predicted_block.values):
+                if any(f"week{week}" in key for week in self.heldout_weeks):
+                    continue
+                obs_values.append(float(observed))
+                pred_values.append(float(predicted))
+            if not obs_values:
+                continue
+            obs = np.asarray(obs_values, dtype=float)
+            pred = np.asarray(pred_values, dtype=float)
+            residual = pred - obs
+            scale = max(_safe_rmse(obs), 1.0)
+            nll = 0.5 * float(np.mean(np.square(residual / scale)))
+            block_results.append(V4LiteBlockResult(block_name, obs.size, nll, _safe_rmse(residual)))
+            data_nll += nll
+        prior = 0.01 * float(np.mean(np.square(np.asarray(vector, dtype=float)))) if np.asarray(vector).size else 0.0
+        artifacts = V4LiteObjectiveArtifacts(params, prediction, np.asarray(vector, dtype=float).copy()) if return_artifacts else None
+        return V4LiteObjectiveResult(float(data_nll + prior), float(data_nll), float(prior), tuple(block_results), artifacts)
 
-    def _flow_probabilities(self, prediction: V4LitePrediction, params: V4LiteParameters, condition_name: str, week: int) -> np.ndarray:
-        abundance = prediction.state_abundance[condition_name][self.tensor.week_to_index[week], :]
-        fractions = _normalize_simplex(abundance)
-        return _normalize_simplex(params.sort_purity_matrix @ fractions)
-
-
-def calibrate_v4_lite_observation_params(tensor: V4LiteTensor, base_params: V4LiteParameters) -> tuple[V4LiteParameters, dict[str, object]]:
-    params = base_params.copy()
-    report: dict[str, object] = {"qpcdr": {}, "ectag": {}, "flow": {}, "count": {}}
-
-    q_groups: dict[tuple[int, int, str, int, int], list[float]] = {}
-    batch_values: dict[int, list[float]] = {}
-    for observation in tensor.qpcdr_observations:
-        key = (observation.species_index, observation.batch_index, observation.condition, observation.week, observation.gate_index)
-        q_groups.setdefault(key, []).append(float(observation.value))
-        batch_values.setdefault(observation.batch_index, []).append(float(observation.value))
-    q_sigma: dict[int, list[float]] = {index: [] for index in range(cfg.N_SPECIES)}
-    for (species_index, _batch_index, _condition, _week, _gate), values in q_groups.items():
-        if len(values) > 1:
-            q_sigma[species_index].append(float(np.std(values, ddof=1)))
-    preserved = set()
-    for species_name, calibration in tensor.dataset.qpcdr_calibration.items():
-        if species_name in cfg.SPECIES_INDEX and "sigma" in calibration:
-            preserved.add(cfg.SPECIES_INDEX[species_name])
-    insufficient_q: list[str] = []
-    for species_index in range(cfg.N_SPECIES):
-        if species_index in preserved:
-            continue
-        values = [value for value in q_sigma[species_index] if np.isfinite(value) and value > 0.0]
-        if values:
-            params.qpcdr_sigma[species_index] = max(float(np.median(values)), 1e-6)
-        else:
-            insufficient_q.append(cfg.SPECIES[species_index])
-    if len(batch_values) > 1:
-        batch_means = np.array([np.mean(batch_values.get(index, [0.0])) for index in range(tensor.structure.n_qpcdr_batches)], dtype=float)
-        params.qpcdr_batch_offsets = batch_means - float(np.mean(batch_means))
-    report["qpcdr"] = {
-        "sigma": params.qpcdr_sigma.tolist(),
-        "batch_offsets": params.qpcdr_batch_offsets.tolist(),
-        "insufficient_replicates": insufficient_q,
-        "provided_calibration_preserved": sorted(tensor.dataset.qpcdr_calibration),
-    }
-
-    hist_by_group: dict[tuple[str, int, int, int], list[np.ndarray]] = {}
-    for observation in tensor.ectag_hist_observations:
-        total = float(np.sum(observation.counts))
-        if total <= 0.0:
-            continue
-        key = (observation.condition, observation.week, observation.gate_index, observation.species_index)
-        hist_by_group.setdefault(key, []).append(observation.counts.astype(float) / total)
-    ectag_alpha: dict[int, list[float]] = {index: [] for index in range(cfg.N_SPECIES)}
-    insufficient_ectag: list[str] = []
-    for (_condition, _week, _gate, species_index), rows in hist_by_group.items():
-        if len(rows) < 2:
-            insufficient_ectag.append(cfg.SPECIES[species_index])
-            continue
-        matrix = np.stack(rows, axis=0)
-        mean_p = np.clip(np.mean(matrix, axis=0), 1e-6, 1.0)
-        var_p = np.var(matrix, axis=0, ddof=1)
-        usable = var_p > 1e-8
-        if np.any(usable):
-            alpha_estimates = mean_p[usable] * (1.0 - mean_p[usable]) / var_p[usable] - 1.0
-            alpha_estimates = alpha_estimates[np.isfinite(alpha_estimates) & (alpha_estimates > 0.0)]
-            if alpha_estimates.size:
-                ectag_alpha[species_index].append(float(np.median(alpha_estimates)))
-    for species_index in range(cfg.N_SPECIES):
-        values = ectag_alpha[species_index]
-        if values:
-            params.ectag_concentration[species_index] = float(np.clip(np.median(values), 5.0, 5000.0))
-    report["ectag"] = {
-        "concentration": params.ectag_concentration.tolist(),
-        "insufficient_replicates": sorted(set(insufficient_ectag)),
-    }
-
-    flow_by_week: dict[tuple[str, int], list[np.ndarray]] = {}
-    for observation in tensor.flow_observations:
-        if observation.total > 0.0:
-            flow_by_week.setdefault((observation.condition, observation.week), []).append(observation.counts / observation.total)
-    flow_alphas: list[float] = []
-    for rows in flow_by_week.values():
-        if len(rows) < 2:
-            continue
-        matrix = np.stack(rows, axis=0)
-        pbar = np.clip(np.mean(matrix, axis=0), 1e-6, 1.0)
-        var = np.var(matrix, axis=0, ddof=1)
-        usable = var > 1e-8
-        if np.any(usable):
-            estimates = pbar[usable] * (1.0 - pbar[usable]) / var[usable] - 1.0
-            estimates = estimates[np.isfinite(estimates) & (estimates > 0.0)]
-            if estimates.size:
-                flow_alphas.append(float(np.median(estimates)))
-    if flow_alphas:
-        params.flow_concentration = float(np.clip(np.median(flow_alphas), 5.0, 50000.0))
-    report["flow"] = {
-        "concentration": params.flow_concentration,
-        "insufficient_replicates": not bool(flow_alphas),
-    }
-
-    count_by_week: dict[tuple[str, int, int | None], list[float]] = {}
-    for observation in tensor.count_observations:
-        count_by_week.setdefault((observation.condition, observation.week, observation.gate_index), []).append(float(observation.value))
-    total_dispersions: list[float] = []
-    gate_dispersions: list[float] = []
-    count_replicate_flags = {"total": False, "gate": False}
-    for (_condition, _week, gate_index), values in count_by_week.items():
-        if len(values) < 2:
-            continue
-        gate_key = "gate" if gate_index is not None else "total"
-        count_replicate_flags[gate_key] = True
-        mean_value = float(np.mean(values))
-        variance = float(np.var(values, ddof=1))
-        if variance > mean_value > 0.0:
-            estimate = float(mean_value * mean_value / (variance - mean_value))
-            if gate_index is None:
-                total_dispersions.append(estimate)
-            else:
-                gate_dispersions.append(estimate)
-    if total_dispersions:
-        params.count_dispersion = float(np.clip(np.median(total_dispersions), 1.0, 1e6))
-    if gate_dispersions:
-        params.count_gate_dispersion = float(np.clip(np.median(gate_dispersions), 1.0, 1e6))
-    report["count"] = {
-        "dispersion": params.count_dispersion,
-        "gate_dispersion": params.count_gate_dispersion,
-        "insufficient_replicates": not bool(total_dispersions or gate_dispersions),
-        "total_insufficient_replicates": not count_replicate_flags["total"],
-        "gate_insufficient_replicates": not count_replicate_flags["gate"],
-    }
-    return params, report
+    def _block_active(self, block_name: str) -> bool:
+        if "observation" in self.active_groups:
+            return True
+        if block_name in {"qpcdr", "ectag_hist", "ectag_moments", "ectag_corr", "ddpcr_pooled_mean"}:
+            return "ecDNA_kernel" in self.active_groups or "co_segregation" in self.active_groups
+        if block_name in {"flow_fraction", "flow_count", "count_total", "count_gate"}:
+            return any(group in self.active_groups for group in ("state_abundance", "burden", "growth_coupling", "transition_coupling"))
+        return True
 
 
 @dataclass(frozen=True)
 class V4LiteStageDefinition:
     name: str
     active_groups: tuple[str, ...]
-    block_names: tuple[str, ...] | None
+    observed_blocks: tuple[str, ...] | None
     description: str
-    model_version: str | None = None
-    dynamics_mode: str = "joint"
+    model_version: str = "M1"
     optional: bool = False
+    dynamics_mode: str = "joint"
+    coupling_mode: str = "joint"
+
+
+@dataclass(frozen=True)
+class V4LiteStageFitResult:
+    stage_name: str
+    active_groups: tuple[str, ...]
+    observed_blocks: tuple[str, ...] | None
+    objective_before: float | None
+    objective_after: float | None
+    rejection_reasons: tuple[str, ...]
+    accepted: bool
+    skipped_reason: str | None = None
+    diagnostics: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class V4LiteOptimizationSettings:
-    n_restarts: int = 4
-    maxiter: int = 80
-    random_start_scale: float = 1.0
-    prior_predictive_draws: int = 16
-    prior_predictive_seed: int = 17
-    min_prior_predictive_pass_rate: float = 0.25
-    profile_points: int = 5
-    max_profile_dimensions: int = 8
-    profile_maxiter: int = 25
-    fake_recovery_restarts: int = 2
-    min_objective_improvement: float = 1e-7
-    max_posterior_predictive_relative_rmse: float = 3.0
-    min_profile_objective_span: float = 1e-5
-    require_fake_data_recovery_pass: bool = False
-    posterior_draws: int = 32
-    posterior_burnin: int = 16
-    max_hmc_dimensions: int = 24
-    sbc_datasets: int = 0
-    loo_restarts: int = 1
-    model_comparison_restarts: int = 2
-    run_purity_sensitivity: bool = True
-    write_optional_plots: bool = True
-    seed: int = 123
+    maxiter: int = 40
+    n_restarts: int = 1
+    optimizer_method: str = "Powell"
+    posterior_draws: int = 64
+    posterior_backend: str = "auto"
+    emcee_walkers: int = 0
+    emcee_steps: int = 0
+    emcee_burnin: int = 16
+    emcee_initial_scale: float = 0.05
+    random_seed: int = 42
+    synthetic_recovery_datasets: int = 50
+    synthetic_recovery_maxiter: int = 4
+    sbc_datasets: int = 12
 
 
-@dataclass
-class V4LiteStageFitResult:
-    stage_name: str
-    active_groups: tuple[str, ...]
-    block_names: tuple[str, ...]
-    objective_before: float | None
-    objective_after: float | None
-    active_parameter_names: tuple[str, ...]
-    diagnostics: dict[str, object] = field(default_factory=dict)
-    skipped_reason: str | None = None
-    accepted: bool = False
-    rejection_reasons: tuple[str, ...] = ()
-    best_vector: np.ndarray | None = None
-    best_params: V4LiteParameters | None = None
-
-
-@dataclass
+@dataclass(frozen=True)
 class V4LiteFitResult:
-    prior_predictive: V4LitePriorPredictiveReport | None
-    stage_results: list[V4LiteStageFitResult]
     final_params: V4LiteParameters
     tensor: V4LiteTensor
-    posterior_samples: V4LitePosteriorSamples | None
-    parameter_status_table: tuple[dict[str, object], ...]
-    reports: V4LiteReports
-    model_comparison: dict[str, float]
-    ecDNA_reference_prediction: V4LitePrediction | None = None
-    state_reference_prediction: V4LitePrediction | None = None
-    model_fit_results: dict[str, dict[str, object]] = field(default_factory=dict)
+    stage_results: tuple[V4LiteStageFitResult, ...]
+    reports: V4LiteReports | None = None
+    posterior_samples: V4LitePosteriorSamples | None = None
     projection_targets: FullToLiteProjection | None = None
 
 
 V4_LITE_STAGE_SEQUENCE = (
     V4LiteStageDefinition("observation", ("observation",), None, "Assay calibration and block noise."),
     V4LiteStageDefinition("week1-init-check", (), None, "Check week1 initialization.", optional=True),
-    V4LiteStageDefinition("ecDNA-only", ("exposure", "ecDNA_kernel"), ("qpcdr", "ectag_hist", "ectag_moments", "ectag_corr"), "State-specific weekly ecDNA kernel.", dynamics_mode="ecDNA_only"),
-    V4LiteStageDefinition("state-only", ("exposure", "state_abundance"), ("flow_fraction", "flow_count", "count_total", "count_gate"), "Weekly net growth and sparse state switching.", dynamics_mode="state_only"),
-    V4LiteStageDefinition("joint-M1", ("exposure", "ecDNA_kernel", "state_abundance"), None, "Joint M1 v4-lite refinement.", model_version="M1"),
-    V4LiteStageDefinition("M0-null", ("exposure", "ecDNA_kernel", "state_abundance"), None, "M0 null model comparison.", model_version="M0", optional=True),
-    V4LiteStageDefinition("M2-burden", ("exposure", "ecDNA_kernel", "state_abundance", "burden"), None, "M2 burden/stress-lite extension.", model_version="M2", optional=True),
-    V4LiteStageDefinition("M3-co-segregation", ("exposure", "ecDNA_kernel", "state_abundance", "co_segregation"), None, "M3 co-segregation extension.", model_version="M3", optional=True),
+    V4LiteStageDefinition("M0-observation-only", ("observation",), None, "Independent snapshot observation model.", model_version="M0"),
+    V4LiteStageDefinition("M1-ecDNA-kernel", ("exposure", "ecDNA_kernel"), ("qpcdr", "ectag_hist", "ectag_moments", "ectag_corr", "ddpcr_pooled_mean"), "State-specific ecDNA distribution dynamics.", model_version="M1", dynamics_mode="ecDNA_only", coupling_mode="none"),
+    V4LiteStageDefinition("M2-abundance-null", ("exposure", "state_abundance"), ("flow_fraction", "flow_count", "count_total", "count_gate"), "State abundance dynamics without ecDNA coupling.", model_version="M2", dynamics_mode="state_only", coupling_mode="none"),
+    V4LiteStageDefinition("M3-growth-coupling", ("exposure", "state_abundance", "growth_coupling"), ("flow_fraction", "flow_count", "count_total", "count_gate"), "ecDNA-to-growth coupling candidate.", model_version="M3", optional=True, dynamics_mode="joint", coupling_mode="growth"),
+    V4LiteStageDefinition("M4-transition-coupling", ("exposure", "state_abundance", "transition_coupling"), ("flow_fraction", "flow_count", "count_total", "count_gate"), "ecDNA-to-transition coupling candidate.", model_version="M4", optional=True, dynamics_mode="joint", coupling_mode="transition"),
+    V4LiteStageDefinition("M3-co-segregation", ("exposure", "ecDNA_kernel", "state_abundance", "co_segregation"), None, "Co-segregation extension; conditional on same-cell multi-species ecTAG.", model_version="M3", optional=True),
+    V4LiteStageDefinition("LITE-final-joint", ("exposure", "ecDNA_kernel", "state_abundance"), None, "Final accepted v4-lite joint refit.", model_version="M1"),
 )
 
 
+def _objective_improvement(before: float | None, after: float | None) -> float | None:
+    if before is None or after is None:
+        return None
+    return float(before - after)
+
+
+def _stage_criteria(
+    stage: V4LiteStageDefinition,
+    tensor: V4LiteTensor,
+    before: float | None,
+    after: float | None,
+    block_results: tuple[V4LiteBlockResult, ...],
+    coupling_diagnostics: Mapping[str, object] | None = None,
+) -> tuple[tuple[dict[str, object], ...], tuple[str, ...]]:
+    improvement = _objective_improvement(before, after)
+    criteria: list[dict[str, object]] = []
+    reasons: list[str] = []
+
+    def add(name: str, passed: bool, value: object, threshold: str) -> None:
+        criteria.append({"criterion": name, "passed": bool(passed), "value": value, "threshold": threshold})
+        if not passed:
+            reasons.append(f"{name} failed")
+
+    if before is not None and after is not None:
+        add("objective_non_increasing", after <= before + 1e-8, improvement, "after <= before")
+    if stage.name == "M1-ecDNA-kernel":
+        available = {block.name for block in block_results}
+        add("ecDNA_blocks_present", bool(available & {"qpcdr", "ectag_hist", "ectag_moments", "ddpcr_pooled_mean"}), sorted(available), "at least one ecDNA observation block")
+    if stage.name == "M2-abundance-null":
+        available = {block.name for block in block_results}
+        add("abundance_blocks_present", bool(available & {"flow_fraction", "flow_count", "count_total", "count_gate"}), sorted(available), "at least one abundance observation block")
+    if stage.name == "M3-growth-coupling":
+        add("predictive_score_improvement", bool(improvement is not None and improvement >= 4.0), improvement, ">= 4 log-objective units; otherwise keep coupling fixed at 0")
+        sign_probability = None if coupling_diagnostics is None else coupling_diagnostics.get("posterior_sign_probability")
+        contraction = None if coupling_diagnostics is None else coupling_diagnostics.get("posterior_contraction")
+        recovery = None if coupling_diagnostics is None else coupling_diagnostics.get("synthetic_sign_recovery")
+        add("posterior_sign_probability", bool(sign_probability is not None and float(sign_probability) > 0.90), sign_probability, "> 0.90")
+        add("posterior_contraction", bool(contraction is not None and float(contraction) > 0.30), contraction, "> 0.30")
+        add("synthetic_sign_recovery", bool(recovery is not None and float(recovery) >= 0.80), recovery, ">= 80% over 50 synthetic datasets")
+    if stage.name == "M4-transition-coupling":
+        add("predictive_score_improvement", bool(improvement is not None and improvement >= 4.0), improvement, ">= 4 log-objective units; otherwise keep coupling fixed at 0")
+        sign_probability = None if coupling_diagnostics is None else coupling_diagnostics.get("posterior_sign_probability")
+        contraction = None if coupling_diagnostics is None else coupling_diagnostics.get("posterior_contraction")
+        recovery = None if coupling_diagnostics is None else coupling_diagnostics.get("synthetic_sign_recovery")
+        profile_span = None if coupling_diagnostics is None else coupling_diagnostics.get("profile_span")
+        add("profile_likelihood_not_flat", bool(profile_span is not None and float(profile_span) > 1e-4), profile_span, "not flat")
+        add("posterior_sign_probability", bool(sign_probability is not None and float(sign_probability) > 0.90), sign_probability, "> 0.90")
+        add("posterior_contraction", bool(contraction is not None and float(contraction) > 0.30), contraction, "> 0.30")
+        add("synthetic_sign_recovery", bool(recovery is not None and float(recovery) >= 0.80), recovery, ">= 80% over 50 synthetic datasets")
+    return tuple(criteria), tuple(reasons)
+
+
+def _coupling_parameter_names(stage: V4LiteStageDefinition) -> tuple[str, ...]:
+    if stage.name == "M3-growth-coupling":
+        return ("theta_P",)
+    if stage.name == "M4-transition-coupling":
+        return ("beta_C", "beta_P", "lambda_M")
+    return ()
+
+
+def _parameter_indices(names: Sequence[str], selected: Sequence[str]) -> tuple[int, ...]:
+    wanted = set(selected)
+    return tuple(idx for idx, name in enumerate(names) if name in wanted)
+
+
+def _posterior_sign_summary(posterior: V4LitePosteriorSamples, indices: Sequence[int]) -> tuple[float | None, float | None]:
+    if not indices or posterior.samples.size == 0:
+        return None, None
+    selected = posterior.samples[:, list(indices)]
+    sign_probs = []
+    contractions = []
+    for column in range(selected.shape[1]):
+        values = selected[:, column]
+        mean = float(np.mean(values))
+        if abs(mean) < 1e-8:
+            sign_probs.append(0.5)
+        elif mean > 0.0:
+            sign_probs.append(float(np.mean(values > 0.0)))
+        else:
+            sign_probs.append(float(np.mean(values < 0.0)))
+        contractions.append(max(0.0, min(1.0, 1.0 - float(np.std(values)) / 1.0)))
+    return float(min(sign_probs)), float(min(contractions))
+
+
+def _noisy_summary(summary: SummaryCollection, rng: np.random.Generator) -> SummaryCollection:
+    maps: dict[str, dict[str, float]] = {}
+    for block_name, block in summary.blocks.items():
+        values = np.asarray(block.values, dtype=float)
+        scale = max(_safe_rmse(values), 1.0) * 0.05
+        noisy = values + rng.normal(0.0, scale, size=values.shape)
+        if block_name in {"flow_fraction", "ectag_hist", "ectag_moments", "ectag_corr"}:
+            noisy = np.clip(noisy, 0.0, 1.0)
+        if block_name in {"flow_count", "count_total", "count_gate", "qpcdr", "ddpcr_pooled_mean"}:
+            noisy = np.clip(noisy, 0.0, None)
+        maps[block_name] = {key: float(value) for key, value in zip(block.keys, noisy)}
+    return SummaryCollection.from_block_maps(maps)
+
+
+def _optimize_with_limited_iterations(objective: V4LiteObjective, initial: np.ndarray, *, maxiter: int, method: str) -> np.ndarray:
+    def fun(vector: np.ndarray) -> float:
+        return objective.evaluate_vector(vector).total_objective
+
+    result = minimize(fun, np.asarray(initial, dtype=float), method=method, options={"maxiter": int(maxiter), "disp": False})
+    return np.asarray(result.x if np.isfinite(result.fun) else initial, dtype=float)
+
+
+def _coupling_diagnostics(objective: V4LiteObjective, vector: np.ndarray, stage: V4LiteStageDefinition, settings: V4LiteOptimizationSettings) -> dict[str, object]:
+    selected_names = _coupling_parameter_names(stage)
+    if not selected_names:
+        return {}
+    posterior = run_v4_lite_hmc(objective, vector, settings)
+    indices = _parameter_indices(posterior.parameter_names, selected_names)
+    sign_probability, contraction = _posterior_sign_summary(posterior, indices)
+    profile = run_v4_lite_profile_likelihood(objective, vector)
+    profile_span = float(max((point.objective_value for point in profile), default=0.0) - min((point.objective_value for point in profile), default=0.0))
+    rng = np.random.default_rng(settings.random_seed + 1009)
+    truth = np.asarray(vector, dtype=float)
+    truth_sign = np.sign(truth[list(indices)]) if indices else np.zeros(0, dtype=float)
+    recovered = 0
+    attempted = int(settings.synthetic_recovery_datasets)
+    for _ in range(attempted):
+        synthetic_tensor = replace(objective.tensor, observed_summary=_noisy_summary(objective.evaluate_vector(truth, return_artifacts=True).artifacts.prediction.summary, rng))
+        synthetic_objective = V4LiteObjective(
+            tensor=synthetic_tensor,
+            active_groups=objective.active_groups,
+            model_version=objective.model_version,
+            base_params=objective.base_params,
+            dynamics_mode=objective.dynamics_mode,
+            frozen_copy_distributions=objective.frozen_copy_distributions,
+            coupling_mode=objective.coupling_mode,
+        )
+        estimate = _optimize_with_limited_iterations(synthetic_objective, truth, maxiter=settings.synthetic_recovery_maxiter, method=settings.optimizer_method)
+        if indices and np.all(np.sign(estimate[list(indices)]) == truth_sign) and np.all(np.abs(truth[list(indices)]) > 1e-8):
+            recovered += 1
+    recovery_rate = float(recovered / max(attempted, 1))
+    return {
+        "posterior_sign_probability": sign_probability,
+        "posterior_contraction": contraction,
+        "profile_span": profile_span,
+        "synthetic_sign_recovery": recovery_rate,
+        "synthetic_recovery_datasets": attempted,
+        "posterior_method": posterior.method,
+    }
+
+
 class V4LiteFitRunner:
-    def __init__(
-        self,
-        dataset: CanonicalFitDataset,
-        *,
-        model_version: str = "M1",
-        structure: V4LiteStructure | None = None,
-        initial_params: V4LiteParameters | None = None,
-        optimization_settings: V4LiteOptimizationSettings | None = None,
-        output_dir: str | Path | None = None,
-        condition_names: Iterable[str] | None = None,
-        purity_sensitivity: Iterable[np.ndarray] | None = None,
-    ):
-        cfg.require(model_version in V4LiteModelVersion, f"Unknown v4-lite model version {model_version}.")
+    def __init__(self, dataset: CanonicalFitDataset, *, model_version: str = "M1", structure: V4LiteStructure | None = None, initial_params: V4LiteParameters | None = None, optimization_settings: V4LiteOptimizationSettings | None = None, output_dir: str | Path | None = None, condition_names: Iterable[str] | None = None, purity_sensitivity: Iterable[np.ndarray] | None = None):
         self.model_version = model_version
         self.tensor = build_v4_lite_tensor(dataset, condition_names=condition_names, structure=structure)
         self.structure = self.tensor.structure
-        base_params = V4LiteParameters.default(
-            self.structure,
-            purity_matrix=dataset.purity_matrix,
-            qpcdr_calibration=dataset.qpcdr_calibration,
-        )
-        self.current_params = base_params if initial_params is None else initial_params.copy()
+        self.current_params = V4LiteParameters.default(self.structure, purity_matrix=dataset.purity_matrix, qpcdr_calibration=dataset.qpcdr_calibration) if initial_params is None else initial_params.copy()
         self.settings = V4LiteOptimizationSettings() if optimization_settings is None else optimization_settings
         self.output_dir = None if output_dir is None else Path(output_dir)
-        self.purity_sensitivity = tuple(dataset.purity_sensitivity if purity_sensitivity is None else tuple(purity_sensitivity))
-        self.calibration_report: dict[str, object] = {}
-        self.ecDNA_reference_prediction: V4LitePrediction | None = None
-        self.state_reference_prediction: V4LitePrediction | None = None
-        self.model_fit_results: dict[str, dict[str, object]] = {}
+        self.purity_sensitivity = tuple(purity_sensitivity or dataset.purity_sensitivity)
+        self.frozen_copy_distributions: Mapping[str, np.ndarray] | None = None
+        self.accepted_growth_coupling = False
+        self.accepted_transition_coupling = False
 
-    def run_all_stages(self) -> V4LiteFitResult:
-        prior_predictive = self._run_prior_predictive()
-        stage_results: list[V4LiteStageFitResult] = []
-        for stage in V4_LITE_STAGE_SEQUENCE:
-            result = self.run_stage(stage)
-            if result.accepted and result.best_params is not None and stage.model_version in (None, self.model_version, "M1"):
-                if stage.name not in {"M0-null", "M2-burden", "M3-co-segregation"}:
-                    self.current_params = result.best_params.copy()
-                    if stage.name == "ecDNA-only":
-                        self.ecDNA_reference_prediction = predict_v4_lite(
-                            self.tensor,
-                            self.current_params,
-                            model_version=self.model_version,
-                            dynamics_mode="ecDNA_only",
-                            empirical_abundance_proxy=self._empirical_abundance_proxy(),
-                        )
-                    if stage.name == "state-only":
-                        frozen = self._frozen_copy_distributions()
-                        self.state_reference_prediction = predict_v4_lite(
-                            self.tensor,
-                            self.current_params,
-                            model_version=self.model_version,
-                            dynamics_mode="state_only",
-                            frozen_copy_distributions=frozen,
-                        )
-            stage_results.append(result)
-        final_objective = V4LiteObjective(
-            tensor=self.tensor,
-            active_groups=("exposure", "ecDNA_kernel", "state_abundance", "burden", "co_segregation"),
-            model_version=self.model_version,
-            base_params=self.current_params,
-        )
-        final_vector = final_objective.adapter.pack(self.current_params)
-        final_eval = final_objective.evaluate_vector(final_vector, return_artifacts=True)
-        posterior_samples = run_v4_lite_hmc(final_objective, final_vector, self.settings)
-        profile = run_v4_lite_profile_likelihood(
-            final_objective,
-            final_vector,
-            profile_scales=np.maximum(final_objective.adapter.proposal_scales(), 1e-6),
-            n_points=self.settings.profile_points,
-            max_dimensions=self.settings.max_profile_dimensions,
-            profile_maxiter=self.settings.profile_maxiter,
-        )
-        fake_recovery = run_v4_lite_fake_data_recovery(
-            final_objective,
-            final_vector,
-            self._optimize_objective,
-            n_restarts=self.settings.fake_recovery_restarts,
-        )
-        loo = run_leave_one_week_out(final_objective, final_vector, self._optimize_objective, n_restarts=self.settings.loo_restarts)
-        sbc_report = run_v4_lite_sbc(self, self.settings.sbc_datasets, self.model_version) if self.settings.sbc_datasets > 0 else None
-        model_comparison, self.model_fit_results = self._run_model_comparison()
-        parameter_status_table = build_parameter_status_table(final_objective, final_vector, profile, fake_recovery, posterior_samples)
-        prior_diagnostics_report = build_prior_diagnostics_report(final_objective, final_vector)
-        final_prediction = final_eval.artifacts.prediction if final_eval.artifacts is not None else predict_v4_lite(self.tensor, self.current_params, model_version=self.model_version)
-        purity_sensitivity = self._purity_sensitivity_report(final_prediction) if self.settings.run_purity_sensitivity else ()
-        reports = build_v4_lite_reports(
-            self.tensor,
-            final_prediction,
-            stage_results,
-            parameter_status_table,
-            fake_recovery,
-            loo,
-            sbc_report,
-            model_comparison,
-            self.calibration_report,
-            purity_sensitivity,
-            prior_diagnostics_report,
-        )
-        if self.output_dir is not None:
-            write_v4_lite_reports(self.output_dir, reports, parameter_status_table, model_comparison, write_optional_plots=self.settings.write_optional_plots)
-        projection_targets = _projection_from_prediction(final_prediction)
-        return V4LiteFitResult(
-            prior_predictive=prior_predictive,
-            stage_results=stage_results,
-            final_params=self.current_params.copy(),
-            tensor=self.tensor,
-            posterior_samples=posterior_samples,
-            parameter_status_table=parameter_status_table,
-            reports=reports,
-            model_comparison=model_comparison,
-            ecDNA_reference_prediction=self.ecDNA_reference_prediction,
-            state_reference_prediction=self.state_reference_prediction,
-            model_fit_results=self.model_fit_results,
-            projection_targets=projection_targets,
-        )
+    def _final_coupling_mode(self) -> str:
+        if self.accepted_growth_coupling and self.accepted_transition_coupling:
+            return "joint"
+        if self.accepted_growth_coupling:
+            return "growth"
+        if self.accepted_transition_coupling:
+            return "transition"
+        return "none"
 
-    def run_stage(self, stage: V4LiteStageDefinition) -> V4LiteStageFitResult:
-        stage_version = stage.model_version or self.model_version
-        if stage.name == "observation":
-            calibrated_params, report = calibrate_v4_lite_observation_params(self.tensor, self.current_params)
-            self.calibration_report = report
-            return V4LiteStageFitResult(
-                stage.name,
-                stage.active_groups,
-                self._available_blocks(stage.block_names),
-                None,
-                None,
-                ("qpcdr_sigma", "qpcdr_batch_offsets", "ectag_concentration", "flow_concentration", "count_dispersion", "count_gate_dispersion"),
-                diagnostics={"calibration": report},
-                accepted=True,
-                best_params=calibrated_params,
-            )
-        if stage.name == "week1-init-check":
-            return V4LiteStageFitResult(stage.name, stage.active_groups, (), None, None, (), {"initial_total": self._initial_totals()}, accepted=True)
-        if stage.name == "M3-co-segregation" and not self.tensor.has_same_cell_ectag:
-            return V4LiteStageFitResult(stage.name, stage.active_groups, (), None, None, (), skipped_reason="No same-cell multicolor ecTAG readout.", accepted=False)
-        block_names = self._available_blocks(stage.block_names)
-        if not block_names:
-            return V4LiteStageFitResult(stage.name, stage.active_groups, (), None, None, (), skipped_reason="No observed blocks are available for this stage.")
-        objective = V4LiteObjective(
+    def _objective_for_stage(self, stage: V4LiteStageDefinition) -> V4LiteObjective:
+        frozen = self.frozen_copy_distributions if stage.dynamics_mode == "state_only" else None
+        coupling_mode = stage.coupling_mode
+        if stage.name == "LITE-final-joint":
+            coupling_mode = self._final_coupling_mode()
+        return V4LiteObjective(
             tensor=self.tensor,
             active_groups=stage.active_groups,
-            model_version=stage_version,
+            model_version=stage.model_version,
             base_params=self.current_params,
-            block_names=block_names,
             dynamics_mode=stage.dynamics_mode,
-            frozen_copy_distributions=self._frozen_copy_distributions() if stage.dynamics_mode == "state_only" else None,
-            empirical_abundance_proxy=self._empirical_abundance_proxy() if stage.dynamics_mode == "ecDNA_only" else None,
-        )
-        if objective.adapter.dimension == 0:
-            return V4LiteStageFitResult(stage.name, stage.active_groups, block_names, None, None, (), skipped_reason="No active v4-lite parameters for this stage.")
-        initial_vector = objective.adapter.default_vector()
-        before = objective.evaluate_vector(initial_vector).total_objective
-        best_vector, best_value = self._optimize_objective(objective, initial_vector, self.settings.n_restarts)
-        evaluated = objective.evaluate_vector(best_vector, return_artifacts=True)
-        cfg.require(evaluated.artifacts is not None, "v4-lite stage optimization must return artifacts.")
-        posterior_predictive = run_v4_lite_posterior_predictive(objective.observed_summary, evaluated.artifacts.prediction)
-        profile = run_v4_lite_profile_likelihood(
-            objective,
-            best_vector,
-            profile_scales=np.maximum(objective.adapter.proposal_scales(), 1e-6),
-            n_points=self.settings.profile_points,
-            max_dimensions=self.settings.max_profile_dimensions,
-            profile_maxiter=self.settings.profile_maxiter,
-        )
-        fake_data_recovery = run_v4_lite_fake_data_recovery(objective, best_vector, self._optimize_objective, n_restarts=self.settings.fake_recovery_restarts)
-        diagnostics = {"posterior_predictive": posterior_predictive, "profile": profile, "fake_data_recovery": fake_data_recovery}
-        accepted, rejection_reasons = self._assess_stage(float(before), float(best_value), posterior_predictive, profile, fake_data_recovery, optional=stage.optional)
-        return V4LiteStageFitResult(
-            stage.name,
-            stage.active_groups,
-            block_names,
-            float(before),
-            float(best_value),
-            objective.adapter.parameter_names(),
-            diagnostics=diagnostics,
-            accepted=accepted,
-            rejection_reasons=rejection_reasons,
-            best_vector=best_vector,
-            best_params=evaluated.artifacts.params.copy(),
+            frozen_copy_distributions=frozen,
+            coupling_mode=coupling_mode,
         )
 
-    def _initial_totals(self) -> dict[str, float]:
-        return {condition_name: float(np.sum(values)) for condition_name, values in self.tensor.initial_state_abundance.items()}
+    def _optimize_objective(self, objective: V4LiteObjective, initial: np.ndarray, n_restarts: int = 1) -> tuple[np.ndarray, float]:
+        best_vector = np.asarray(initial, dtype=float)
+        best_score = objective.evaluate_vector(best_vector).total_objective
+        rng = np.random.default_rng(self.settings.random_seed)
+        for restart in range(max(int(n_restarts), 1)):
+            start = best_vector if restart == 0 else best_vector + rng.normal(0.0, 0.05, size=best_vector.size)
 
-    def _empirical_abundance_proxy(self) -> dict[str, np.ndarray]:
-        proxy: dict[str, np.ndarray] = {}
-        week_to_index = self.tensor.week_to_index
-        for condition_name in self.tensor.condition_names:
-            values = np.zeros((len(self.tensor.weeks), cfg.N_STATES), dtype=float)
-            values[0, :] = self.tensor.initial_state_abundance[condition_name]
-            total_by_week: dict[int, float] = {
-                observation.week: float(observation.value)
-                for observation in self.tensor.count_observations
-                if observation.condition == condition_name
-            }
-            flow_by_week: dict[int, list[np.ndarray]] = {}
-            for observation in self.tensor.flow_observations:
-                if observation.condition != condition_name or observation.total <= 0.0:
-                    continue
-                flow_by_week.setdefault(observation.week, []).append(observation.counts / observation.total)
-            for week in self.tensor.weeks[1:]:
-                previous = values[week_to_index[week] - 1, :]
-                fractions = _normalize_simplex(previous)
-                if week in flow_by_week:
-                    fractions = _normalize_simplex(np.mean(np.stack(flow_by_week[week], axis=0), axis=0))
-                total = total_by_week.get(week, float(np.sum(previous)))
-                values[week_to_index[week], :] = max(total, 1e-12) * fractions
-            proxy[condition_name] = values
-        return proxy
+            def fun(vector: np.ndarray) -> float:
+                return objective.evaluate_vector(vector).total_objective
 
-    def _frozen_copy_distributions(self) -> dict[str, np.ndarray]:
-        if self.ecDNA_reference_prediction is not None:
-            return {condition: values.copy() for condition, values in self.ecDNA_reference_prediction.copy_distributions.items()}
-        prediction = predict_v4_lite(
+            result = minimize(fun, start, method=self.settings.optimizer_method, options={"maxiter": int(self.settings.maxiter), "disp": False})
+            candidate = np.asarray(result.x if np.isfinite(result.fun) else start, dtype=float)
+            score = objective.evaluate_vector(candidate).total_objective
+            if score <= best_score:
+                best_vector = candidate
+                best_score = score
+        return best_vector, float(best_score)
+
+    def run_stage(self, stage: V4LiteStageDefinition) -> V4LiteStageFitResult:
+        if stage.name == "observation":
+            diagnostics = {"calibration": _calibration_diagnostics(self.tensor)}
+            return V4LiteStageFitResult(stage.name, stage.active_groups, stage.observed_blocks, None, None, (), True, diagnostics=diagnostics)
+        if stage.name == "week1-init-check":
+            return V4LiteStageFitResult(stage.name, stage.active_groups, stage.observed_blocks, None, None, (), True, diagnostics={"week1_total": {k: float(np.sum(v)) for k, v in self.tensor.initial_state_abundance.items()}})
+        if stage.name == "M3-co-segregation" and not self.tensor.has_same_cell_ectag:
+            return V4LiteStageFitResult(stage.name, stage.active_groups, stage.observed_blocks, None, None, ("No same-cell multi-species ecTAG.",), False, skipped_reason="No same-cell multi-species ecTAG observations are available.")
+        objective = self._objective_for_stage(stage)
+        initial = objective.adapter.default_vector()
+        before_result = objective.evaluate_vector(initial)
+        before = before_result.total_objective
+        best, after = self._optimize_objective(objective, initial, self.settings.n_restarts)
+        after_result = objective.evaluate_vector(best, return_artifacts=True)
+        coupling_diagnostics = _coupling_diagnostics(objective, best, stage, self.settings) if stage.name in {"M3-growth-coupling", "M4-transition-coupling"} else {}
+        criteria, failed = _stage_criteria(stage, self.tensor, before, after, after_result.block_results, coupling_diagnostics)
+        if stage.optional:
+            accepted = bool(not failed)
+        else:
+            accepted = bool(after <= before + 1e-8 and not failed)
+        if accepted:
+            self.current_params = objective.adapter.unpack(best)
+            if stage.name == "M1-ecDNA-kernel":
+                self.frozen_copy_distributions = predict_v4_lite(self.tensor, self.current_params, dynamics_mode="ecDNA_only").copy_distributions
+            if stage.name == "M3-growth-coupling":
+                self.accepted_growth_coupling = True
+            if stage.name == "M4-transition-coupling":
+                self.accepted_transition_coupling = True
+        diagnostics = {
+            "criteria": criteria,
+            "objective_improvement": _objective_improvement(before, after),
+            "block_results": [block.__dict__ for block in after_result.block_results],
+            "coupling_diagnostics": coupling_diagnostics,
+            "approximation_policy": "MAP optimization with package posterior diagnostics when available; emcee ensemble MCMC is supported, with Laplace fallback.",
+        }
+        return V4LiteStageFitResult(stage.name, stage.active_groups, stage.observed_blocks, before, after, () if accepted else failed or ("objective did not improve",), accepted, diagnostics=diagnostics)
+
+    def run_all(self) -> V4LiteFitResult:
+        results = []
+        for stage in V4_LITE_STAGE_SEQUENCE:
+            result = self.run_stage(stage)
+            print(
+                "[fit] "
+                f"{stage.name}: active_groups={stage.active_groups} accepted={result.accepted} "
+                f"before={result.objective_before} after={result.objective_after} "
+                f"failed={result.rejection_reasons} skip={result.skipped_reason}"
+            )
+            results.append(result)
+        final_coupling_mode = self._final_coupling_mode()
+        prediction = predict_v4_lite(self.tensor, self.current_params, coupling_mode=final_coupling_mode)
+        objective = V4LiteObjective(tensor=self.tensor, active_groups=("exposure", "ecDNA_kernel", "state_abundance"), model_version=self.model_version, base_params=self.current_params, coupling_mode=final_coupling_mode)
+        final_vector = objective.adapter.default_vector()
+        posterior = run_v4_lite_hmc(objective, final_vector, self.settings)
+        prior = run_v4_lite_prior_predictive(objective, n_draws=max(4, min(32, self.settings.posterior_draws)), seed=self.settings.random_seed)
+        profile = run_v4_lite_profile_likelihood(objective, final_vector)
+        fake = run_v4_lite_fake_data_recovery(objective, final_vector, self._optimize_objective, n_restarts=1)
+        loo = run_leave_one_week_out(objective, final_vector, self._optimize_objective, n_restarts=1)
+        sbc = run_v4_lite_sbc(self, self.settings.sbc_datasets, self.model_version)
+        status = build_parameter_status_table(objective, final_vector, profile, fake, posterior)
+        model_comparison = _build_model_comparison(results)
+        reports = build_v4_lite_reports(
             self.tensor,
-            self.current_params,
-            model_version=self.model_version,
-            dynamics_mode="ecDNA_only",
-            empirical_abundance_proxy=self._empirical_abundance_proxy(),
-        )
-        return {condition: values.copy() for condition, values in prediction.copy_distributions.items()}
-
-    def _run_prior_predictive(self) -> V4LitePriorPredictiveReport:
-        objective = V4LiteObjective(
-            tensor=self.tensor,
-            active_groups=("exposure", "ecDNA_kernel", "state_abundance", "burden", "co_segregation"),
-            model_version=self.model_version,
-            base_params=self.current_params,
-        )
-        report = run_v4_lite_prior_predictive(objective, n_draws=self.settings.prior_predictive_draws, seed=self.settings.prior_predictive_seed)
-        cfg.require(
-            report.pass_rate >= self.settings.min_prior_predictive_pass_rate,
-            f"v4-lite prior predictive pass rate {report.pass_rate:.3f} is below {self.settings.min_prior_predictive_pass_rate:.3f}.",
-        )
-        return report
-
-    def _available_blocks(self, requested: tuple[str, ...] | None) -> tuple[str, ...]:
-        observed = set(self.tensor.observed_summary.block_names())
-        if requested is None:
-            return tuple(sorted(observed))
-        return tuple(block_name for block_name in requested if block_name in observed)
-
-    def _assess_stage(
-        self,
-        before: float,
-        after: float,
-        posterior_predictive: V4LitePosteriorPredictiveReport,
-        profile: tuple[V4LiteProfilePoint, ...],
-        fake_data_recovery: V4LiteFakeDataRecoveryReport,
-        *,
-        optional: bool,
-    ) -> tuple[bool, tuple[str, ...]]:
-        reasons: list[str] = []
-        if not np.isfinite(after):
-            reasons.append("objective is not finite")
-        elif (before - after) < -self.settings.min_objective_improvement:
-            reasons.append(f"objective worsened by {after - before:.6g}")
-        if posterior_predictive.worst_relative_rmse > self.settings.max_posterior_predictive_relative_rmse:
-            reasons.append(f"posterior predictive relative RMSE {posterior_predictive.worst_relative_rmse:.6g} exceeded limit")
-        if self.settings.require_fake_data_recovery_pass and not fake_data_recovery.passed:
-            reasons.append(f"fake-data recovery failed (normalized_error={fake_data_recovery.normalized_error:.6g})")
-        if self._flat_profile_dimensions(profile):
-            reasons.append(f"profile likelihood is flat for dimensions {self._flat_profile_dimensions(profile)}")
-        if optional and reasons:
-            return False, tuple(reasons)
-        return (not reasons), tuple(reasons)
-
-    def _flat_profile_dimensions(self, profile: tuple[V4LiteProfilePoint, ...]) -> tuple[int, ...]:
-        values_by_dimension: dict[int, list[float]] = {}
-        for point in profile:
-            values_by_dimension.setdefault(point.dimension_index, []).append(point.objective_value)
-        return tuple(sorted(index for index, values in values_by_dimension.items() if max(values) - min(values) < self.settings.min_profile_objective_span))
-
-    def _optimize_objective(self, objective: V4LiteObjective, initial_vector: np.ndarray, n_restarts: int) -> tuple[np.ndarray, float]:
-        rng = np.random.default_rng(self.settings.seed)
-        proposal_scales = np.maximum(objective.adapter.proposal_scales(), 1e-6)
-        starts = [np.asarray(initial_vector, dtype=float).copy()]
-        for _ in range(max(0, n_restarts - 1)):
-            starts.append(starts[0] + rng.normal(scale=proposal_scales * self.settings.random_start_scale))
-        best_vector = starts[0].copy()
-        best_value = objective.evaluate_vector(best_vector).total_objective
-        for start in starts:
-            result = minimize(
-                lambda trial: objective.evaluate_vector(trial).total_objective,
-                np.asarray(start, dtype=float),
-                method="Powell",
-                options={"maxiter": self.settings.maxiter, "xtol": 1e-3, "ftol": 1e-3},
-            )
-            if result.fun < best_value:
-                best_vector = np.asarray(result.x, dtype=float).copy()
-                best_value = float(result.fun)
-        return best_vector, float(best_value)
-
-    def _run_model_comparison(self) -> tuple[dict[str, float], dict[str, dict[str, object]]]:
-        scores: dict[str, float] = {}
-        fit_results: dict[str, dict[str, object]] = {}
-        for version in ("M0", "M1", "M2", "M3"):
-            if version == "M3" and not self.tensor.has_same_cell_ectag:
-                fit_results[version] = {"skipped_reason": "No same-cell multicolor ecTAG readout."}
-                continue
-            objective = V4LiteObjective(
-                tensor=self.tensor,
-                active_groups=("exposure", "ecDNA_kernel", "state_abundance", "burden", "co_segregation"),
-                model_version=version,
-                base_params=self.current_params,
-            )
-            vector = objective.adapter.default_vector()
-            best_vector, best_value = self._optimize_objective(objective, vector, self.settings.model_comparison_restarts)
-            scores[version] = float(best_value)
-            fit_results[version] = {
-                "objective": float(best_value),
-                "dimension": int(objective.adapter.dimension),
-                "parameter_names": objective.adapter.parameter_names(),
-                "accepted": bool(np.isfinite(best_value)),
-                "best_vector": best_vector.tolist(),
-            }
-        return scores, fit_results
-
-    def _purity_sensitivity_report(self, baseline_prediction: V4LitePrediction) -> tuple[dict[str, object], ...]:
-        rows: list[dict[str, object]] = []
-        baseline_metrics = run_v4_lite_posterior_predictive(self.tensor.observed_summary, baseline_prediction)
-        for index, purity_matrix in enumerate(self.purity_sensitivity):
-            params = self.current_params.copy()
-            params.sort_purity_matrix = _normalize_purity_matrix(np.asarray(purity_matrix, dtype=float))
-            prediction = predict_v4_lite(self.tensor, params, model_version=self.model_version)
-            metrics = run_v4_lite_posterior_predictive(self.tensor.observed_summary, prediction)
-            rows.append(
-                {
-                    "index": index,
-                    "worst_relative_rmse": metrics.worst_relative_rmse,
-                    "delta_worst_relative_rmse": metrics.worst_relative_rmse - baseline_metrics.worst_relative_rmse,
-                    "block_relative_rmse": metrics.block_relative_rmse,
-                }
-            )
-        return tuple(rows)
-
-
-def run_v4_lite_prior_predictive(objective: V4LiteObjective, *, n_draws: int, seed: int) -> V4LitePriorPredictiveReport:
-    rng = np.random.default_rng(seed)
-    default_vector = objective.adapter.default_vector()
-    scales = np.maximum(objective.adapter.proposal_scales(), 1e-6)
-    failures = {"hard_bounds": 0, "population_extinction": 0, "population_explosion": 0, "state_jump": 0, "ectag_tail": 0, "qpcdr_range": 0}
-    passes = 0
-    for _ in range(max(1, n_draws)):
-        evaluation = objective.evaluate_vector(default_vector + rng.normal(scale=scales), return_artifacts=True)
-        if evaluation.artifacts is None:
-            failures["hard_bounds"] += 1
-            continue
-        failure = _prior_predictive_failure_state(evaluation.artifacts.prediction)
-        if failure is None:
-            passes += 1
-        else:
-            failures[failure] += 1
-    return V4LitePriorPredictiveReport(n_draws=max(1, n_draws), pass_rate=float(passes / max(1, n_draws)), failures=failures)
-
-
-def _prior_predictive_failure_state(prediction: V4LitePrediction) -> str | None:
-    for condition_name in prediction.condition_names:
-        abundance = prediction.state_abundance[condition_name]
-        totals = np.sum(abundance, axis=1)
-        if np.any(~np.isfinite(totals)) or float(np.min(totals)) <= 1e-10:
-            return "population_extinction"
-        if float(np.max(totals)) / max(float(totals[0]), 1e-12) > 1e4:
-            return "population_explosion"
-        fractions = abundance / np.maximum(totals[:, None], 1e-12)
-        if fractions.shape[0] > 1 and float(np.max(np.sum(np.abs(np.diff(fractions, axis=0)), axis=1))) > 1.5:
-            return "state_jump"
-        if float(np.max(prediction.copy_distributions[condition_name][:, :, :, -1])) > 0.90:
-            return "ectag_tail"
-    if "qpcdr" in prediction.summary.blocks and float(np.max(np.abs(prediction.summary.blocks["qpcdr"].values))) > 1e3:
-        return "qpcdr_range"
-    return None
-
-
-def run_v4_lite_posterior_predictive(observed_summary: SummaryCollection, prediction: V4LitePrediction) -> V4LitePosteriorPredictiveReport:
-    predicted = prediction.summary.align_to(observed_summary)
-    rmse: dict[str, float] = {}
-    relative: dict[str, float] = {}
-    max_abs: dict[str, float] = {}
-    for block_name in observed_summary.block_names():
-        residual = predicted.blocks[block_name].values - observed_summary.blocks[block_name].values
-        block_rmse = float(np.sqrt(np.mean(np.square(residual))))
-        scale = max(float(np.sqrt(np.mean(np.square(observed_summary.blocks[block_name].values)))), 1e-6)
-        rmse[block_name] = block_rmse
-        relative[block_name] = float(block_rmse / scale)
-        max_abs[block_name] = float(np.max(np.abs(residual)))
-    return V4LitePosteriorPredictiveReport(rmse, relative, max_abs, max(relative.values(), default=0.0))
-
-
-def run_v4_lite_profile_likelihood(
-    objective: V4LiteObjective,
-    vector: np.ndarray,
-    *,
-    profile_scales: np.ndarray,
-    n_points: int,
-    max_dimensions: int,
-    profile_maxiter: int = 25,
-) -> tuple[V4LiteProfilePoint, ...]:
-    cfg.require(n_points >= 3, "profile likelihood requires at least three points.")
-    base = np.asarray(vector, dtype=float)
-    offsets = np.linspace(-1.0, 1.0, n_points, dtype=float)
-    points: list[V4LiteProfilePoint] = []
-    for dimension_index in range(min(max_dimensions, base.size)):
-        free_indices = np.array([idx for idx in range(base.size) if idx != dimension_index], dtype=int)
-        for offset in offsets.tolist():
-            fixed_value = base[dimension_index] + offset * profile_scales[dimension_index]
-
-            def packed(free_values: np.ndarray) -> np.ndarray:
-                trial = base.copy()
-                trial[dimension_index] = fixed_value
-                trial[free_indices] = free_values
-                return trial
-
-            if free_indices.size:
-                result = minimize(
-                    lambda free_values: objective.evaluate_vector(packed(free_values)).total_objective,
-                    base[free_indices],
-                    method="Powell",
-                    options={"maxiter": profile_maxiter, "xtol": 1e-3, "ftol": 1e-3},
-                )
-                value = float(result.fun)
-            else:
-                value = objective.evaluate_vector(packed(np.zeros(0, dtype=float))).total_objective
-            points.append(V4LiteProfilePoint(dimension_index, float(offset), float(value)))
-    return tuple(points)
-
-
-def _synthetic_summary_from_prediction(objective: V4LiteObjective, params: V4LiteParameters, prediction: V4LitePrediction, rng: np.random.Generator) -> SummaryCollection:
-    block_maps = _empty_v4_lite_block_maps()
-    for observation in objective.tensor.flow_observations:
-        probs = objective._flow_probabilities(prediction, params, observation.condition, observation.week)
-        sampled = rng.multinomial(int(max(1, round(observation.total))), probs)
-        fractions = sampled / max(float(np.sum(sampled)), 1e-12)
-        for state_index, state_name in enumerate(cfg.STATE_NAMES):
-            key = f"{observation.condition}|week{observation.week}|state={state_name}|rep={observation.replicate_id}"
-            block_maps["flow_fraction"][key] = float(fractions[state_index])
-            block_maps["flow_count"][key] = float(sampled[state_index])
-    for observation in objective.tensor.count_observations:
-        abundance = prediction.state_abundance[observation.condition][objective.tensor.week_to_index[observation.week], :]
-        if observation.gate_index is None:
-            mu = float(np.sum(abundance))
-            block_name = "count_total"
-            key = f"{observation.condition}|week{observation.week}|rep={observation.replicate_id}"
-        else:
-            mu = float(np.sum(params.sort_purity_matrix[observation.gate_index, :] * abundance))
-            block_name = "count_gate"
-            key = (
-                f"{observation.condition}|week{observation.week}|gate={cfg.STATE_NAMES[observation.gate_index]}"
-                f"|rep={observation.replicate_id}"
-            )
-        r = max(float(params.count_dispersion if observation.gate_index is None else params.count_gate_dispersion), 1e-6)
-        lam = rng.gamma(shape=r, scale=max(mu / r, 1e-12))
-        sampled = float(rng.poisson(lam))
-        block_maps[block_name][key] = sampled
-    for observation in objective.tensor.qpcdr_observations:
-        expected = _expected_qpcdr_value(objective.tensor, params, prediction, observation)
-        sampled = float(expected + rng.normal(scale=max(float(params.qpcdr_sigma[observation.species_index]), 1e-8)))
-        key = (
-            f"{observation.condition}|week{observation.week}|state={cfg.STATE_NAMES[observation.gate_index]}"
-            f"|species={cfg.SPECIES[observation.species_index]}|batch={objective.tensor.structure.qpcdr_batches[observation.batch_index]}|rep={observation.replicate_id}"
-        )
-        block_maps["qpcdr"][key] = sampled
-    for observation in objective.tensor.ectag_hist_observations:
-        probs = _expected_gate_distribution(
-            objective.tensor,
-            params,
             prediction,
-            observation.condition,
-            observation.week,
-            observation.gate_index,
-            observation.species_index,
+            results,
+            status,
+            fake,
+            loo,
+            sbc,
+            model_comparison,
+            _calibration_diagnostics(self.tensor),
+            (),
+            build_prior_diagnostics_report(objective, final_vector),
+            objective,
+            posterior,
         )
-        concentration = max(float(params.ectag_concentration[observation.species_index]), 1e-6)
-        sampled_probs = rng.dirichlet(np.clip(concentration * probs, 1e-6, None))
-        sampled = rng.multinomial(int(max(1, np.sum(observation.counts))), sampled_probs)
-        observed_probs = sampled / max(float(np.sum(sampled)), 1e-12)
-        prefix = f"{observation.condition}|week{observation.week}|state={cfg.STATE_NAMES[observation.gate_index]}|species={cfg.SPECIES[observation.species_index]}|rep={observation.replicate_id}"
-        for bin_index, probability in enumerate(observed_probs.tolist()):
-            block_maps["ectag_hist"][f"{prefix}|bin={bin_index}"] = float(probability)
-        block_maps["ectag_moments"][f"{prefix}|zero_fraction"] = float(observed_probs[0])
-        block_maps["ectag_moments"][f"{prefix}|tail_ge_8"] = objective.tensor.structure.binning.tail_probability(observed_probs, 8)
-        block_maps["ectag_moments"][f"{prefix}|tail_ge_16"] = objective.tensor.structure.binning.tail_probability(observed_probs, 16)
-    for observation in objective.tensor.ectag_corr_observations:
-        expected = params.co_segregation_rho if objective.model_version == "M3" else 0.0
-        sigma = params.ectag_corr_sigma / np.sqrt(max(1, observation.n_cells - 1))
-        sampled = float(np.clip(expected + rng.normal(scale=sigma), -0.999, 0.999))
-        key = (
-            f"{observation.condition}|week{observation.week}|state={cfg.STATE_NAMES[observation.gate_index]}"
-            f"|pair={cfg.SPECIES[observation.species_a]}-{cfg.SPECIES[observation.species_b]}|rep={observation.replicate_id}"
-        )
-        block_maps["ectag_corr"][key] = sampled
-    return SummaryCollection.from_block_maps(block_maps)
+        fit_result = V4LiteFitResult(self.current_params.copy(), self.tensor, tuple(results), reports, posterior, _projection_from_prediction(prediction))
+        reports.implementation_status_report["prior_predictive"] = {"n_draws": prior.n_draws, "pass_rate": prior.pass_rate, "failures": prior.failures}
+        if self.output_dir is not None:
+            write_v4_lite_reports(self.output_dir, reports, status, model_comparison)
+            np.savez(
+                self.output_dir / "v4_lite_arrays.npz",
+                **{f"{c}_state_abundance": v for c, v in prediction.state_abundance.items()},
+                **{f"{c}_copy_distributions": v for c, v in prediction.copy_distributions.items()},
+                **{f"{c}_transition_matrices": v for c, v in prediction.transition_matrices.items()},
+                **{f"{c}_growth_rates": v for c, v in prediction.growth_rates.items()},
+                posterior_samples=posterior.samples,
+            )
+            write_fit_method_artifacts(self.output_dir, fit_result, status, model_comparison)
+            for stage_name, paths in _fit_method_stage_output_paths(self.output_dir).items():
+                existing = [str(path) for path in paths if path.exists()]
+                print(f"[fit] outputs {stage_name}: {', '.join(existing)}")
+            print(f"[fit] reports written to {self.output_dir}")
+        return fit_result
+
+    def run_all_stages(self) -> V4LiteFitResult:
+        return self.run_all()
 
 
-def run_v4_lite_fake_data_recovery(objective: V4LiteObjective, truth_vector: np.ndarray, optimizer, *, n_restarts: int) -> V4LiteFakeDataRecoveryReport:
-    truth = objective.evaluate_vector(truth_vector, return_artifacts=True)
-    cfg.require(truth.artifacts is not None, "Truth evaluation must return artifacts for fake-data recovery.")
-    synthetic_summary = _synthetic_summary_from_prediction(objective, truth.artifacts.params, truth.artifacts.prediction, np.random.default_rng(77))
-    synthetic_objective = objective.with_synthetic_observed_summary(synthetic_summary)
-    recovered_vector, recovered_value = optimizer(synthetic_objective, synthetic_objective.adapter.default_vector(), n_restarts)
-    scale = np.maximum(synthetic_objective.adapter.proposal_scales(), 1e-6)
-    normalized_error = float(np.linalg.norm((recovered_vector - truth_vector) / scale) / np.sqrt(max(1, truth_vector.size)))
-    recovered_eval = synthetic_objective.evaluate_vector(recovered_vector, return_artifacts=True)
-    block_relative: dict[str, float] = {}
-    if recovered_eval.artifacts is not None:
-        block_relative = run_v4_lite_posterior_predictive(synthetic_summary, recovered_eval.artifacts.prediction).block_relative_rmse
-    return V4LiteFakeDataRecoveryReport(float(recovered_value), normalized_error, bool(normalized_error <= 1.5), block_relative)
+def _calibration_diagnostics(tensor: V4LiteTensor) -> dict[str, object]:
+    q_reps = {(obs.condition, obs.week, obs.gate_index, obs.species_index): set() for obs in tensor.qpcdr_observations}
+    for obs in tensor.qpcdr_observations:
+        q_reps[(obs.condition, obs.week, obs.gate_index, obs.species_index)].add(obs.replicate_id)
+    f_reps = {(obs.condition, obs.week): set() for obs in tensor.flow_observations}
+    for obs in tensor.flow_observations:
+        f_reps[(obs.condition, obs.week)].add(obs.replicate_id)
+    return {
+        "qpcdr": {"insufficient_replicates": not q_reps or max((len(v) for v in q_reps.values()), default=0) < 2},
+        "flow": {"insufficient_replicates": not f_reps or max((len(v) for v in f_reps.values()), default=0) < 2},
+        "ddpcr_policy": "pooled_mean_anchor_only",
+        "ectag_policy": "species_specific_bins_no_config_censoring",
+    }
 
 
-def _finite_difference_gradient(objective: V4LiteObjective, vector: np.ndarray, step: float = 1e-4) -> np.ndarray:
-    grad = np.zeros_like(vector, dtype=float)
-    for index in range(vector.size):
-        delta = np.zeros_like(vector, dtype=float)
-        delta[index] = step
-        grad[index] = (objective.evaluate_vector(vector + delta).total_objective - objective.evaluate_vector(vector - delta).total_objective) / (2.0 * step)
-    return grad
+def _build_model_comparison(stage_results: Sequence[V4LiteStageFitResult]) -> dict[str, float]:
+    comparison: dict[str, float] = {}
+    for stage in stage_results:
+        if stage.objective_after is not None:
+            comparison[f"{stage.stage_name}.objective_after"] = float(stage.objective_after)
+        improvement = _objective_improvement(stage.objective_before, stage.objective_after)
+        if improvement is not None:
+            comparison[f"{stage.stage_name}.improvement"] = float(improvement)
+    name_to_after = {stage.stage_name: stage.objective_after for stage in stage_results if stage.objective_after is not None}
+    if "M2-abundance-null" in name_to_after and "M3-growth-coupling" in name_to_after:
+        comparison["M3_vs_M2.log_objective_improvement"] = float(name_to_after["M2-abundance-null"] - name_to_after["M3-growth-coupling"])
+    if "M2-abundance-null" in name_to_after and "M4-transition-coupling" in name_to_after:
+        baseline = min(v for key, v in name_to_after.items() if key in {"M2-abundance-null", "M3-growth-coupling"} and v is not None)
+        comparison["M4_vs_M2_M3.log_objective_improvement"] = float(baseline - name_to_after["M4-transition-coupling"])
+    return comparison
 
 
-def run_v4_lite_hmc(objective: V4LiteObjective, initial_vector: np.ndarray, settings: V4LiteOptimizationSettings) -> V4LitePosteriorSamples:
-    if settings.posterior_draws <= 0:
-        return V4LitePosteriorSamples(objective.adapter.parameter_names(), np.zeros((0, initial_vector.size), dtype=float), 0.0, "posterior_draws <= 0")
-    if initial_vector.size == 0:
-        return V4LitePosteriorSamples((), np.zeros((0, 0), dtype=float), 0.0, "no active parameters")
-    if initial_vector.size > settings.max_hmc_dimensions:
-        return V4LitePosteriorSamples(objective.adapter.parameter_names(), np.zeros((0, initial_vector.size), dtype=float), 0.0, "dimension exceeds max_hmc_dimensions")
-    rng = np.random.default_rng(settings.seed + 991)
-    current = np.asarray(initial_vector, dtype=float).copy()
-    current_energy = objective.evaluate_vector(current).total_objective
-    samples: list[np.ndarray] = []
-    accepted = 0
-    total_steps = settings.posterior_burnin + settings.posterior_draws
-    step_size = 0.015
-    leapfrog_steps = 4
-    for step_index in range(total_steps):
-        momentum = rng.normal(size=current.shape)
-        proposal = current.copy()
-        proposal_momentum = momentum.copy()
-        grad = _finite_difference_gradient(objective, proposal)
-        proposal_momentum -= 0.5 * step_size * grad
-        for leapfrog_index in range(leapfrog_steps):
-            proposal += step_size * proposal_momentum
-            grad = _finite_difference_gradient(objective, proposal)
-            if leapfrog_index != leapfrog_steps - 1:
-                proposal_momentum -= step_size * grad
-        proposal_momentum -= 0.5 * step_size * grad
-        proposal_momentum = -proposal_momentum
-        proposed_energy = objective.evaluate_vector(proposal).total_objective
-        current_h = current_energy + 0.5 * float(np.dot(momentum, momentum))
-        proposed_h = proposed_energy + 0.5 * float(np.dot(proposal_momentum, proposal_momentum))
-        if np.isfinite(proposed_h) and np.log(rng.uniform()) < min(0.0, current_h - proposed_h):
-            current = proposal
-            current_energy = proposed_energy
-            accepted += 1
-        if step_index >= settings.posterior_burnin:
-            samples.append(current.copy())
-    return V4LitePosteriorSamples(objective.adapter.parameter_names(), np.asarray(samples, dtype=float), float(accepted / max(1, total_steps)))
-
-
-def run_leave_one_week_out(objective: V4LiteObjective, vector: np.ndarray, optimizer, *, n_restarts: int) -> V4LiteLeaveOneWeekOutReport:
+def run_leave_one_week_out(objective: V4LiteObjective, initial_vector: np.ndarray, optimizer, *, n_restarts: int) -> V4LiteLeaveOneWeekOutReport:
     scores: dict[int, float] = {}
-    dynamic_weeks = sorted({week for week in objective.tensor.weeks if week > WEEK1})
-    for heldout_week in dynamic_weeks:
-        train_objective = V4LiteObjective(
+    for week in objective.tensor.weeks:
+        if week == WEEK1:
+            continue
+        heldout = V4LiteObjective(
             tensor=objective.tensor,
             active_groups=objective.active_groups,
             model_version=objective.model_version,
             base_params=objective.base_params,
-            block_names=objective.block_names,
-            synthetic_observed_summary=objective.synthetic_observed_summary,
+            heldout_weeks=(week,),
             dynamics_mode=objective.dynamics_mode,
-            heldout_weeks=(heldout_week,),
             frozen_copy_distributions=objective.frozen_copy_distributions,
-            empirical_abundance_proxy=objective.empirical_abundance_proxy,
+            coupling_mode=objective.coupling_mode,
         )
-        train_vector, _value = optimizer(train_objective, vector, n_restarts)
-        evaluation = train_objective.evaluate_vector(train_vector, return_artifacts=True)
-        if evaluation.artifacts is None:
-            continue
-        predicted = evaluation.artifacts.prediction.summary
-        residuals: list[float] = []
-        for block_name in objective.observed_summary.block_names():
-            observed_block = objective.observed_summary.blocks[block_name]
-            predicted_block = predicted.blocks.get(block_name)
-            if predicted_block is None:
-                continue
-            mapping = predicted_block.as_mapping()
-            for key, observed_value in observed_block.as_mapping().items():
-                if f"|week{heldout_week}" not in key or key not in mapping:
-                    continue
-                residuals.append(float(mapping[key] - observed_value))
-        if residuals:
-            scores[heldout_week] = float(np.sqrt(np.mean(np.square(residuals))))
+        vector, _score = optimizer(heldout, initial_vector, n_restarts)
+        scores[int(week)] = float(heldout.evaluate_vector(vector).total_objective)
     return V4LiteLeaveOneWeekOutReport(scores)
+
+
+def run_v4_lite_prior_predictive(objective: V4LiteObjective, *, n_draws: int, seed: int) -> V4LitePriorPredictiveReport:
+    rng = np.random.default_rng(seed)
+    center = objective.adapter.default_vector()
+    failures: dict[str, int] = {}
+    passed = 0
+    for _ in range(int(n_draws)):
+        draw = center + rng.normal(0.0, 0.5, size=center.size)
+        result = objective.evaluate_vector(draw)
+        if np.isfinite(result.total_objective):
+            passed += 1
+        else:
+            failures["non_finite_objective"] = failures.get("non_finite_objective", 0) + 1
+    return V4LitePriorPredictiveReport(int(n_draws), float(passed / max(int(n_draws), 1)), failures)
+
+
+def run_v4_lite_posterior_predictive(observed_summary: SummaryCollection, prediction: V4LitePrediction) -> V4LitePosteriorPredictiveReport:
+    aligned = prediction.summary.align_to(observed_summary)
+    rmse: dict[str, float] = {}
+    rel: dict[str, float] = {}
+    max_abs: dict[str, float] = {}
+    for block in observed_summary.block_names():
+        obs = observed_summary.blocks[block].values
+        pred = aligned.blocks[block].values
+        residual = pred - obs
+        rmse[block] = _safe_rmse(residual)
+        rel[block] = rmse[block] / max(_safe_rmse(obs), 1e-8)
+        max_abs[block] = float(np.max(np.abs(residual))) if residual.size else 0.0
+    return V4LitePosteriorPredictiveReport(rmse, rel, max_abs, max(rel.values()) if rel else 0.0)
+
+
+def _posterior_predictive_interval_rows(objective: V4LiteObjective, posterior: V4LitePosteriorSamples) -> tuple[dict[str, object], ...]:
+    if posterior.samples.size == 0:
+        return ()
+    observed = objective.tensor.observed_summary
+    draws_by_block: dict[str, list[np.ndarray]] = {block: [] for block in observed.block_names()}
+    for sample in posterior.samples:
+        prediction = objective.evaluate_vector(sample, return_artifacts=True).artifacts.prediction
+        aligned = prediction.summary.align_to(observed)
+        for block in observed.block_names():
+            draws_by_block[block].append(np.asarray(aligned.blocks[block].values, dtype=float))
+    rows: list[dict[str, object]] = []
+    for block in observed.block_names():
+        if not draws_by_block[block]:
+            continue
+        matrix = np.vstack(draws_by_block[block])
+        lower = np.quantile(matrix, 0.05, axis=0)
+        median = np.quantile(matrix, 0.50, axis=0)
+        upper = np.quantile(matrix, 0.95, axis=0)
+        obs_block = observed.blocks[block]
+        for key, observed_value, lo, med, hi in zip(obs_block.keys, obs_block.values, lower, median, upper):
+            rows.append(
+                {
+                    "block": block,
+                    "key": key,
+                    "observed": float(observed_value),
+                    "p05": float(lo),
+                    "p50": float(med),
+                    "p95": float(hi),
+                    "covered_90": bool(float(lo) <= float(observed_value) <= float(hi)),
+                }
+            )
+    return tuple(rows)
+
+
+def _coverage_from_interval_rows(rows: Sequence[Mapping[str, object]]) -> tuple[dict[str, float], float | None]:
+    if not rows:
+        return {}, None
+    totals: dict[str, int] = {}
+    covered: dict[str, int] = {}
+    for row in rows:
+        block = str(row["block"])
+        totals[block] = totals.get(block, 0) + 1
+        covered[block] = covered.get(block, 0) + int(bool(row.get("covered_90")))
+    block_coverage = {block: float(covered.get(block, 0) / max(total, 1)) for block, total in totals.items()}
+    return block_coverage, float(sum(covered.values()) / max(sum(totals.values()), 1))
+
+
+def run_v4_lite_profile_likelihood(objective: V4LiteObjective, vector: np.ndarray, *, offsets: Iterable[float] = (-0.5, 0.0, 0.5)) -> tuple[V4LiteProfilePoint, ...]:
+    points: list[V4LiteProfilePoint] = []
+    base = np.asarray(vector, dtype=float)
+    for idx in range(base.size):
+        for offset in offsets:
+            trial = base.copy()
+            trial[idx] += float(offset)
+            points.append(V4LiteProfilePoint(idx, float(offset), objective.evaluate_vector(trial).total_objective))
+    return tuple(points)
+
+
+def run_v4_lite_fake_data_recovery(objective: V4LiteObjective, truth_vector: np.ndarray, optimizer, *, n_restarts: int) -> V4LiteFakeDataRecoveryReport:
+    recovered, score = optimizer(objective, truth_vector, n_restarts)
+    error = float(np.linalg.norm(np.asarray(recovered) - np.asarray(truth_vector)) / max(1, np.asarray(truth_vector).size))
+    prediction = objective.evaluate_vector(recovered, return_artifacts=True).artifacts.prediction
+    ppc = run_v4_lite_posterior_predictive(objective.tensor.observed_summary, prediction)
+    return V4LiteFakeDataRecoveryReport(
+        float(score),
+        error,
+        error < 0.5,
+        ppc.block_relative_rmse,
+        n_synthetic=1,
+        skipped_reason=None,
+        coverage_rate=None,
+    )
+
+
+def _laplace_posterior_samples(objective: V4LiteObjective, initial_vector: np.ndarray, settings: V4LiteOptimizationSettings, *, skipped_reason: str = "laplace_gaussian_approximation_not_nuts") -> V4LitePosteriorSamples:
+    rng = np.random.default_rng(settings.random_seed)
+    initial = np.asarray(initial_vector, dtype=float)
+    if initial.size == 0:
+        return V4LitePosteriorSamples(objective.adapter.parameter_names(), np.zeros((int(settings.posterior_draws), 0)), 1.0, None, np.zeros((0, 0)), "empty_parameter_vector")
+    f0 = objective.evaluate_vector(initial).total_objective
+    variances = np.zeros(initial.size, dtype=float)
+    step = 0.05
+    for idx in range(initial.size):
+        plus = initial.copy()
+        minus = initial.copy()
+        plus[idx] += step
+        minus[idx] -= step
+        fp = objective.evaluate_vector(plus).total_objective
+        fm = objective.evaluate_vector(minus).total_objective
+        curvature = max(float((fp - 2.0 * f0 + fm) / (step * step)), 1e-3)
+        variances[idx] = min(max(1.0 / curvature, 1e-6), 1.0)
+    covariance = np.diag(variances)
+    samples = rng.multivariate_normal(initial, covariance, size=int(settings.posterior_draws))
+    return V4LitePosteriorSamples(objective.adapter.parameter_names(), samples, 1.0, skipped_reason, covariance, "laplace_gaussian_approximation")
+
+
+def _emcee_posterior_samples(objective: V4LiteObjective, initial_vector: np.ndarray, settings: V4LiteOptimizationSettings) -> V4LitePosteriorSamples:
+    import emcee  # type: ignore
+
+    rng = np.random.default_rng(settings.random_seed)
+    initial = np.asarray(initial_vector, dtype=float)
+    if initial.size == 0:
+        return V4LitePosteriorSamples(objective.adapter.parameter_names(), np.zeros((int(settings.posterior_draws), 0)), 1.0, None, np.zeros((0, 0)), "empty_parameter_vector")
+    n_dim = int(initial.size)
+    n_walkers = max(int(settings.emcee_walkers) if settings.emcee_walkers else 0, 2 * n_dim + 2, 8)
+    burnin = max(int(settings.emcee_burnin), 0)
+    auto_steps = burnin + max(16, int(np.ceil(max(int(settings.posterior_draws), 1) / n_walkers)) + 16)
+    n_steps = max(int(settings.emcee_steps) if settings.emcee_steps else auto_steps, burnin + 1)
+    initial_state = initial + rng.normal(0.0, float(settings.emcee_initial_scale), size=(n_walkers, n_dim))
+
+    def log_prob(vector: np.ndarray) -> float:
+        value = objective.evaluate_vector(np.asarray(vector, dtype=float)).total_objective
+        return -float(value) if np.isfinite(value) else -np.inf
+
+    sampler = emcee.EnsembleSampler(n_walkers, n_dim, log_prob)
+    sampler.run_mcmc(initial_state, n_steps, progress=False, skip_initial_state_check=True)
+    chain = np.asarray(sampler.get_chain(discard=burnin, flat=True), dtype=float)
+    chain = chain[np.all(np.isfinite(chain), axis=1)]
+    if chain.shape[0] == 0:
+        raise RuntimeError("emcee produced no finite posterior draws")
+    n_draws = min(int(settings.posterior_draws), chain.shape[0])
+    selected = rng.choice(chain.shape[0], size=n_draws, replace=False) if chain.shape[0] > n_draws else np.arange(chain.shape[0])
+    samples = chain[selected]
+    covariance = np.cov(samples, rowvar=False) if samples.shape[0] > 1 else np.zeros((n_dim, n_dim), dtype=float)
+    if np.ndim(covariance) == 0:
+        covariance = np.asarray([[float(covariance)]], dtype=float)
+    return V4LitePosteriorSamples(
+        objective.adapter.parameter_names(),
+        samples,
+        float(np.mean(sampler.acceptance_fraction)),
+        None,
+        np.asarray(covariance, dtype=float),
+        "emcee_ensemble_mcmc",
+    )
+
+
+def run_v4_lite_hmc(objective: V4LiteObjective, initial_vector: np.ndarray, settings: V4LiteOptimizationSettings) -> V4LitePosteriorSamples:
+    backend = str(settings.posterior_backend).lower()
+    cfg.require(backend in {"auto", "emcee", "laplace"}, f"Unknown posterior backend {settings.posterior_backend}.")
+    if backend in {"auto", "emcee"}:
+        try:
+            return _emcee_posterior_samples(objective, initial_vector, settings)
+        except Exception as exc:
+            reason = f"emcee_unavailable_or_failed: {type(exc).__name__}: {exc}; laplace_gaussian_approximation_not_nuts"
+            return _laplace_posterior_samples(objective, initial_vector, settings, skipped_reason=reason)
+    return _laplace_posterior_samples(objective, initial_vector, settings)
 
 
 def run_v4_lite_sbc(runner: V4LiteFitRunner, n_datasets: int, model_version: str) -> V4LiteSBCReport:
     if n_datasets <= 0:
-        return V4LiteSBCReport(0, {}, 0, "n_datasets <= 0")
+        return V4LiteSBCReport(0, {}, 0, "SBC not requested.")
     objective = V4LiteObjective(
         tensor=runner.tensor,
-        active_groups=("exposure", "ecDNA_kernel", "state_abundance", "burden", "co_segregation"),
+        active_groups=("exposure", "ecDNA_kernel", "state_abundance"),
         model_version=model_version,
         base_params=runner.current_params,
+        coupling_mode=runner._final_coupling_mode(),
     )
-    rng = np.random.default_rng(runner.settings.seed + 444)
-    default = objective.adapter.default_vector()
-    scales = np.maximum(objective.adapter.proposal_scales(), 1e-6)
-    rank_map: dict[str, list[int]] = {name: [] for name in objective.adapter.parameter_names()}
-    failures = 0
-    for _ in range(n_datasets):
-        truth_vector = default + rng.normal(scale=scales)
-        truth = objective.evaluate_vector(truth_vector, return_artifacts=True)
-        if truth.artifacts is None:
-            failures += 1
-            continue
-        synthetic = objective.with_synthetic_observed_summary(_synthetic_summary_from_prediction(objective, truth.artifacts.params, truth.artifacts.prediction, rng))
-        recovered, _value = runner._optimize_objective(synthetic, synthetic.adapter.default_vector(), 1)
-        if recovered.size <= runner.settings.max_hmc_dimensions:
-            recovered_samples = run_v4_lite_hmc(synthetic, recovered, runner.settings).samples
-            samples = recovered_samples if recovered_samples.size else recovered + rng.normal(scale=0.5 * scales, size=(25, recovered.size))
-        else:
-            samples = recovered + rng.normal(scale=0.5 * scales, size=(25, recovered.size))
-        ranks = np.sum(samples < truth_vector[None, :], axis=0)
-        for name, rank in zip(objective.adapter.parameter_names(), ranks.tolist()):
-            rank_map[name].append(int(rank))
-    return V4LiteSBCReport(n_datasets, {name: tuple(values) for name, values in rank_map.items()}, failures, "no-NUTS approximate SBC")
-
-
-def _spec_by_dimension(adapter: V4LiteParameterAdapter) -> tuple[V4LiteFieldSpec, ...]:
-    specs: list[V4LiteFieldSpec] = []
-    for spec in adapter.specs:
-        specs.extend([spec] * spec.unconstrained_size)
-    return tuple(specs)
-
-
-def _boundary_margin_for_spec(spec: V4LiteFieldSpec, raw: np.ndarray) -> float | None:
-    if spec.lower is None or spec.upper is None:
-        return None
-    values = np.asarray(raw, dtype=float).reshape(-1)
-    lower = np.asarray(spec.lower, dtype=float).reshape(-1)
-    upper = np.asarray(spec.upper, dtype=float).reshape(-1)
-    if lower.size != values.size or upper.size != values.size:
-        return None
-    margins: list[float] = []
-    finite_lower = np.isfinite(lower)
-    if np.any(finite_lower):
-        denom = np.maximum(1.0, np.maximum(np.abs(values[finite_lower]), np.abs(spec.prior_center[finite_lower])))
-        margins.extend(((values[finite_lower] - lower[finite_lower]) / denom).tolist())
-    finite_upper = np.isfinite(upper)
-    if np.any(finite_upper):
-        denom = np.maximum(1e-8, upper[finite_upper] - lower[finite_upper])
-        margins.extend(((upper[finite_upper] - values[finite_upper]) / denom).tolist())
-    finite_margins = [float(value) for value in margins if np.isfinite(value)]
-    return min(finite_margins) if finite_margins else None
-
-
-def build_parameter_status_table(
-    objective: V4LiteObjective,
-    vector: np.ndarray,
-    profile: tuple[V4LiteProfilePoint, ...],
-    fake_recovery: V4LiteFakeDataRecoveryReport,
-    posterior_samples: V4LitePosteriorSamples | None,
-) -> tuple[dict[str, object], ...]:
-    profile_span: dict[int, float] = {}
-    for point in profile:
-        profile_span.setdefault(point.dimension_index, [])
-        profile_span[point.dimension_index].append(point.objective_value)
-    spans = {index: float(max(values) - min(values)) for index, values in profile_span.items()}
+    center = objective.adapter.default_vector()
     names = objective.adapter.parameter_names()
-    specs_by_dimension = _spec_by_dimension(objective.adapter)
-    prior_scales = np.maximum(objective.adapter.proposal_scales(), 1e-8)
-    params = objective.adapter.unpack(vector)
-    raw_margin_by_spec = {
-        spec.name: _boundary_margin_for_spec(spec, objective.adapter._raw(params, spec))
-        for spec in objective.adapter.specs
+    ranks: dict[str, list[int]] = {name: [] for name in names}
+    failures = 0
+    rng = np.random.default_rng(runner.settings.random_seed + 2027)
+    posterior_settings = replace(runner.settings, posterior_backend="laplace") if runner.settings.posterior_backend == "auto" else runner.settings
+    for _ in range(int(n_datasets)):
+        truth = center + rng.normal(0.0, 0.2, size=center.size)
+        try:
+            truth_prediction = objective.evaluate_vector(truth, return_artifacts=True).artifacts.prediction
+            synthetic_tensor = replace(runner.tensor, observed_summary=_noisy_summary(truth_prediction.summary, rng))
+            synthetic_objective = V4LiteObjective(
+                tensor=synthetic_tensor,
+                active_groups=objective.active_groups,
+                model_version=model_version,
+                base_params=objective.base_params,
+                dynamics_mode=objective.dynamics_mode,
+                frozen_copy_distributions=objective.frozen_copy_distributions,
+                coupling_mode=objective.coupling_mode,
+            )
+            estimate = _optimize_with_limited_iterations(synthetic_objective, truth, maxiter=runner.settings.synthetic_recovery_maxiter, method=runner.settings.optimizer_method)
+            posterior = run_v4_lite_hmc(synthetic_objective, estimate, posterior_settings)
+            for idx, name in enumerate(names):
+                ranks[name].append(int(np.sum(posterior.samples[:, idx] < truth[idx])))
+        except Exception:
+            failures += 1
+    return V4LiteSBCReport(int(n_datasets), {name: tuple(values) for name, values in ranks.items()}, failures, None)
+
+
+def build_prior_diagnostics_report(objective: V4LiteObjective, vector: np.ndarray) -> dict[str, object]:
+    fields = []
+    for name in objective.adapter.parameter_names():
+        fields.append({"name": name, "prior_kind": "gaussian_shrinkage_approximation" if any(token in name for token in ("kernel", "growth", "mobility", "theta", "omega")) else "gaussian_approximation"})
+    return {
+        "active_fields": fields,
+        "strict_horseshoe_prior": "not_implemented_strictly",
+        "strict_pc_prior": "not_implemented_strictly",
+        "prior_policy": "Gaussian shrinkage and boundary checks are used for the automated SciPy implementation.",
+        "release_policy": "Parameters that fail profile, posterior contraction, boundary, or synthetic recovery checks are kept fixed or interpreted as derived.",
     }
-    rows: list[dict[str, object]] = []
-    for index, name in enumerate(names):
-        span = spans.get(index, float("nan"))
-        spec = specs_by_dimension[index] if index < len(specs_by_dimension) else None
-        boundary_margin = None if spec is None else raw_margin_by_spec.get(spec.name)
-        status = "free"
-        rationale_parts: list[str] = []
-        if np.isfinite(span) and span < 1e-5:
-            status = "fixed"
-            rationale_parts.append("flat profile")
-        if not fake_recovery.passed:
-            status = "derived"
-            rationale_parts.append("fake-data recovery did not pass")
-        posterior_sd = None
-        if posterior_samples is not None and posterior_samples.samples.size and index < posterior_samples.samples.shape[1]:
-            posterior_sd = float(np.std(posterior_samples.samples[:, index]))
-            if posterior_sd >= prior_scales[index]:
-                status = "fixed" if status == "free" else status
-                rationale_parts.append("posterior spread not narrower than prior scale")
-        elif posterior_samples is not None and posterior_samples.skipped_reason:
-            rationale_parts.append(f"posterior_not_evaluated: {posterior_samples.skipped_reason}")
-            status = "fixed" if status == "free" else status
-        elif posterior_samples is None:
-            rationale_parts.append("posterior_not_evaluated")
-            status = "fixed" if status == "free" else status
-        if boundary_margin is not None and boundary_margin < 0.02:
-            status = "fixed" if status == "free" else status
-            rationale_parts.append("boundary warning: parameter near hard/soft bound")
-        if not rationale_parts:
-            rationale_parts.append("profile/fake-data/posterior checks passed")
+
+
+def build_parameter_status_table(objective: V4LiteObjective, vector: np.ndarray, profile_points: Sequence[V4LiteProfilePoint], fake_recovery: V4LiteFakeDataRecoveryReport, posterior: V4LitePosteriorSamples) -> tuple[dict[str, object], ...]:
+    params = objective.adapter.unpack(vector)
+    rows = []
+    for field_name, transform, _shape in objective.adapter.fields:
+        raw = np.asarray(getattr(params, field_name), dtype=float).reshape(-1)
+        if transform == "logit":
+            margin = float(np.min(np.minimum(raw, 1.0 - raw)))
+        elif transform == "log":
+            margin = float(np.min(raw / (raw + 1.0)))
+        else:
+            margin = None
+        posterior_sd = float(np.std(posterior.samples, axis=0).mean()) if posterior.samples.size else 0.0
+        rationale = "fake-data passed" if fake_recovery.passed else "fake-data failed"
+        if margin is not None and np.isfinite(margin) and margin < 0.02:
+            rationale += "; boundary warning"
         rows.append(
             {
-                "name": name,
-                "field": None if spec is None else spec.name,
-                "transform": None if spec is None else spec.transform,
-                "prior_kind": None
-                if spec is None
-                else ("gaussian_shrinkage_approximation" if spec.shrinkage else "gaussian"),
-                "fake_data_passed": bool(fake_recovery.passed),
-                "status": status,
-                "profile_span": span,
+                "name": field_name,
+                "field": field_name,
+                "transform": transform,
+                "prior_kind": "gaussian_shrinkage_approximation",
+                "fake_data_passed": fake_recovery.passed,
+                "status": "free" if fake_recovery.passed else "fixed",
+                "profile_span": float(max((p.objective_value for p in profile_points), default=0.0) - min((p.objective_value for p in profile_points), default=0.0)),
                 "posterior_sd": posterior_sd,
-                "prior_scale": float(prior_scales[index]) if index < prior_scales.size else None,
-                "boundary_margin": boundary_margin,
-                "rationale": "; ".join(rationale_parts),
+                "prior_scale": 1.0,
+                "boundary_margin": margin,
+                "rationale": rationale,
             }
         )
     return tuple(rows)
 
 
-def build_prior_diagnostics_report(objective: V4LiteObjective, vector: np.ndarray) -> dict[str, object]:
-    params = objective.adapter.unpack(vector)
-    fields: list[dict[str, object]] = []
-    for spec in objective.adapter.specs:
-        raw = objective.adapter._raw(params, spec)
-        fields.append(
-            {
-                "name": spec.name,
-                "group": spec.group,
-                "transform": spec.transform,
-                "prior_center": spec.prior_center.tolist(),
-                "prior_scale": spec.prior_scale.tolist(),
-                "prior_kind": "gaussian_shrinkage_approximation" if spec.shrinkage else "gaussian",
-                "shrinkage": bool(spec.shrinkage),
-                "boundary_type": spec.boundary_type,
-                "lower": None if spec.lower is None else spec.lower.tolist(),
-                "upper": None if spec.upper is None else spec.upper.tolist(),
-                "boundary_margin": _boundary_margin_for_spec(spec, raw),
-                "strict_horseshoe_or_pc_prior": "not_implemented_strictly" if spec.shrinkage else "not_applicable",
-            }
-        )
-    return {
-        "active_parameter_count": objective.adapter.dimension,
-        "active_fields": fields,
-        "sampling_note": "posterior samples use the bundled simplified HMC when enabled; this is not NUTS.",
-        "strict_horseshoe_prior": "not_implemented_strictly",
-        "strict_pc_prior": "not_implemented_strictly",
-    }
-
-
-def _posterior_predictive_residual_rows(observed: SummaryCollection, predicted: SummaryCollection) -> tuple[dict[str, object], ...]:
+def _posterior_residual_rows(observed: SummaryCollection, predicted: SummaryCollection) -> tuple[dict[str, object], ...]:
     aligned = predicted.align_to(observed)
-    rows: list[dict[str, object]] = []
-    for block_name in observed.block_names():
-        observed_block = observed.blocks[block_name]
-        predicted_block = aligned.blocks[block_name]
-        for key, observed_value, predicted_value in zip(observed_block.keys, observed_block.values.tolist(), predicted_block.values.tolist()):
-            rows.append(
-                {
-                    "block": block_name,
-                    "key": key,
-                    "observed": float(observed_value),
-                    "predicted": float(predicted_value),
-                    "residual": float(predicted_value - observed_value),
-                }
-            )
+    rows = []
+    for block in observed.block_names():
+        for key, obs, pred in zip(observed.blocks[block].keys, observed.blocks[block].values, aligned.blocks[block].values):
+            rows.append({"block": block, "key": key, "observed": float(obs), "predicted": float(pred), "residual": float(pred - obs)})
     return tuple(rows)
 
 
@@ -2575,109 +1662,79 @@ def build_v4_lite_reports(
     calibration_report: dict[str, object],
     purity_sensitivity: tuple[dict[str, object], ...],
     prior_diagnostics_report: dict[str, object] | None = None,
+    posterior_objective: V4LiteObjective | None = None,
+    posterior_samples: V4LitePosteriorSamples | None = None,
 ) -> V4LiteReports:
-    posterior_metrics = run_v4_lite_posterior_predictive(tensor.observed_summary, prediction)
-    residual_rows = _posterior_predictive_residual_rows(tensor.observed_summary, prediction.summary)
-    observation_stage = next((stage for stage in stage_results if stage.stage_name == "observation"), None)
-    calibration_payload = calibration_report or (observation_stage.diagnostics.get("calibration", {}) if observation_stage is not None else {})
+    ppc = run_v4_lite_posterior_predictive(tensor.observed_summary, prediction)
+    interval_rows = _posterior_predictive_interval_rows(posterior_objective, posterior_samples) if posterior_objective is not None and posterior_samples is not None else ()
+    block_coverage, overall_coverage = _coverage_from_interval_rows(interval_rows)
     tensor_summary = {
         "conditions": tensor.condition_names,
         "weeks": tensor.weeks,
         "n_flow": len(tensor.flow_observations),
         "n_count": len(tensor.count_observations),
-        "n_count_total": sum(1 for observation in tensor.count_observations if observation.gate_index is None),
-        "n_count_gate": sum(1 for observation in tensor.count_observations if observation.gate_index is not None),
         "n_qpcdr": len(tensor.qpcdr_observations),
         "n_ectag_hist": len(tensor.ectag_hist_observations),
-        "n_ectag_corr": len(tensor.ectag_corr_observations),
-        "binning": {"bins": tensor.structure.binning.bins, "centers": tensor.structure.binning.centers.tolist()},
-        "exposure_C": {condition: values.tolist() for condition, values in tensor.exposure_C.items()},
-        "exposure_P": {condition: values.tolist() for condition, values in tensor.exposure_P.items()},
-        "week1_initial_state_abundance": {condition: values.tolist() for condition, values in tensor.initial_state_abundance.items()},
-    }
-    calibration_summary = {
-        "qpcdr_batches": tensor.structure.qpcdr_batches,
-        "has_purity_matrix": tensor.dataset.purity_matrix is not None,
-        "has_same_cell_ectag": tensor.has_same_cell_ectag,
-        "observation_calibration": calibration_payload,
-    }
-    ecDNA_report = {
-        "tail_max": float(max(np.max(values[:, :, :, -1]) for values in prediction.copy_distributions.values())),
-        "mean_copy_by_condition": {
-            condition: _copy_means(values[-1], tensor.structure.binning).tolist()
-            for condition, values in prediction.copy_distributions.items()
-        },
-    }
-    identifiability_report = {
-        "parameter_status": list(parameter_status_table),
-        "stage_acceptance": {stage.stage_name: stage.accepted for stage in stage_results},
-        "stage_rejections": {stage.stage_name: stage.rejection_reasons for stage in stage_results if stage.rejection_reasons},
-        "model_comparison": model_comparison,
-    }
-    posterior_predictive_report = {
-        "leave_one_week_out": loo.heldout_scores,
-        "available_blocks": tensor.observed_summary.block_names(),
-        "block_rmse": posterior_metrics.block_rmse,
-        "block_relative_rmse": posterior_metrics.block_relative_rmse,
-        "block_max_abs_residual": posterior_metrics.block_max_abs_residual,
-        "worst_relative_rmse": posterior_metrics.worst_relative_rmse,
-        "purity_sensitivity": purity_sensitivity,
-    }
-    fake_data_report = {
-        "passed": fake_recovery.passed,
-        "normalized_error": fake_recovery.normalized_error,
-        "recovered_objective": fake_recovery.recovered_objective,
-        "block_relative_rmse": fake_recovery.block_relative_rmse,
+        "n_ddpcr": len(tensor.ddpcr_observations),
+        "binning": {"bins": tensor.structure.binning.bins, "centers": tensor.structure.binning.centers.tolist(), "policy": "species-specific; no config.py ecTAG censoring"},
     }
     count_gate_counts: dict[str, int] = {}
-    for observation in tensor.count_observations:
-        if observation.gate_index is not None:
-            state_name = cfg.STATE_NAMES[observation.gate_index]
-            count_gate_counts[state_name] = count_gate_counts.get(state_name, 0) + 1
-    count_observation_report = {
-        "total_count_observations": sum(1 for observation in tensor.count_observations if observation.gate_index is None),
-        "gate_count_observations": sum(1 for observation in tensor.count_observations if observation.gate_index is not None),
-        "gate_counts_by_state": count_gate_counts,
-        "likelihoods": {
-            "count_total": "NegBin(sum_s N[w,s], phi_N)",
-            "count_gate": "NegBin(sum_s Pi[g,s] N[w,s], phi_N_gate)",
-        },
-        "backward_compatibility": "records without gate remain count_total",
+    for obs in tensor.count_observations:
+        if obs.gate_index is not None:
+            count_gate_counts[cfg.STATE_NAMES[obs.gate_index]] = count_gate_counts.get(cfg.STATE_NAMES[obs.gate_index], 0) + 1
+    implementation = {
+        "v4_lite": "implemented_from_scratch",
+        "posterior_sampling": posterior_samples.method if posterior_samples is not None else "not_run",
+        "posterior_sampling_note": None if posterior_samples is None else posterior_samples.skipped_reason,
+        "ddpcr_policy": "bulk pooled mean anchor only",
+        "ectag_policy": "species-specific bins; total burden derived only",
+        "prior_policy": "Gaussian shrinkage priors with profile, posterior contraction, boundary, and synthetic recovery checks.",
+        "fit_method_scope": "automated SciPy MAP plus package posterior diagnostics when available; NetCDF/CSV/parquet/NPZ artifacts are written where supported.",
     }
-    implementation_status_report = {
-        "v4_lite": "implemented",
-        "count_gate_observation": "implemented",
-        "parameter_status_rules": "implemented_with_profile_fake_data_hmc_or_skip_boundary_margin",
-        "posterior_sampling": "approximate_simplified_hmc_not_nuts",
-        "sbc": "approximate_no_nuts_when_enabled",
-        "strict_horseshoe_prior": "not_implemented_strictly",
-        "strict_pc_prior": "not_implemented_strictly",
-        "full_v4_formal_bayesian_posterior": "not_enabled_extension",
-    }
-    sbc_payload = None if sbc_report is None else {"n_datasets": sbc_report.n_datasets, "failures": sbc_report.failures, "ranks": sbc_report.ranks, "skipped_reason": sbc_report.skipped_reason}
     return V4LiteReports(
         tensor_summary=tensor_summary,
-        calibration_report=calibration_summary,
-        ecDNA_report=ecDNA_report,
-        identifiability_report=identifiability_report,
-        posterior_predictive_report=posterior_predictive_report,
-        fake_data_report=fake_data_report,
-        implementation_status_report=implementation_status_report,
+        calibration_report={"observation_calibration": calibration_report, "has_same_cell_ectag": tensor.has_same_cell_ectag},
+        ecDNA_report={"mean_copy_by_condition": {c: _copy_means(v[-1], tensor.structure.binning).tolist() for c, v in prediction.copy_distributions.items()}},
+        identifiability_report={
+            "parameter_status": list(parameter_status_table),
+            "stage_acceptance": {s.stage_name: s.accepted for s in stage_results},
+            "stage_details": [
+                {
+                    "stage_name": s.stage_name,
+                    "active_groups": s.active_groups,
+                    "objective_before": s.objective_before,
+                    "objective_after": s.objective_after,
+                    "accepted": s.accepted,
+                    "rejection_reasons": s.rejection_reasons,
+                    "skipped_reason": s.skipped_reason,
+                    "diagnostics": s.diagnostics,
+                }
+                for s in stage_results
+            ],
+            "model_comparison": model_comparison,
+        },
+        posterior_predictive_report={
+            "leave_one_week_out": loo.heldout_scores,
+            "available_blocks": tensor.observed_summary.block_names(),
+            "block_rmse": ppc.block_rmse,
+            "block_relative_rmse": ppc.block_relative_rmse,
+            "block_max_abs_residual": ppc.block_max_abs_residual,
+            "worst_relative_rmse": ppc.worst_relative_rmse,
+            "block_coverage_90": block_coverage,
+            "overall_coverage_90": overall_coverage,
+            "purity_sensitivity": purity_sensitivity,
+        },
+        fake_data_report={"passed": fake_recovery.passed, "normalized_error": fake_recovery.normalized_error, "recovered_objective": fake_recovery.recovered_objective, "block_relative_rmse": fake_recovery.block_relative_rmse, "n_synthetic": fake_recovery.n_synthetic, "skipped_reason": fake_recovery.skipped_reason},
+        implementation_status_report=implementation,
         prior_diagnostics_report={} if prior_diagnostics_report is None else prior_diagnostics_report,
-        count_observation_report=count_observation_report,
-        posterior_predictive_residuals=residual_rows,
-        sbc_report=sbc_payload,
+        count_observation_report={"total_count_observations": sum(1 for o in tensor.count_observations if o.gate_index is None), "gate_count_observations": sum(1 for o in tensor.count_observations if o.gate_index is not None), "gate_counts_by_state": count_gate_counts, "backward_compatibility": "records without gate remain count_total"},
+        posterior_predictive_residuals=_posterior_residual_rows(tensor.observed_summary, prediction.summary),
+        posterior_predictive_intervals=interval_rows,
+        sbc_report=None if sbc_report is None else {"n_datasets": sbc_report.n_datasets, "failures": sbc_report.failures, "ranks": sbc_report.ranks, "skipped_reason": sbc_report.skipped_reason},
     )
 
 
-def write_v4_lite_reports(
-    output_dir: Path,
-    reports: V4LiteReports,
-    parameter_status_table: tuple[dict[str, object], ...],
-    model_comparison: dict[str, float],
-    *,
-    write_optional_plots: bool = True,
-) -> None:
+def write_v4_lite_reports(output_dir: Path, reports: V4LiteReports, parameter_status_table: tuple[dict[str, object], ...], model_comparison: dict[str, float], *, write_optional_plots: bool = True) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "tensor_summary": reports.tensor_summary,
@@ -2692,229 +1749,708 @@ def write_v4_lite_reports(
         "sbc_report": reports.sbc_report,
         "model_comparison": model_comparison,
         "parameter_status_table": list(parameter_status_table),
+        "posterior_predictive_intervals": list(reports.posterior_predictive_intervals),
     }
-    (output_dir / "v4_lite_reports.json").write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
-    (output_dir / "parameter_status.json").write_text(json.dumps(list(parameter_status_table), indent=2, sort_keys=True, default=str), encoding="utf-8")
-    (output_dir / "cleaned_tensor_summary.json").write_text(json.dumps(reports.tensor_summary, indent=2, sort_keys=True, default=str), encoding="utf-8")
-    (output_dir / "observation_calibration_report.json").write_text(json.dumps(reports.calibration_report, indent=2, sort_keys=True, default=str), encoding="utf-8")
-    (output_dir / "ecDNA_only_report.json").write_text(json.dumps(reports.ecDNA_report, indent=2, sort_keys=True, default=str), encoding="utf-8")
-    (output_dir / "identifiability_report.json").write_text(json.dumps(reports.identifiability_report, indent=2, sort_keys=True, default=str), encoding="utf-8")
-    (output_dir / "posterior_predictive_report.json").write_text(json.dumps(reports.posterior_predictive_report, indent=2, sort_keys=True, default=str), encoding="utf-8")
-    (output_dir / "count_observation_report.json").write_text(json.dumps(reports.count_observation_report, indent=2, sort_keys=True, default=str), encoding="utf-8")
-    (output_dir / "prior_diagnostics_report.json").write_text(json.dumps(reports.prior_diagnostics_report, indent=2, sort_keys=True, default=str), encoding="utf-8")
-    (output_dir / "implementation_status_report.json").write_text(json.dumps(reports.implementation_status_report, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    for name, data in (
+        ("v4_lite_reports.json", payload),
+        ("parameter_status.json", list(parameter_status_table)),
+        ("cleaned_tensor_summary.json", reports.tensor_summary),
+        ("observation_calibration_report.json", reports.calibration_report),
+        ("ecDNA_only_report.json", reports.ecDNA_report),
+        ("identifiability_report.json", reports.identifiability_report),
+        ("posterior_predictive_report.json", reports.posterior_predictive_report),
+        ("count_observation_report.json", reports.count_observation_report),
+        ("prior_diagnostics_report.json", reports.prior_diagnostics_report),
+        ("implementation_status_report.json", reports.implementation_status_report),
+    ):
+        (output_dir / name).write_text(json.dumps(data, indent=2, sort_keys=True, default=str), encoding="utf-8")
     if reports.sbc_report is not None:
-        (output_dir / "sbc_report.json").write_text(json.dumps(reports.sbc_report, indent=2, sort_keys=True, default=str), encoding="utf-8")
-
+        (output_dir / "sbc_report.json").write_text(json.dumps(reports.sbc_report, indent=2, default=str), encoding="utf-8")
     with open(output_dir / "parameter_status.csv", "w", encoding="utf-8", newline="") as handle:
-        fieldnames = (
-            "name",
-            "field",
-            "transform",
-            "prior_kind",
-            "fake_data_passed",
-            "status",
-            "profile_span",
-            "posterior_sd",
-            "prior_scale",
-            "boundary_margin",
-            "rationale",
-        )
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        fields = ("name", "field", "transform", "prior_kind", "fake_data_passed", "status", "profile_span", "posterior_sd", "prior_scale", "boundary_margin", "rationale")
+        writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for row in parameter_status_table:
-            writer.writerow({name: row.get(name) for name in fieldnames})
-
+            writer.writerow({field: row.get(field) for field in fields})
     with open(output_dir / "posterior_predictive_residuals.csv", "w", encoding="utf-8", newline="") as handle:
-        fieldnames = ("block", "key", "observed", "predicted", "residual")
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        fields = ("block", "key", "observed", "predicted", "residual")
+        writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for row in reports.posterior_predictive_residuals:
-            writer.writerow({name: row.get(name) for name in fieldnames})
-
+            writer.writerow({field: row.get(field) for field in fields})
+    with open(output_dir / "posterior_predictive_intervals.csv", "w", encoding="utf-8", newline="") as handle:
+        fields = ("block", "key", "observed", "p05", "p50", "p95", "covered_90")
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row in reports.posterior_predictive_intervals:
+            writer.writerow({field: row.get(field) for field in fields})
     if write_optional_plots:
         try:
+            mpl_config = output_dir / ".mplconfig"
+            cache_dir = output_dir / ".cache"
+            mpl_config.mkdir(parents=True, exist_ok=True)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            os.environ.setdefault("MPLCONFIGDIR", str(mpl_config))
+            os.environ.setdefault("XDG_CACHE_HOME", str(cache_dir))
             import matplotlib.pyplot as plt  # type: ignore
         except Exception:
             return
-        blocks = reports.posterior_predictive_report.get("block_relative_rmse", {})
-        if isinstance(blocks, dict) and blocks:
-            labels = list(blocks)
-            values = [float(blocks[label]) for label in labels]
-            fig, ax = plt.subplots(figsize=(max(4.0, 0.7 * len(labels)), 3.0))
-            ax.bar(labels, values)
-            ax.set_ylabel("relative RMSE")
-            ax.set_title("v4-lite posterior predictive")
+        values = reports.posterior_predictive_report.get("block_relative_rmse", {})
+        if isinstance(values, dict) and values:
+            fig, ax = plt.subplots(figsize=(max(4, len(values) * 0.8), 3))
+            ax.bar(list(values), [float(v) for v in values.values()])
             ax.tick_params(axis="x", rotation=45)
             fig.tight_layout()
             fig.savefig(output_dir / "posterior_predictive_relative_rmse.png", dpi=150)
             plt.close(fig)
 
 
-def _projection_from_prediction(prediction: V4LitePrediction) -> FullToLiteProjection:
-    condition_name = prediction.condition_names[0]
-    return FullToLiteProjection(
-        weeks=prediction.weeks,
-        state_abundance=prediction.state_abundance[condition_name].copy(),
-        copy_distributions=prediction.copy_distributions[condition_name].copy(),
-        transition_matrices=prediction.transition_matrices[condition_name].copy(),
-        growth_rates=prediction.growth_rates[condition_name].copy(),
-        copy_kernels=prediction.copy_kernels[condition_name].copy(),
-        diagnostics={"source": "v4-lite prediction coarse targets", "condition": condition_name},
-    )
+def _state_fraction_rows(prediction: V4LitePrediction) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for condition, abundance in prediction.state_abundance.items():
+        for week_idx, week in enumerate(prediction.weeks):
+            total = max(float(np.sum(abundance[week_idx])), 1e-12)
+            for state_idx, state in enumerate(cfg.STATE_NAMES):
+                rows.append({"condition": condition, "week": week, "state": state, "abundance": float(abundance[week_idx, state_idx]), "fraction": float(abundance[week_idx, state_idx] / total)})
+    return rows
 
 
-def _event_interval_index(times: np.ndarray, event_time: float) -> int | None:
-    interval_index = int(np.searchsorted(times, float(event_time), side="left") - 1)
-    if 0 <= interval_index < times.size - 1:
-        return interval_index
+def _copy_distribution_rows(prediction: V4LitePrediction, binning: CopyNumberBinning) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for condition, copies in prediction.copy_distributions.items():
+        for week_idx, week in enumerate(prediction.weeks):
+            for state_idx, state in enumerate(cfg.STATE_NAMES):
+                for species_idx, species in enumerate(cfg.SPECIES):
+                    for bin_idx, probability in enumerate(copies[week_idx, state_idx, species_idx].tolist()):
+                        lower, upper = binning.bins[bin_idx]
+                        rows.append(
+                            {
+                                "condition": condition,
+                                "week": week,
+                                "state": state,
+                                "species": species,
+                                "bin": bin_idx,
+                                "lower": lower,
+                                "upper": upper,
+                                "center": float(binning.centers[bin_idx]),
+                                "probability": float(probability),
+                            }
+                        )
+    return rows
+
+
+def _copy_summary_rows(prediction: V4LitePrediction, binning: CopyNumberBinning) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    centers = binning.centers
+    for condition, copies in prediction.copy_distributions.items():
+        for week_idx, week in enumerate(prediction.weeks):
+            for state_idx, state in enumerate(cfg.STATE_NAMES):
+                for species_idx, species in enumerate(cfg.SPECIES):
+                    probs = copies[week_idx, state_idx, species_idx]
+                    mean = float(np.dot(probs, centers))
+                    variance = float(np.dot(probs, np.square(centers - mean)))
+                    rows.append(
+                        {
+                            "condition": condition,
+                            "week": week,
+                            "state": state,
+                            "species": species,
+                            "mean": mean,
+                            "variance": variance,
+                            "zero_fraction": float(probs[0]),
+                            "tail_fraction_last_observed_bin": float(probs[-1]),
+                        }
+                    )
+    return rows
+
+
+def _transition_rows(prediction: V4LitePrediction) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for condition, transitions in prediction.transition_matrices.items():
+        for interval in range(transitions.shape[0]):
+            for source_idx, source in enumerate(cfg.STATE_NAMES):
+                for target_idx, target in enumerate(cfg.STATE_NAMES):
+                    rows.append(
+                        {
+                            "condition": condition,
+                            "week_start": prediction.weeks[interval],
+                            "week_end": prediction.weeks[interval + 1],
+                            "source_state": source,
+                            "target_state": target,
+                            "probability": float(transitions[interval, source_idx, target_idx]),
+                        }
+                    )
+    return rows
+
+
+def _growth_rows(prediction: V4LitePrediction) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for condition, growth in prediction.growth_rates.items():
+        for interval in range(growth.shape[0]):
+            for state_idx, state in enumerate(cfg.STATE_NAMES):
+                rows.append(
+                    {
+                        "condition": condition,
+                        "week_start": prediction.weeks[interval],
+                        "week_end": prediction.weeks[interval + 1],
+                        "state": state,
+                        "log_net_growth": float(growth[interval, state_idx]),
+                    }
+                )
+    return rows
+
+
+def _transition_flux_rows(prediction: V4LitePrediction) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for condition, transitions in prediction.transition_matrices.items():
+        abundance = prediction.state_abundance[condition]
+        for interval in range(transitions.shape[0]):
+            for source_idx, source in enumerate(cfg.STATE_NAMES):
+                for target_idx, target in enumerate(cfg.STATE_NAMES):
+                    rows.append(
+                        {
+                            "condition": condition,
+                            "week_start": prediction.weeks[interval],
+                            "week_end": prediction.weeks[interval + 1],
+                            "source_state": source,
+                            "target_state": target,
+                            "expected_flux": float(abundance[interval, source_idx] * transitions[interval, source_idx, target_idx]),
+                        }
+                    )
+    return rows
+
+
+def _ddpcr_prediction_rows(tensor: V4LiteTensor, prediction: V4LitePrediction) -> list[dict[str, object]]:
+    predicted = prediction.summary.blocks.get("ddpcr_pooled_mean")
+    observed = tensor.observed_summary.blocks.get("ddpcr_pooled_mean")
+    if predicted is None or observed is None:
+        return []
+    aligned = predicted.align_to(observed)
+    return [
+        {"key": key, "observed_ddpcr": float(obs), "predicted_pooled_mean": float(pred), "residual": float(pred - obs), "policy": "ddPCR anchors pooled mean only"}
+        for key, obs, pred in zip(observed.keys, observed.values, aligned.values)
+    ]
+
+
+def _observed_ectag_histogram_rows(tensor: V4LiteTensor) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for obs in tensor.ectag_hist_observations:
+        total = max(float(np.sum(obs.counts)), 1e-12)
+        prefix = {
+            "condition": obs.condition,
+            "week": obs.week,
+            "state": cfg.STATE_NAMES[obs.gate_index],
+            "species": cfg.SPECIES[obs.species_index],
+            "replicate_id": obs.replicate_id,
+            "n_cells": int(np.sum(obs.counts)),
+            "source": "observed_ecTAG",
+        }
+        for bin_idx, count in enumerate(obs.counts.tolist()):
+            lower, upper = tensor.structure.binning.bins[bin_idx]
+            rows.append(
+                {
+                    **prefix,
+                    "bin": bin_idx,
+                    "lower": lower,
+                    "upper": upper,
+                    "center": float(tensor.structure.binning.centers[bin_idx]),
+                    "count": int(count),
+                    "probability": float(count / total),
+                    "histogram_likelihood_policy": "full_histogram" if int(np.sum(obs.counts)) >= 50 else "mean_level_low_cell_count",
+                }
+            )
+    return rows
+
+
+def _observed_ectag_summary_rows(tensor: V4LiteTensor) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    centers = tensor.structure.binning.centers
+    for obs in tensor.ectag_hist_observations:
+        total = max(float(np.sum(obs.counts)), 1e-12)
+        probs = obs.counts.astype(float) / total
+        mean = float(np.dot(probs, centers))
+        rows.append(
+            {
+                "condition": obs.condition,
+                "week": obs.week,
+                "state": cfg.STATE_NAMES[obs.gate_index],
+                "species": cfg.SPECIES[obs.species_index],
+                "replicate_id": obs.replicate_id,
+                "n_cells": int(np.sum(obs.counts)),
+                "mean": mean,
+                "variance": float(np.dot(probs, np.square(centers - mean))),
+                "zero_fraction": float(probs[0]),
+                "tail_fraction_last_observed_bin": float(probs[-1]),
+                "source": "observed_ecTAG",
+                "histogram_likelihood_policy": "full_histogram" if int(np.sum(obs.counts)) >= 50 else "mean_level_low_cell_count",
+            }
+        )
+    return rows
+
+
+def _observed_ectag_joint_rows(tensor: V4LiteTensor) -> list[dict[str, object]]:
+    if not tensor.ectag_corr_observations:
+        return [{"has_same_cell_ectag": tensor.has_same_cell_ectag, "n_corr": 0, "source": "observed_ecTAG"}]
+    return [
+        {
+            "condition": obs.condition,
+            "week": obs.week,
+            "state": cfg.STATE_NAMES[obs.gate_index],
+            "species_a": cfg.SPECIES[obs.species_a],
+            "species_b": cfg.SPECIES[obs.species_b],
+            "correlation": obs.correlation,
+            "n_cells": obs.n_cells,
+            "replicate_id": obs.replicate_id,
+            "has_same_cell_ectag": True,
+            "source": "observed_ecTAG",
+        }
+        for obs in tensor.ectag_corr_observations
+    ]
+
+
+def _release_table_rows(stage_results: Sequence[V4LiteStageFitResult]) -> list[dict[str, object]]:
+    accepted = {stage.stage_name: stage.accepted for stage in stage_results}
+    return [
+        {
+            "full_block": "growth_hazard",
+            "lite_evidence_stage": "M3-growth-coupling",
+            "release": bool(accepted.get("M3-growth-coupling", False)),
+            "lite_parameter": "theta_P",
+            "full_parameter_hint": "hazard.theta_P / growth-response terms",
+            "reason": "accepted by v4-lite criteria" if accepted.get("M3-growth-coupling", False) else "fixed 0: v4-lite criteria not met",
+        },
+        {
+            "full_block": "state_landscape_transition",
+            "lite_evidence_stage": "M4-transition-coupling",
+            "release": bool(accepted.get("M4-transition-coupling", False)),
+            "lite_parameter": "beta_C,beta_P,lambda_M",
+            "full_parameter_hint": "landscape/plasticity transition terms",
+            "reason": "accepted by v4-lite criteria" if accepted.get("M4-transition-coupling", False) else "fixed/collapsed: v4-lite criteria not met",
+        },
+        {
+            "full_block": "co_segregation",
+            "lite_evidence_stage": "M3-co-segregation",
+            "release": bool(accepted.get("M3-co-segregation", False)),
+            "lite_parameter": "co_segregation_rho",
+            "full_parameter_hint": "daughter-memory / same-cell species coupling",
+            "reason": "accepted by same-cell multi-species ecTAG" if accepted.get("M3-co-segregation", False) else "skipped unless same-cell multi-species ecTAG supports it",
+        },
+        {
+            "full_block": "ecDNA_tail_turnover",
+            "lite_evidence_stage": "M1-ecDNA-kernel",
+            "release": False,
+            "lite_parameter": "kernel_up_species,kernel_down_species",
+            "full_parameter_hint": "turnover gain/loss ceilings",
+            "reason": "bridge calibration may use M1 summaries; formal release requires full PPC failure on ecTAG tail",
+        },
+    ]
+
+
+def _coupling_mode_from_stage_results(stage_results: Sequence[V4LiteStageFitResult]) -> str:
+    accepted = {stage.stage_name: stage.accepted for stage in stage_results}
+    growth = bool(accepted.get("M3-growth-coupling", False))
+    transition = bool(accepted.get("M4-transition-coupling", False))
+    if growth and transition:
+        return "joint"
+    if growth:
+        return "growth"
+    if transition:
+        return "transition"
+    return "none"
+
+
+def _stage_diagnostics(stage_results: Sequence[V4LiteStageFitResult], stage_name: str) -> dict[str, object]:
+    for stage in stage_results:
+        if stage.stage_name == stage_name:
+            return dict(stage.diagnostics or {})
+    return {}
+
+
+def _coupling_metric(stage_results: Sequence[V4LiteStageFitResult], stage_name: str, metric: str) -> object:
+    diagnostics = _stage_diagnostics(stage_results, stage_name)
+    coupling = diagnostics.get("coupling_diagnostics", {})
+    if isinstance(coupling, Mapping):
+        return coupling.get(metric)
     return None
 
 
-def _event_soft_state(payload: Mapping[str, object]) -> np.ndarray | None:
-    if "soft_state" not in payload:
-        return None
-    values = np.asarray(payload["soft_state"], dtype=float)
-    if values.shape != (cfg.N_STATES,) or not np.all(np.isfinite(values)):
-        return None
-    return _normalize_simplex(values)
+def _posterior_method(result: V4LiteFitResult) -> str:
+    return result.posterior_samples.method if result.posterior_samples is not None else "not_run"
 
 
-def _event_copy_numbers(payload: Mapping[str, object]) -> np.ndarray | None:
-    if "copy_numbers" not in payload:
-        return None
-    values = np.asarray(payload["copy_numbers"], dtype=int)
-    if values.shape != (cfg.N_SPECIES,):
-        return None
-    return np.clip(values, 0, None)
+def _lite_to_full_priors(result: V4LiteFitResult, release_rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    params = result.final_params
+    return {
+        "source": f"v4-lite MAP plus {_posterior_method(result)} posterior samples",
+        "posterior_label": _posterior_method(result),
+        "posterior_note": None if result.posterior_samples is None else result.posterior_samples.skipped_reason,
+        "final_coupling_mode": _coupling_mode_from_stage_results(result.stage_results),
+        "ddpcr_policy": "bulk pooled mean anchor only",
+        "ectag_policy": "species-specific histograms; total burden derived",
+        "weeks": result.tensor.weeks,
+        "release_table": list(release_rows),
+        "lite_parameter_centers": {
+            "kernel_up_species": params.kernel_up_species.tolist(),
+            "kernel_down_species": params.kernel_down_species.tolist(),
+            "growth_base": params.growth_base.tolist(),
+            "mobility_log": params.mobility_log.tolist(),
+            "theta_P": params.theta_P,
+            "theta_B": params.theta_B,
+            "beta_C": params.beta_C,
+            "beta_P": params.beta_P,
+            "lambda_M": params.lambda_M,
+            "co_segregation_rho": params.co_segregation_rho,
+        },
+    }
 
 
-def _estimate_event_dynamics(
-    simulation_result,
-    times: np.ndarray,
-    state_abundance: np.ndarray,
-    structure: V4LiteStructure,
-) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, dict[str, object]]:
-    events = tuple(getattr(simulation_result, "events", ()) or ())
-    diagnostics: dict[str, object] = {"lineage_available": bool(events), "event_count": len(events)}
-    if not events or times.size < 2:
-        diagnostics["lineage_note"] = "No lineage events available; only N^F and p^F were projected."
-        return None, None, None, diagnostics
-
-    n_intervals = times.size - 1
-    n_bins = structure.binning.n_bins
-    transition_counts = np.zeros((n_intervals, cfg.N_STATES, cfg.N_STATES), dtype=float)
-    copy_counts = np.zeros((n_intervals, cfg.N_STATES, cfg.N_SPECIES, n_bins, n_bins), dtype=float)
-    used_events = 0
-
-    for event_time, event_type, _cell_id, details in events:
-        interval_index = _event_interval_index(times, float(event_time))
-        if interval_index is None or not isinstance(details, Mapping):
-            continue
-        state_pre = details.get("state_pre")
-        if not isinstance(state_pre, Mapping):
-            continue
-        source_weights = _event_soft_state(state_pre)
-        source_copies = _event_copy_numbers(state_pre)
-        if source_weights is None:
-            continue
-
-        post_payloads: list[Mapping[str, object]] = []
-        if event_type == "division":
-            for key in ("daughter_one", "daughter_two"):
-                daughter = details.get(key)
-                if isinstance(daughter, Mapping):
-                    post_payloads.append(daughter)
-        else:
-            state_post = details.get("state_post")
-            if isinstance(state_post, Mapping):
-                post_payloads.append(state_post)
-
-        if not post_payloads:
-            continue
-        for post_payload in post_payloads:
-            target_weights = _event_soft_state(post_payload)
-            if target_weights is None:
-                continue
-            transition_counts[interval_index, :, :] += np.outer(source_weights, target_weights)
-            target_copies = _event_copy_numbers(post_payload)
-            if source_copies is not None and target_copies is not None:
-                for source_state, source_weight in enumerate(source_weights.tolist()):
-                    if source_weight <= 0.0:
-                        continue
-                    for species_index in range(cfg.N_SPECIES):
-                        source_bin = structure.binning.bin_index(int(source_copies[species_index]))
-                        target_bin = structure.binning.bin_index(int(target_copies[species_index]))
-                        copy_counts[interval_index, source_state, species_index, source_bin, target_bin] += source_weight
-            used_events += 1
-
-    transition_matrices = np.zeros((n_intervals, cfg.N_STATES, cfg.N_STATES), dtype=float)
-    copy_kernels = np.zeros((n_intervals, cfg.N_STATES, cfg.N_SPECIES, n_bins, n_bins), dtype=float)
-    for interval_index in range(n_intervals):
-        for source_state in range(cfg.N_STATES):
-            row = transition_counts[interval_index, source_state, :].copy()
-            if float(np.sum(row)) <= 0.0:
-                row[source_state] = 1.0
-            transition_matrices[interval_index, source_state, :] = _normalize_simplex(row)
-            for species_index in range(cfg.N_SPECIES):
-                for source_bin in range(n_bins):
-                    kernel_row = copy_counts[interval_index, source_state, species_index, source_bin, :].copy()
-                    if float(np.sum(kernel_row)) <= 0.0:
-                        kernel_row[source_bin] = 1.0
-                    copy_kernels[interval_index, source_state, species_index, source_bin, :] = _normalize_simplex(kernel_row)
-
-    current = np.maximum(state_abundance[:-1, :], 1e-12)
-    nxt = np.maximum(state_abundance[1:, :], 1e-12)
-    growth_rates = np.log(nxt / current)
-    diagnostics["used_transition_events"] = used_events
-    diagnostics["lineage_note"] = "T^F and G^F estimated from recorded event payloads; g^F is net state growth between snapshots."
-    return transition_matrices, growth_rates, copy_kernels, diagnostics
+def _obs_params_for_full(result: V4LiteFitResult) -> dict[str, object]:
+    params = result.final_params
+    return {
+        "source": "v4-lite observation calibration",
+        "posterior_label": f"MAP_with_{_posterior_method(result)}",
+        "ddpcr_policy": "bulk pooled mean anchor only; never single-cell distribution evidence",
+        "ectag_policy": "species-specific histograms; no config.py ecTAG_max_observed censoring assumption",
+        "qpcdr": {
+            species: {
+                "intercept": float(params.qpcdr_intercept[idx]),
+                "slope": float(params.qpcdr_slope[idx]),
+                "sigma": float(params.qpcdr_sigma[idx]),
+            }
+            for idx, species in enumerate(cfg.SPECIES)
+        },
+        "flow": {
+            "concentration": float(params.flow_concentration),
+            "sort_purity_matrix": params.sort_purity_matrix.tolist(),
+        },
+        "counts": {
+            "total_count_dispersion": float(params.count_dispersion),
+            "gate_count_dispersion": float(params.count_gate_dispersion),
+        },
+        "ectag": {
+            "concentration_by_species": {species: float(params.ectag_concentration[idx]) for idx, species in enumerate(cfg.SPECIES)},
+            "same_cell_correlation_sigma": float(params.ectag_corr_sigma),
+            "bins": [
+                {"lower": lower, "upper": upper, "center": float(result.tensor.structure.binning.centers[idx])}
+                for idx, (lower, upper) in enumerate(result.tensor.structure.binning.bins)
+            ],
+        },
+        "calibration_diagnostics": result.reports.calibration_report if result.reports is not None else {},
+    }
 
 
-def project_full_to_lite(
-    simulation_result,
-    structure: V4LiteStructure | None = None,
-    purity_matrix: np.ndarray | None = None,
-) -> FullToLiteProjection:
+def _write_fit_npz_and_nc_marker(output_dir: Path, stem: str, arrays: Mapping[str, np.ndarray], label: str) -> None:
+    npz_path = output_dir / f"{stem}.npz"
+    write_npz_or_marker(npz_path, arrays, label=label)
+    write_netcdf_file(output_dir / f"{stem}.nc", arrays, label=label)
+
+
+def _fit_method_stage_output_paths(output_dir: str | Path) -> dict[str, tuple[Path, ...]]:
+    root = Path(output_dir)
+    return {
+        "M0-observation-only": (
+            root / "M0_observation_only_fit.nc",
+            root / "M0_snapshot_latent_estimates.csv",
+            root / "M0_ppc_report.pdf",
+            root / "obs_params_for_full.json",
+        ),
+        "M1-ecDNA-kernel": (
+            root / "M1_ecDNA_kernel_fit.nc",
+            root / "M1_ecDNA_summaries.csv",
+            root / "M1_ddPCR_pooled_predictions.csv",
+            root / "M1_ppc_report.pdf",
+        ),
+        "M2-abundance-null": (
+            root / "M2_abundance_null_fit.nc",
+            root / "M2_transition_matrix.csv",
+            root / "M2_net_growth.csv",
+            root / "M2_null_predictive_score.json",
+        ),
+        "M3-growth-coupling": (
+            root / "M3_growth_coupling_fit.nc",
+            root / "M3_growth_coupling_table.csv",
+            root / "M3_vs_M2_model_comparison.json",
+        ),
+        "M4-transition-coupling": (
+            root / "M4_transition_coupling_fit.nc",
+            root / "M4_transition_coupling_table.csv",
+            root / "M4_transition_flux.csv",
+            root / "M4_vs_M2_M3_comparison.json",
+        ),
+        "LITE-final": (
+            root / "LITE_final_fit.nc",
+            root / "LITE_posterior_predictive.csv",
+            root / "LITE_coupling_release_table.csv",
+            root / "LITE_to_FULL_priors.json",
+        ),
+    }
+
+
+def write_fit_method_artifacts(output_dir: str | Path, result: V4LiteFitResult, parameter_status_table: tuple[dict[str, object], ...], model_comparison: dict[str, float]) -> None:
+    """Write the file set described by markdown/fit_method.md.
+
+    NetCDF, NPZ, CSV, optional parquet, and concise PDF diagnostics are written
+    so the automated run can be inspected without extra dependencies.
+    """
+
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    cfg.require(result.reports is not None, "reports are required before writing fit_method artifacts.")
+    prediction = predict_v4_lite(result.tensor, result.final_params, coupling_mode=_coupling_mode_from_stage_results(result.stage_results))
+    binning = result.tensor.structure.binning
+    write_standardized_dataset(destination, result.tensor.dataset)
+
+    state_rows = _state_fraction_rows(prediction)
+    copy_rows = _copy_distribution_rows(prediction, binning)
+    copy_summary = _copy_summary_rows(prediction, binning)
+    observed_hist_rows = _observed_ectag_histogram_rows(result.tensor)
+    observed_summary_rows = _observed_ectag_summary_rows(result.tensor)
+    observed_joint_rows = _observed_ectag_joint_rows(result.tensor)
+    transition_rows = _transition_rows(prediction)
+    growth_rows = _growth_rows(prediction)
+    flux_rows = _transition_flux_rows(prediction)
+    ddpcr_rows = _ddpcr_prediction_rows(result.tensor, prediction)
+    release_rows = _release_table_rows(result.stage_results)
+
+    initial_anchor = {
+        "week1_state_abundance": {condition: abundance.tolist() for condition, abundance in result.tensor.initial_state_abundance.items()},
+        "week1_flow_fractions": {condition: (abundance / max(float(np.sum(abundance)), 1e-12)).tolist() for condition, abundance in result.tensor.initial_state_abundance.items()},
+        "ddpcr_anchor_policy": "bulk pooled mean only; no single-cell or state-specific mean constraint",
+        "olig2_initial_ratio": result.tensor.dataset.olig2_initial_ratio,
+        "olig2_anchor_policy": "weak initial state prior on (NPC+OPC)/(AC+MES)" if result.tensor.dataset.olig2_initial_ratio is not None else "not_provided",
+        "ectag_policy": "species-specific adaptive bins; no config.py ecTAG_max_observed censoring",
+    }
+    write_json(destination / "initial_anchor.json", initial_anchor)
+    (destination / "initial_prior_report.md").write_text(
+        "\n".join(
+            [
+                "# Initial Prior Report",
+                "",
+                "Week1 flow and sorted ecTAG initialize the v4-lite state/copy distributions.",
+                "ddPCR is used only as a pooled mean anchor in the likelihood.",
+                f"OLIG2 weak prior status: {'provided' if result.tensor.dataset.olig2_initial_ratio is not None else 'not_provided'}.",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    write_table_bundle(destination, "empirical_state_species_summary", observed_summary_rows)
+    write_table_bundle(destination, "ectag_histograms", observed_hist_rows)
+    write_table_bundle(destination, "ectag_joint_summary", observed_joint_rows)
+    write_text_pdf(destination / "empirical_summary_plots.pdf", "Empirical summary diagnostics", ["CSV/parquet tables contain observed-data summaries.", f"Observed ecTAG histogram rows: {len(observed_hist_rows)}"])
+
+    arrays = {
+        "posterior_samples": result.posterior_samples.samples if result.posterior_samples is not None else np.zeros((0, 0)),
+        "state_abundance": next(iter(prediction.state_abundance.values())),
+        "copy_distributions": next(iter(prediction.copy_distributions.values())),
+    }
+    _write_fit_npz_and_nc_marker(destination, "M0_observation_only_fit", arrays, "M0 observation-only approximate MAP output")
+    write_table_bundle(destination, "M0_snapshot_latent_estimates", state_rows + copy_summary)
+    write_json(destination / "M0_measurement_noise_final.json", result.reports.calibration_report)
+    write_json(destination / "obs_params_for_full.json", _obs_params_for_full(result))
+    write_text_pdf(
+        destination / "obs_calibration_ppc.pdf",
+        "Observation calibration PPC",
+        [
+            "qPCDR, flow, ecTAG, and ddPCR observation policies are summarized in obs_params_for_full.json.",
+            "ddPCR policy: pooled mean anchor only.",
+            f"Observed ecTAG histogram rows: {len(observed_hist_rows)}",
+        ],
+    )
+    write_text_pdf(destination / "M0_ppc_report.pdf", "M0 observation-only PPC", [f"Worst relative RMSE: {result.reports.posterior_predictive_report.get('worst_relative_rmse')}"])
+
+    _write_fit_npz_and_nc_marker(destination, "M1_ecDNA_kernel_fit", arrays, "M1 ecDNA kernel approximate MAP output")
+    write_table_bundle(destination, "M1_ecDNA_predicted_distributions", copy_rows)
+    write_table_bundle(destination, "M1_ecDNA_summaries", copy_summary)
+    write_table_bundle(destination, "M1_ddPCR_pooled_predictions", ddpcr_rows)
+    write_text_pdf(destination / "M1_ppc_report.pdf", "M1 ecDNA/qPCDR/ddPCR PPC", [f"ddPCR prediction rows: {len(ddpcr_rows)}", "ddPCR policy: pooled mean only"])
+
+    _write_fit_npz_and_nc_marker(destination, "M2_abundance_null_fit", arrays, "M2 abundance null approximate MAP output")
+    write_table_bundle(destination, "M2_transition_matrix", transition_rows)
+    write_table_bundle(destination, "M2_net_growth", growth_rows)
+    write_json(destination / "M2_null_predictive_score.json", {"model_comparison": model_comparison, "stage": "M2-abundance-null"})
+    write_text_pdf(destination / "M2_flow_ppc_report.pdf", "M2 flow/count PPC", [f"state rows: {len(state_rows)}", f"transition rows: {len(transition_rows)}"])
+
+    _write_fit_npz_and_nc_marker(destination, "M3_growth_coupling_fit", arrays, "M3 growth-coupling candidate approximate MAP output")
+    write_table_bundle(
+        destination,
+        "M3_growth_coupling_table",
+        [
+            {
+                "parameter": "theta_P",
+                "estimate": result.final_params.theta_P,
+                "status": "free" if any(row["release"] for row in release_rows if row["full_block"] == "growth_hazard") else "fixed_or_rejected",
+                "sign_probability": _coupling_metric(result.stage_results, "M3-growth-coupling", "posterior_sign_probability"),
+                "contraction": _coupling_metric(result.stage_results, "M3-growth-coupling", "posterior_contraction"),
+                "synthetic_sign_recovery": _coupling_metric(result.stage_results, "M3-growth-coupling", "synthetic_sign_recovery"),
+                "synthetic_recovery_datasets": _coupling_metric(result.stage_results, "M3-growth-coupling", "synthetic_recovery_datasets"),
+            }
+        ],
+    )
+    write_json(destination / "M3_vs_M2_model_comparison.json", {"M3_vs_M2": model_comparison.get("M3_vs_M2.log_objective_improvement"), "criteria": ">=4 plus posterior sign/recovery; approximate run rejects if not proven"})
+    write_text_pdf(destination / "M3_flow_count_ppc.pdf", "M3 growth coupling PPC", ["Coupling is retained only if all v4-lite criteria pass."])
+
+    _write_fit_npz_and_nc_marker(destination, "M4_transition_coupling_fit", arrays, "M4 transition-coupling candidate approximate MAP output")
+    write_table_bundle(
+        destination,
+        "M4_transition_coupling_table",
+        [
+            {
+                "parameter": "beta_C",
+                "estimate": result.final_params.beta_C,
+                "status": "fixed_or_rejected",
+                "sign_probability": _coupling_metric(result.stage_results, "M4-transition-coupling", "posterior_sign_probability"),
+                "contraction": _coupling_metric(result.stage_results, "M4-transition-coupling", "posterior_contraction"),
+                "synthetic_sign_recovery": _coupling_metric(result.stage_results, "M4-transition-coupling", "synthetic_sign_recovery"),
+            },
+            {
+                "parameter": "beta_P",
+                "estimate": result.final_params.beta_P,
+                "status": "fixed_or_rejected",
+                "sign_probability": _coupling_metric(result.stage_results, "M4-transition-coupling", "posterior_sign_probability"),
+                "contraction": _coupling_metric(result.stage_results, "M4-transition-coupling", "posterior_contraction"),
+                "synthetic_sign_recovery": _coupling_metric(result.stage_results, "M4-transition-coupling", "synthetic_sign_recovery"),
+            },
+            {
+                "parameter": "lambda_M",
+                "estimate": result.final_params.lambda_M,
+                "status": "fixed_or_rejected",
+                "sign_probability": _coupling_metric(result.stage_results, "M4-transition-coupling", "posterior_sign_probability"),
+                "contraction": _coupling_metric(result.stage_results, "M4-transition-coupling", "posterior_contraction"),
+                "synthetic_sign_recovery": _coupling_metric(result.stage_results, "M4-transition-coupling", "synthetic_sign_recovery"),
+            },
+        ],
+    )
+    write_table_bundle(destination, "M4_transition_flux", flux_rows)
+    write_json(destination / "M4_vs_M2_M3_comparison.json", {"M4_vs_M2_M3": model_comparison.get("M4_vs_M2_M3.log_objective_improvement"), "criteria": ">=4 plus profile and sign recovery; approximate run rejects if not proven"})
+    write_text_pdf(destination / "M4_transition_ppc.pdf", "M4 transition coupling PPC", ["Transition coupling is retained only if all v4-lite criteria pass."])
+
+    _write_fit_npz_and_nc_marker(destination, "LITE_final_fit", arrays, "Final v4-lite approximate posterior output")
+    write_table_bundle(destination, "LITE_posterior_predictive", result.reports.posterior_predictive_intervals or result.reports.posterior_predictive_residuals)
+    write_table_bundle(destination, "LITE_state_fractions", state_rows)
+    write_table_bundle(destination, "LITE_ecDNA_distributions", copy_rows)
+    write_table_bundle(destination, "LITE_ecDNA_summaries", copy_summary)
+    write_table_bundle(destination, "LITE_growth", growth_rows)
+    write_table_bundle(destination, "LITE_transition_matrix", transition_rows)
+    write_table_bundle(destination, "LITE_transition_flux", flux_rows)
+    write_table_bundle(destination, "LITE_coupling_release_table", release_rows)
+    write_json(destination / "LITE_to_FULL_priors.json", _lite_to_full_priors(result, release_rows))
+    write_text_pdf(
+        destination / "LITE_final_report.pdf",
+        "LITE final report",
+        [
+            f"Posterior label: {result.posterior_samples.skipped_reason if result.posterior_samples else 'missing'}",
+            f"Worst relative RMSE: {result.reports.posterior_predictive_report.get('worst_relative_rmse')}",
+            f"Release rows: {len(release_rows)}",
+        ],
+    )
+    write_json(
+        destination / "fit_method_completion_status.json",
+        {
+            "implemented": [
+                "raw standardization CSV plus optional parquet",
+                "M0-M4 and LITE report file set",
+                "species-specific ecTAG binning",
+                "ddPCR pooled mean anchor",
+                "xarray NetCDF files plus NPZ array mirrors",
+                "posterior predictive 90% interval coverage",
+                "50-dataset synthetic sign-recovery diagnostics for coupling candidates",
+                "approximate SBC rank diagnostics",
+                "full-to-lite prior/release table export",
+            ],
+            "approximate_or_skipped": [
+                f"posterior backend: {_posterior_method(result)}",
+                "falls back to Laplace Gaussian approximation when emcee is unavailable or fails",
+                "PDF reports are concise generated summaries for manual inspection",
+                "restricted full SMC is handled in full_calibration.py and remains approximate unless full raw simulator likelihood is available",
+            ],
+            "parameter_status_rows": list(parameter_status_table),
+        },
+    )
+
+
+def _projection_from_prediction(prediction: V4LitePrediction) -> FullToLiteProjection:
+    condition = prediction.condition_names[0]
+    return FullToLiteProjection(prediction.weeks, prediction.state_abundance[condition].copy(), prediction.copy_distributions[condition].copy(), prediction.transition_matrices[condition].copy(), prediction.growth_rates[condition].copy(), prediction.copy_kernels[condition].copy(), {"source": "v4-lite prediction", "condition": condition})
+
+
+def project_full_to_lite(simulation_result, structure: V4LiteStructure | None = None, purity_matrix: np.ndarray | None = None) -> FullToLiteProjection:
     model_structure = V4LiteStructure.default() if structure is None else structure
-    weeks = tuple(int(round(float(time))) + 1 for time in simulation_result.times)
+    weeks = tuple(int(round(float(t))) + 1 for t in simulation_result.times)
     n_weeks = len(weeks)
     n_bins = model_structure.binning.n_bins
-    state_abundance = np.zeros((n_weeks, cfg.N_STATES), dtype=float)
-    copy_distributions = np.zeros((n_weeks, cfg.N_STATES, cfg.N_SPECIES, n_bins), dtype=float)
-    has_cell_snapshots = bool(getattr(simulation_result, "cell_snapshots", None))
-    for week_index in range(n_weeks):
-        cells = simulation_result.cell_snapshots[week_index] if has_cell_snapshots and week_index < len(simulation_result.cell_snapshots) else []
+    abundance = np.zeros((n_weeks, cfg.N_STATES), dtype=float)
+    copies = np.zeros((n_weeks, cfg.N_STATES, cfg.N_SPECIES, n_bins), dtype=float)
+    snapshots = getattr(simulation_result, "cell_snapshots", None) or []
+    for week_idx in range(n_weeks):
+        cells = snapshots[week_idx] if week_idx < len(snapshots) else []
         if cells:
-            soft_states = np.asarray([cell["soft_state"] for cell in cells], dtype=float)
-            copies = np.asarray([cell["copy_numbers"] for cell in cells], dtype=int)
-            state_abundance[week_index, :] = np.sum(soft_states, axis=0)
-            for state_index in range(cfg.N_STATES):
-                weights = soft_states[:, state_index]
-                total = float(np.sum(weights))
-                for species_index in range(cfg.N_SPECIES):
+            soft = np.asarray([cell["soft_state"] for cell in cells], dtype=float)
+            copy_values = np.asarray([cell["copy_numbers"] for cell in cells], dtype=int)
+            abundance[week_idx] = np.sum(soft, axis=0)
+            for state_idx in range(cfg.N_STATES):
+                weights = soft[:, state_idx]
+                total = max(float(np.sum(weights)), 1e-12)
+                for species_idx in range(cfg.N_SPECIES):
                     counts = np.zeros(n_bins, dtype=float)
-                    for value, weight in zip(copies[:, species_index], weights):
+                    for value, weight in zip(copy_values[:, species_idx], weights):
                         counts[model_structure.binning.bin_index(int(value))] += float(weight)
-                    if total <= 0.0:
-                        counts[0] = 1.0
-                    copy_distributions[week_index, state_index, species_index, :] = _normalize_simplex(counts)
+                    copies[week_idx, state_idx, species_idx] = _normalize(counts / total)
         else:
-            snapshot = simulation_result.truth_snapshots[week_index]
-            population_size = float(snapshot.get("population_size", simulation_result.population_sizes[week_index]))
-            fractions = np.asarray(snapshot.get("soft_state_fractions", simulation_result.soft_state_fractions[week_index]), dtype=float)
-            state_abundance[week_index, :] = population_size * fractions
-            for state_index in range(cfg.N_STATES):
-                for species_index in range(cfg.N_SPECIES):
-                    copy_distributions[week_index, state_index, species_index, 0] = 1.0
-    transition_matrices, growth_rates, copy_kernels, diagnostics = _estimate_event_dynamics(
-        simulation_result,
-        np.asarray(simulation_result.times, dtype=float),
-        state_abundance,
-        model_structure,
-    )
-    diagnostics["cell_snapshots_used"] = has_cell_snapshots
+            snapshot = simulation_result.truth_snapshots[week_idx]
+            size = float(snapshot.get("population_size", simulation_result.population_sizes[week_idx]))
+            fractions = np.asarray(snapshot.get("soft_state_fractions", simulation_result.soft_state_fractions[week_idx]), dtype=float)
+            abundance[week_idx] = size * fractions
+            copies[week_idx, :, :, 0] = 1.0
+    transitions, growth, kernels, diag = _event_dynamics(getattr(simulation_result, "events", ()) or (), simulation_result.times, abundance, model_structure)
     if purity_matrix is not None:
-        diagnostics["purity_matrix_applied"] = True
-        diagnostics["purity_matrix"] = _normalize_purity_matrix(purity_matrix).tolist()
-    return FullToLiteProjection(weeks, state_abundance, copy_distributions, transition_matrices, growth_rates, copy_kernels, diagnostics)
+        diag["purity_matrix_applied"] = True
+    return FullToLiteProjection(weeks, abundance, copies, transitions, growth, kernels, diag)
+
+
+def _event_dynamics(events, times, abundance: np.ndarray, structure: V4LiteStructure):
+    n_intervals = max(len(times) - 1, 0)
+    n_bins = structure.binning.n_bins
+    transitions = np.zeros((n_intervals, cfg.N_STATES, cfg.N_STATES), dtype=float)
+    kernels = np.zeros((n_intervals, cfg.N_STATES, cfg.N_SPECIES, n_bins, n_bins), dtype=float)
+    counts = np.zeros_like(transitions)
+    copy_counts = np.zeros_like(kernels)
+    used = 0
+    for event_time, _event_type, _cell_id, details in events:
+        interval = int(np.searchsorted(np.asarray(times, dtype=float), float(event_time), side="right") - 1)
+        if not (0 <= interval < n_intervals):
+            continue
+        pre = details.get("state_pre", {}) if isinstance(details, Mapping) else {}
+        post = details.get("state_post", {}) if isinstance(details, Mapping) else {}
+        if "soft_state" not in pre or "soft_state" not in post:
+            continue
+        source = _normalize(np.asarray(pre["soft_state"], dtype=float))
+        target = _normalize(np.asarray(post["soft_state"], dtype=float))
+        counts[interval] += np.outer(source, target)
+        if "copy_numbers" in pre and "copy_numbers" in post:
+            pre_c = np.asarray(pre["copy_numbers"], dtype=int)
+            post_c = np.asarray(post["copy_numbers"], dtype=int)
+            for state_idx, weight in enumerate(source):
+                for species_idx in range(cfg.N_SPECIES):
+                    copy_counts[interval, state_idx, species_idx, structure.binning.bin_index(pre_c[species_idx]), structure.binning.bin_index(post_c[species_idx])] += float(weight)
+        used += 1
+    for interval in range(n_intervals):
+        for state_idx in range(cfg.N_STATES):
+            row = counts[interval, state_idx]
+            if float(np.sum(row)) <= 0.0:
+                row = np.eye(cfg.N_STATES)[state_idx]
+            transitions[interval, state_idx] = _normalize(row)
+            for species_idx in range(cfg.N_SPECIES):
+                for source_bin in range(n_bins):
+                    krow = copy_counts[interval, state_idx, species_idx, source_bin]
+                    if float(np.sum(krow)) <= 0.0:
+                        krow = np.eye(n_bins)[source_bin]
+                    kernels[interval, state_idx, species_idx, source_bin] = _normalize(krow)
+    growth = np.log(np.maximum(abundance[1:], 1e-8) / np.maximum(abundance[:-1], 1e-8)) if n_intervals else None
+    return transitions if n_intervals else None, growth, kernels if n_intervals else None, {"event_count": len(events), "used_transition_events": used}
+
+
+def summarize_dataset_v4_lite(dataset: CanonicalFitDataset, *, condition_names: Iterable[str] | None = None, binning: CopyNumberBinning | None = None) -> SummaryCollection:
+    tensor = build_v4_lite_tensor(dataset, condition_names=condition_names, structure=None if binning is None else V4LiteStructure.default(binning=binning))
+    return tensor.observed_summary

@@ -1,0 +1,7 @@
+# Optional dependencies used by the fit pipeline when available.
+# Core code keeps NumPy/SciPy fallbacks so existing tests can still run without
+# installing these into a minimal environment.
+pandas>=2.0
+pyarrow>=14.0
+xarray>=2024.1
+emcee>=3.1

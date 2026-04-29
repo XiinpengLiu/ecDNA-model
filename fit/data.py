@@ -1,22 +1,20 @@
-"""
-Canonical fitting dataset objects and loaders for week1-10 calibration.
-"""
+"""Canonical fitting inputs and CSV/manifest loaders."""
 
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass, field
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
 import config as cfg
+from fit.io_utils import write_json, write_table_bundle
 
 
 WEEK1 = 1
-WEEK10 = 10
 DEFAULT_QPCDR_BATCH = "default"
 DEFAULT_QPCDR_SCALE = "copy_number"
 SUPPORTED_QPCDR_SCALES = {DEFAULT_QPCDR_SCALE, "ct"}
@@ -31,35 +29,27 @@ def _resolve_path(path: str | Path, *, base_dir: Path | None = None) -> Path:
 
 
 def _float_or_none(value: str | None) -> float | None:
-    if value is None:
+    if value is None or not str(value).strip():
         return None
-    text = value.strip()
-    if not text:
-        return None
-    return float(text)
+    return float(value)
 
 
 def _int_or_none(value: str | None) -> int | None:
-    if value is None:
+    if value is None or not str(value).strip():
         return None
-    text = value.strip()
-    if not text:
-        return None
-    return int(text)
+    return int(float(value))
 
 
 def _piecewise_constant(points: Sequence[tuple[float, float]]) -> Callable[[float], float]:
     ordered = tuple(sorted((float(time), float(value)) for time, value in points))
-    for time, _value in ordered:
-        cfg.require(time >= 0.0, "Schedule times must be non-negative.")
 
     def schedule(query_time: float) -> float:
-        current_value = 0.0
+        current = 0.0
         for start_time, value in ordered:
-            if query_time + 1e-12 < start_time:
+            if float(query_time) + 1e-12 < start_time:
                 break
-            current_value = value
-        return float(current_value)
+            current = value
+        return float(current)
 
     return schedule
 
@@ -67,54 +57,25 @@ def _piecewise_constant(points: Sequence[tuple[float, float]]) -> Callable[[floa
 @dataclass(frozen=True)
 class ConditionSpec:
     name: str
-    schedules: dict[str, tuple[tuple[float, float], ...]] = field(default_factory=dict)
+    schedules: Mapping[str, Iterable[tuple[float, float]]] | None = None
     initialization_source: str | None = None
 
     def __post_init__(self) -> None:
-        cfg.require(bool(self.name), "Condition name must be non-empty.")
-        object.__setattr__(self, "schedules", self._normalize_schedules(self.schedules))
-        if self.initialization_source is not None:
-            cfg.require(bool(self.initialization_source), "initialization_source must be non-empty when provided.")
-
-    @staticmethod
-    def _normalize_schedules(
-        schedules: Mapping[str, Iterable[tuple[float, float]]] | None,
-    ) -> dict[str, tuple[tuple[float, float], ...]]:
-        result: dict[str, tuple[tuple[float, float], ...]] = {}
-        if schedules is None:
-            return result
-        for schedule_name, points in schedules.items():
-            cfg.require(
-                schedule_name in cfg.DEFAULT_INPUT_SCHEDULES,
-                f"Unknown schedule key {schedule_name}; expected one of {tuple(cfg.DEFAULT_INPUT_SCHEDULES.keys())}.",
-            )
-            normalized = tuple((float(time), float(value)) for time, value in points)
-            if normalized:
-                starts = np.array([time for time, _ in normalized], dtype=float)
-                cfg.require(np.all(np.diff(starts) >= 0.0), f"Schedule {schedule_name} must be sorted by time.")
-            result[schedule_name] = normalized
-        return result
+        cfg.require(bool(self.name), "ConditionSpec.name must be non-empty.")
+        normalized: dict[str, tuple[tuple[float, float], ...]] = {}
+        for key, points in (self.schedules or {}).items():
+            cfg.require(key in cfg.DEFAULT_INPUT_SCHEDULES, f"Unknown input schedule {key}.")
+            normalized[key] = tuple((float(t), float(v)) for t, v in points)
+        object.__setattr__(self, "schedules", normalized)
 
     def build_input_schedules(self) -> dict[str, Callable[[float], float]]:
-        schedule_functions = dict(cfg.DEFAULT_INPUT_SCHEDULES)
-        for schedule_name, points in self.schedules.items():
-            schedule_functions[schedule_name] = _piecewise_constant(points)
-        return schedule_functions
-
-    def is_baseline(self) -> bool:
-        return not self.has_drug_input() and not self.has_cue_input()
+        schedules = dict(cfg.DEFAULT_INPUT_SCHEDULES)
+        for name, points in self.schedules.items():
+            schedules[name] = _piecewise_constant(points)
+        return schedules
 
     def has_drug_input(self) -> bool:
-        for schedule_name in ("u_C", "u_P"):
-            if any(abs(value) > 1e-12 for _, value in self.schedules.get(schedule_name, ())):
-                return True
-        return False
-
-    def has_cue_input(self) -> bool:
-        for schedule_name in ("a", "m"):
-            if any(abs(value) > 1e-12 for _, value in self.schedules.get(schedule_name, ())):
-                return True
-        return False
+        return any(abs(value) > 1e-12 for key in ("u_C", "u_P") for _time, value in self.schedules.get(key, ()))
 
 
 @dataclass(frozen=True)
@@ -128,16 +89,14 @@ class FlowRecord:
     replicate_id: str | None = None
 
     def __post_init__(self) -> None:
-        cfg.require(bool(self.condition), "FlowRecord.condition must be non-empty.")
+        cfg.require(self.condition != "", "FlowRecord.condition must be non-empty.")
         cfg.require(self.week >= WEEK1, "FlowRecord.week must be at least 1.")
         cfg.require(self.state in cfg.STATE_NAMES, f"Invalid flow state {self.state}.")
         cfg.require(self.count is not None or self.fraction is not None, "FlowRecord requires count or fraction.")
         if self.count is not None:
             cfg.require(self.count >= 0, "FlowRecord.count must be non-negative.")
         if self.fraction is not None:
-            cfg.require(0.0 <= self.fraction <= 1.0, "FlowRecord.fraction must lie in [0, 1].")
-        if self.total_events is not None:
-            cfg.require(self.total_events >= 0, "FlowRecord.total_events must be non-negative.")
+            cfg.require(0.0 <= self.fraction <= 1.0, "FlowRecord.fraction must be in [0, 1].")
 
 
 @dataclass(frozen=True)
@@ -149,7 +108,7 @@ class CountRecord:
     gate: str | None = None
 
     def __post_init__(self) -> None:
-        cfg.require(bool(self.condition), "CountRecord.condition must be non-empty.")
+        cfg.require(self.condition != "", "CountRecord.condition must be non-empty.")
         cfg.require(self.week >= WEEK1, "CountRecord.week must be at least 1.")
         cfg.require(np.isfinite(self.value) and self.value >= 0.0, "CountRecord.value must be finite and non-negative.")
         if self.gate is not None:
@@ -168,16 +127,12 @@ class QPCDRRecord:
     value_scale: str = DEFAULT_QPCDR_SCALE
 
     def __post_init__(self) -> None:
-        cfg.require(bool(self.condition), "QPCDRRecord.condition must be non-empty.")
+        cfg.require(self.condition != "", "QPCDRRecord.condition must be non-empty.")
         cfg.require(self.week >= WEEK1, "QPCDRRecord.week must be at least 1.")
         cfg.require(self.state in cfg.STATE_NAMES, f"Invalid qPCDR state {self.state}.")
         cfg.require(self.species in cfg.SPECIES, f"Invalid qPCDR species {self.species}.")
         cfg.require(np.isfinite(self.value), "QPCDRRecord.value must be finite.")
-        cfg.require(bool(self.batch), "QPCDRRecord.batch must be non-empty.")
-        cfg.require(
-            self.value_scale in SUPPORTED_QPCDR_SCALES,
-            f"Unsupported qPCDR value scale {self.value_scale}; expected one of {SUPPORTED_QPCDR_SCALES}.",
-        )
+        cfg.require(self.value_scale in SUPPORTED_QPCDR_SCALES, f"Unsupported qPCDR scale {self.value_scale}.")
 
 
 @dataclass(frozen=True)
@@ -191,513 +146,491 @@ class EcTAGRecord:
     replicate_id: str | None = None
 
     def __post_init__(self) -> None:
-        cfg.require(bool(self.condition), "EcTAGRecord.condition must be non-empty.")
+        cfg.require(self.condition != "", "EcTAGRecord.condition must be non-empty.")
         cfg.require(self.week >= WEEK1, "EcTAGRecord.week must be at least 1.")
         cfg.require(self.state in cfg.STATE_NAMES, f"Invalid ecTAG state {self.state}.")
         cfg.require(self.species in cfg.SPECIES, f"Invalid ecTAG species {self.species}.")
-        cfg.require(bool(self.cell_id), "EcTAGRecord.cell_id must be non-empty.")
+        cfg.require(self.cell_id != "", "EcTAGRecord.cell_id must be non-empty.")
         cfg.require(self.value >= 0, "EcTAGRecord.value must be non-negative.")
+
+
+@dataclass(frozen=True)
+class DDPCRRecord:
+    condition: str
+    week: int
+    species: str
+    value: float
+    lower: float | None = None
+    upper: float | None = None
+    replicate_id: str | None = None
+
+    def __post_init__(self) -> None:
+        cfg.require(self.condition != "", "DDPCRRecord.condition must be non-empty.")
+        cfg.require(self.week >= WEEK1, "DDPCRRecord.week must be at least 1.")
+        cfg.require(self.species in cfg.SPECIES, f"Invalid ddPCR species {self.species}.")
+        cfg.require(np.isfinite(self.value) and self.value >= 0.0, "DDPCRRecord.value must be finite and non-negative.")
 
 
 @dataclass(frozen=True)
 class CanonicalFitDataset:
     conditions: dict[str, ConditionSpec]
-    flow: tuple[FlowRecord, ...]
-    counts: tuple[CountRecord, ...]
-    qpcdr: tuple[QPCDRRecord, ...]
-    ectag: tuple[EcTAGRecord, ...]
+    flow: tuple[FlowRecord, ...] = ()
+    counts: tuple[CountRecord, ...] = ()
+    qpcdr: tuple[QPCDRRecord, ...] = ()
+    ectag: tuple[EcTAGRecord, ...] = ()
+    ddpcr: tuple[DDPCRRecord, ...] = ()
     week1_copy_distributions: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
     ectag_hist_max: int | None = None
     purity_matrix: np.ndarray | None = None
     purity_sensitivity: tuple[np.ndarray, ...] = ()
     qpcdr_calibration: dict[str, dict[str, float]] = field(default_factory=dict)
-    batch_column_policy: str = "as-provided"
+    olig2_initial_ratio: float | None = None
 
     def __post_init__(self) -> None:
-        normalized_conditions = {name: spec for name, spec in self.conditions.items()}
-        cfg.require(bool(normalized_conditions), "CanonicalFitDataset requires at least one condition.")
-        object.__setattr__(self, "conditions", normalized_conditions)
+        cfg.require(bool(self.conditions), "CanonicalFitDataset requires at least one condition.")
         object.__setattr__(self, "flow", tuple(self.flow))
         object.__setattr__(self, "counts", tuple(self.counts))
         object.__setattr__(self, "qpcdr", tuple(self.qpcdr))
         object.__setattr__(self, "ectag", tuple(self.ectag))
-        object.__setattr__(self, "week1_copy_distributions", self._normalize_week1_copy_distributions(self.week1_copy_distributions))
+        object.__setattr__(self, "ddpcr", tuple(self.ddpcr))
+        object.__setattr__(self, "week1_copy_distributions", self._normalize_week1(self.week1_copy_distributions))
         if self.purity_matrix is not None:
-            object.__setattr__(self, "purity_matrix", self._normalize_purity_matrix(self.purity_matrix, "purity_matrix"))
-        object.__setattr__(
-            self,
-            "purity_sensitivity",
-            tuple(self._normalize_purity_matrix(matrix, f"purity_sensitivity[{index}]") for index, matrix in enumerate(self.purity_sensitivity)),
-        )
-        object.__setattr__(self, "qpcdr_calibration", dict(self.qpcdr_calibration))
-        cfg.require(bool(self.batch_column_policy), "batch_column_policy must be non-empty.")
+            object.__setattr__(self, "purity_matrix", self._normalize_purity(self.purity_matrix))
+        object.__setattr__(self, "purity_sensitivity", tuple(self._normalize_purity(m) for m in self.purity_sensitivity))
+        if self.olig2_initial_ratio is not None:
+            cfg.require(np.isfinite(self.olig2_initial_ratio) and self.olig2_initial_ratio > 0.0, "OLIG2 initial ratio must be positive when provided.")
         self.validate()
 
     @staticmethod
-    def _normalize_week1_copy_distributions(
-        values: Mapping[str, Mapping[str, np.ndarray]] | None,
-    ) -> dict[str, dict[str, np.ndarray]]:
-        result: dict[str, dict[str, np.ndarray]] = {}
-        if values is None:
-            return result
-        for condition, by_state in values.items():
-            state_payload: dict[str, np.ndarray] = {}
+    def _normalize_week1(payload: Mapping[str, Mapping[str, np.ndarray]]) -> dict[str, dict[str, np.ndarray]]:
+        normalized: dict[str, dict[str, np.ndarray]] = {}
+        for condition, by_state in payload.items():
+            normalized[condition] = {}
             for state_name, matrix in by_state.items():
+                cfg.require(state_name in cfg.STATE_NAMES, f"Invalid week1 state {state_name}.")
                 array = np.asarray(matrix, dtype=int)
-                cfg.require(
-                    array.ndim == 2 and array.shape[1] == cfg.N_SPECIES,
-                    f"week1 copy matrix for {condition}/{state_name} must have shape (n, {cfg.N_SPECIES}).",
-                )
-                cfg.require(array.shape[0] > 0, f"week1 copy matrix for {condition}/{state_name} must be non-empty.")
-                cfg.require(np.all(array >= 0), f"week1 copy matrix for {condition}/{state_name} must be non-negative.")
-                state_payload[state_name] = array.copy()
-            result[condition] = state_payload
-        return result
+                cfg.require(array.ndim == 2 and array.shape[1] == cfg.N_SPECIES, "week1 copy matrices must be n x species.")
+                cfg.require(array.shape[0] > 0, "week1 copy matrices must be non-empty.")
+                cfg.require(np.all(array >= 0), "week1 copy matrices must be non-negative.")
+                normalized[condition][state_name] = array.copy()
+        return normalized
 
     @staticmethod
-    def _normalize_purity_matrix(values: np.ndarray, name: str) -> np.ndarray:
-        matrix = np.asarray(values, dtype=float)
-        cfg.require(matrix.shape == (cfg.N_STATES, cfg.N_STATES), f"{name} must have shape ({cfg.N_STATES}, {cfg.N_STATES}).")
-        cfg.require(np.all(np.isfinite(matrix)), f"{name} must be finite.")
-        cfg.require(np.all(matrix >= 0.0), f"{name} must be non-negative.")
-        column_sums = np.sum(matrix, axis=0)
-        cfg.require(np.all(column_sums > 0.0), f"Every {name} column must have positive mass.")
-        return matrix / column_sums
+    def _normalize_purity(matrix: np.ndarray) -> np.ndarray:
+        values = np.asarray(matrix, dtype=float)
+        cfg.require(values.shape == (cfg.N_STATES, cfg.N_STATES), "purity matrix has invalid shape.")
+        cfg.require(np.all(np.isfinite(values)) and np.all(values >= 0.0), "purity matrix must be finite and non-negative.")
+        totals = np.sum(values, axis=0)
+        cfg.require(np.all(totals > 0.0), "purity matrix columns must have positive mass.")
+        return values / totals
 
     def validate(self) -> None:
-        referenced_conditions = set(self.conditions)
-        for collection_name, records in (
-            ("flow", self.flow),
-            ("counts", self.counts),
-            ("qpcdr", self.qpcdr),
-            ("ectag", self.ectag),
-        ):
-            for record in records:
-                condition = getattr(record, "condition")
-                cfg.require(condition in referenced_conditions, f"{collection_name} record references unknown condition {condition}.")
-
-        qpcdr_scales = {record.value_scale for record in self.qpcdr}
-        cfg.require(len(qpcdr_scales) <= 1, "qPCDR records must use a single value scale across the dataset.")
-
-        dynamic_weeks = self.dynamic_weeks()
-        cfg.require(bool(dynamic_weeks), "CanonicalFitDataset requires at least one dynamic week in week2-10.")
-        for condition_name in self.conditions:
-            init_condition = self.resolve_initialization_condition(condition_name)
+        names = set(self.conditions)
+        for label, rows in (("flow", self.flow), ("counts", self.counts), ("qpcdr", self.qpcdr), ("ectag", self.ectag), ("ddpcr", self.ddpcr)):
+            for row in rows:
+                cfg.require(getattr(row, "condition") in names, f"{label} record references unknown condition.")
+        scales = {row.value_scale for row in self.qpcdr}
+        cfg.require(len(scales) <= 1, "qPCDR records must use one scale per dataset.")
+        cfg.require(bool(self.dynamic_weeks()), "CanonicalFitDataset requires dynamic data after week1.")
+        for condition in self.conditions:
+            init_condition = self.resolve_initialization_condition(condition)
             self._validate_week1_flow(init_condition)
-            self._validate_week1_copy_source(init_condition)
-
-    def resolve_initialization_condition(self, condition_name: str) -> str:
-        cfg.require(condition_name in self.conditions, f"Unknown condition {condition_name}.")
-        init_source = self.conditions[condition_name].initialization_source
-        resolved = condition_name if init_source is None else init_source
-        cfg.require(resolved in self.conditions, f"Initialization condition {resolved} is not defined.")
-        return resolved
-
-    def _validate_week1_flow(self, condition_name: str) -> None:
-        records = [record for record in self.flow if record.condition == condition_name and record.week == WEEK1]
-        cfg.require(records, f"Missing week1 flow records for condition {condition_name}.")
-        by_state = {record.state for record in records}
-        cfg.require(set(cfg.STATE_NAMES).issubset(by_state), f"week1 flow records for {condition_name} must cover every state.")
-
-    def _validate_week1_copy_source(self, condition_name: str) -> None:
-        if condition_name in self.week1_copy_distributions:
-            by_state = self.week1_copy_distributions[condition_name]
-            cfg.require(set(by_state) == set(cfg.STATE_NAMES), f"week1 copy matrices for {condition_name} must cover every state.")
-            return
-        by_state = self._week1_ectag_grouped(condition_name)
-        cfg.require(set(by_state) == set(cfg.STATE_NAMES), f"week1 ecTAG records for {condition_name} must cover every state.")
-        for state_name, cell_map in by_state.items():
-            cfg.require(cell_map, f"week1 ecTAG records for {condition_name}/{state_name} must be non-empty.")
-            for cell_key, species_map in cell_map.items():
-                missing = set(cfg.SPECIES) - set(species_map)
-                cfg.require(
-                    not missing,
-                    f"week1 ecTAG cell {cell_key} in {condition_name}/{state_name} is missing species {sorted(missing)}; aligned cell-level week1 data is required.",
-                )
-
-    def qpcdr_scale(self) -> str:
-        if not self.qpcdr:
-            return DEFAULT_QPCDR_SCALE
-        return self.qpcdr[0].value_scale
-
-    def qpcdr_batch(self) -> str:
-        if not self.qpcdr:
-            return DEFAULT_QPCDR_BATCH
-        return self.qpcdr[0].batch
-
-    def qpcdr_batches(self) -> tuple[str, ...]:
-        if not self.qpcdr:
-            return (DEFAULT_QPCDR_BATCH,)
-        return tuple(sorted({record.batch for record in self.qpcdr}))
+            self._validate_week1_copy(init_condition)
 
     def condition_names(self) -> tuple[str, ...]:
-        return tuple(self.conditions.keys())
+        return tuple(self.conditions)
 
     def dynamic_weeks(self) -> tuple[int, ...]:
         weeks = {
-            record.week
-            for collection in (self.flow, self.counts, self.qpcdr, self.ectag)
-            for record in collection
-            if record.week > WEEK1
+            row.week
+            for collection in (self.flow, self.counts, self.qpcdr, self.ectag, self.ddpcr)
+            for row in collection
+            if row.week > WEEK1
         }
-        return tuple(sorted(int(week) for week in weeks))
+        return tuple(sorted(weeks))
+
+    def qpcdr_scale(self) -> str:
+        return self.qpcdr[0].value_scale if self.qpcdr else DEFAULT_QPCDR_SCALE
+
+    def qpcdr_batches(self) -> tuple[str, ...]:
+        return tuple(sorted({row.batch for row in self.qpcdr})) if self.qpcdr else (DEFAULT_QPCDR_BATCH,)
 
     def ectag_upper_bound(self) -> int:
+        values = [row.value for row in self.ectag]
         if self.ectag_hist_max is not None:
-            return int(self.ectag_hist_max)
-        if not self.ectag:
-            return 0
-        return int(max(record.value for record in self.ectag))
+            values.append(int(self.ectag_hist_max))
+        return max(values) if values else 0
 
-    def _week1_ectag_grouped(self, condition_name: str) -> dict[str, dict[str, dict[str, int]]]:
+    def resolve_initialization_condition(self, condition: str) -> str:
+        cfg.require(condition in self.conditions, f"Unknown condition {condition}.")
+        source = self.conditions[condition].initialization_source or condition
+        cfg.require(source in self.conditions, f"Unknown initialization source {source}.")
+        return source
+
+    def _validate_week1_flow(self, condition: str) -> None:
+        states = {row.state for row in self.flow if row.condition == condition and row.week == WEEK1}
+        cfg.require(set(cfg.STATE_NAMES).issubset(states), f"week1 flow must cover every state for {condition}.")
+
+    def _validate_week1_copy(self, condition: str) -> None:
+        if condition in self.week1_copy_distributions:
+            cfg.require(set(self.week1_copy_distributions[condition]) == set(cfg.STATE_NAMES), "week1 copy distributions must cover all states.")
+            return
+        grouped = self._week1_ectag_grouped(condition)
+        cfg.require(set(grouped) == set(cfg.STATE_NAMES), f"week1 ecTAG must cover every state for {condition}.")
+        for state_name, cells in grouped.items():
+            cfg.require(bool(cells), f"week1 ecTAG has no cells for {condition}/{state_name}.")
+            for cell_id, species_values in cells.items():
+                missing = set(cfg.SPECIES) - set(species_values)
+                cfg.require(not missing, f"week1 ecTAG cell {cell_id} is missing {sorted(missing)}.")
+
+    def _week1_ectag_grouped(self, condition: str) -> dict[str, dict[str, dict[str, int]]]:
         grouped: dict[str, dict[str, dict[str, int]]] = {}
-        for record in self.ectag:
-            if record.condition != condition_name or record.week != WEEK1:
-                continue
-            cell_key = self._ectag_cell_key(record)
-            grouped.setdefault(record.state, {}).setdefault(cell_key, {})[record.species] = int(record.value)
+        for row in self.ectag:
+            if row.condition == condition and row.week == WEEK1:
+                key = self._cell_key(row)
+                grouped.setdefault(row.state, {}).setdefault(key, {})[row.species] = int(row.value)
         return grouped
 
     @staticmethod
-    def _ectag_cell_key(record: EcTAGRecord) -> str:
-        replicate_token = "" if record.replicate_id is None else f"{record.replicate_id}|"
-        return f"{replicate_token}{record.cell_id}"
+    def _cell_key(row: EcTAGRecord) -> str:
+        return f"{row.replicate_id or ''}|{row.cell_id}"
 
-    def build_empirical_initialization(
-        self,
-        condition_name: str,
-        *,
-        template: cfg.InitializationParameters | None = None,
-    ) -> cfg.InitializationParameters:
-        init_condition = self.resolve_initialization_condition(condition_name)
+    def build_empirical_initialization(self, condition: str, *, template: cfg.InitializationParameters | None = None) -> cfg.InitializationParameters:
+        source = self.resolve_initialization_condition(condition)
         base = cfg.DEFAULT_INITIALIZATION_PARAMETERS if template is None else template
-        flow_fractions = self._build_week1_flow_fractions(init_condition)
-        copy_distributions = self._build_week1_copy_distributions(init_condition)
-        initialization = cfg.InitializationParameters(
+        flow = self._week1_flow_fractions(source)
+        copies = self._week1_copy_distributions(source)
+        init = cfg.InitializationParameters(
             mode=cfg.EMPIRICAL_WEEK1,
             parametric_copy_number_mean=np.asarray(base.parametric_copy_number_mean, dtype=float).copy(),
             parametric_state_dirichlet_alpha=np.asarray(base.parametric_state_dirichlet_alpha, dtype=float).copy(),
             cycle_probabilities=np.asarray(base.cycle_probabilities, dtype=float).copy(),
             age_scale=float(base.age_scale),
-            empirical_flow_fractions=flow_fractions,
-            empirical_sorted_copy_distributions=copy_distributions,
+            empirical_flow_fractions=flow,
+            empirical_sorted_copy_distributions=copies,
             empirical_soft_state_concentration=float(base.empirical_soft_state_concentration),
         )
-        cfg.validate_initialization_parameters(initialization)
-        return initialization
+        cfg.validate_initialization_parameters(init)
+        return init
 
-    def _build_week1_flow_fractions(self, condition_name: str) -> np.ndarray:
-        rows = [record for record in self.flow if record.condition == condition_name and record.week == WEEK1]
-        state_totals = np.zeros(cfg.N_STATES, dtype=float)
-        if any(record.count is not None for record in rows):
-            for record in rows:
-                if record.count is not None:
-                    state_totals[cfg.STATE_INDEX[record.state]] += float(record.count)
-                elif record.fraction is not None and record.total_events is not None:
-                    state_totals[cfg.STATE_INDEX[record.state]] += float(record.fraction * record.total_events)
+    def _week1_flow_fractions(self, condition: str) -> np.ndarray:
+        rows = [row for row in self.flow if row.condition == condition and row.week == WEEK1]
+        totals = np.zeros(cfg.N_STATES, dtype=float)
+        if any(row.count is not None for row in rows):
+            for row in rows:
+                if row.count is not None:
+                    totals[cfg.STATE_INDEX[row.state]] += float(row.count)
+                elif row.fraction is not None and row.total_events is not None:
+                    totals[cfg.STATE_INDEX[row.state]] += float(row.fraction * row.total_events)
         else:
-            replicate_maps: dict[str, np.ndarray] = {}
-            for record in rows:
-                replicate_key = record.replicate_id or "__aggregate__"
-                replicate_maps.setdefault(replicate_key, np.zeros(cfg.N_STATES, dtype=float))
-                cfg.require(record.fraction is not None, f"week1 flow record for {condition_name}/{record.state} is missing fraction.")
-                replicate_maps[replicate_key][cfg.STATE_INDEX[record.state]] = float(record.fraction)
-            cfg.require(bool(replicate_maps), f"No week1 flow replicates found for {condition_name}.")
-            state_totals = np.mean(np.stack(tuple(replicate_maps.values()), axis=0), axis=0)
+            for row in rows:
+                totals[cfg.STATE_INDEX[row.state]] += float(row.fraction or 0.0)
+        total = float(np.sum(totals))
+        cfg.require(total > 0.0, f"week1 flow total must be positive for {condition}.")
+        fractions = totals / total
+        cfg.validate_probability_vector(fractions, name="week1 flow fractions", expected_shape=(cfg.N_STATES,))
+        return fractions
 
-        total = float(np.sum(state_totals))
-        cfg.require(total > 0.0, f"week1 flow totals for {condition_name} must be positive.")
-        flow_fractions = state_totals / total
-        cfg.validate_probability_vector(flow_fractions, name=f"{condition_name}.week1_flow_fractions", expected_shape=(cfg.N_STATES,))
-        return flow_fractions.astype(float)
-
-    def _build_week1_copy_distributions(self, condition_name: str) -> dict[str, np.ndarray]:
-        if condition_name in self.week1_copy_distributions:
-            return {
-                state_name: np.asarray(matrix, dtype=int).copy()
-                for state_name, matrix in self.week1_copy_distributions[condition_name].items()
-            }
-
-        grouped = self._week1_ectag_grouped(condition_name)
-        copy_distributions: dict[str, np.ndarray] = {}
+    def _week1_copy_distributions(self, condition: str) -> dict[str, np.ndarray]:
+        if condition in self.week1_copy_distributions:
+            return {state: matrix.copy() for state, matrix in self.week1_copy_distributions[condition].items()}
+        grouped = self._week1_ectag_grouped(condition)
+        matrices: dict[str, np.ndarray] = {}
         for state_name in cfg.STATE_NAMES:
-            cell_map = grouped.get(state_name, {})
-            rows: list[list[int]] = []
-            for _cell_key, species_map in sorted(cell_map.items()):
-                rows.append([int(species_map[species]) for species in cfg.SPECIES])
-            matrix = np.asarray(rows, dtype=int)
-            cfg.require(
-                matrix.ndim == 2 and matrix.shape[0] > 0 and matrix.shape[1] == cfg.N_SPECIES,
-                f"week1 ecTAG-derived copy distribution for {condition_name}/{state_name} must have shape (n, {cfg.N_SPECIES}).",
-            )
-            copy_distributions[state_name] = matrix
-        return copy_distributions
+            rows = [[species_values[species] for species in cfg.SPECIES] for _cell, species_values in sorted(grouped[state_name].items())]
+            matrices[state_name] = np.asarray(rows, dtype=int)
+        return matrices
 
     @classmethod
-    def from_manifest(cls, manifest_path: str | Path) -> "CanonicalFitDataset":
-        manifest_file = _resolve_path(manifest_path)
-        payload = json.loads(manifest_file.read_text(encoding="utf-8"))
-        base_dir = manifest_file.parent
-
+    def from_manifest(cls, path: str | Path) -> "CanonicalFitDataset":
+        manifest = _resolve_path(path)
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        base = manifest.parent
         conditions = {
-            name: ConditionSpec(
-                name=name,
-                schedules=spec_payload.get("schedules", {}),
-                initialization_source=spec_payload.get("initialization_source"),
-            )
-            for name, spec_payload in payload["conditions"].items()
+            name: ConditionSpec(name, spec.get("schedules", {}), spec.get("initialization_source"))
+            for name, spec in payload["conditions"].items()
         }
-
-        flow = load_flow_csv(_resolve_path(payload["files"]["flow"], base_dir=base_dir))
-        counts = ()
-        if payload["files"].get("counts"):
-            counts = load_count_csv(_resolve_path(payload["files"]["counts"], base_dir=base_dir))
-        qpcdr = ()
-        if payload["files"].get("qpcdr"):
-            qpcdr = load_qpcdr_csv(_resolve_path(payload["files"]["qpcdr"], base_dir=base_dir))
-        ectag = ()
-        if payload["files"].get("ectag"):
-            ectag = load_ectag_csv(_resolve_path(payload["files"]["ectag"], base_dir=base_dir))
-
-        week1_copy_distributions: dict[str, dict[str, np.ndarray]] = {}
-        if payload["files"].get("week1_copy_distributions"):
-            matrix_payload = json.loads(
-                _resolve_path(payload["files"]["week1_copy_distributions"], base_dir=base_dir).read_text(encoding="utf-8")
-            )
-            week1_copy_distributions = {
-                condition: {state_name: np.asarray(matrix, dtype=int) for state_name, matrix in by_state.items()}
-                for condition, by_state in matrix_payload.items()
-            }
-
-        purity_matrix = payload.get("purity_matrix")
-        purity_sensitivity = tuple(np.asarray(matrix, dtype=float) for matrix in payload.get("purity_sensitivity", ()))
-
+        files = payload.get("files", {})
+        week1: dict[str, dict[str, np.ndarray]] = {}
+        if files.get("week1_copy_distributions"):
+            raw = json.loads(_resolve_path(files["week1_copy_distributions"], base_dir=base).read_text(encoding="utf-8"))
+            week1 = {condition: {state: np.asarray(matrix, dtype=int) for state, matrix in by_state.items()} for condition, by_state in raw.items()}
         return cls(
             conditions=conditions,
-            flow=flow,
-            counts=counts,
-            qpcdr=qpcdr,
-            ectag=ectag,
-            week1_copy_distributions=week1_copy_distributions,
+            flow=load_flow_csv(_resolve_path(files["flow"], base_dir=base)) if files.get("flow") else (),
+            counts=load_count_csv(_resolve_path(files["counts"], base_dir=base)) if files.get("counts") else (),
+            qpcdr=load_qpcdr_csv(_resolve_path(files["qpcdr"], base_dir=base)) if files.get("qpcdr") else (),
+            ectag=load_ectag_csv(_resolve_path(files["ectag"], base_dir=base)) if files.get("ectag") else (),
+            ddpcr=load_ddpcr_csv(_resolve_path(files["ddpcr"], base_dir=base)) if files.get("ddpcr") else (),
+            week1_copy_distributions=week1,
             ectag_hist_max=payload.get("ectag_hist_max"),
-            purity_matrix=None if purity_matrix is None else np.asarray(purity_matrix, dtype=float),
-            purity_sensitivity=purity_sensitivity,
+            purity_matrix=None if payload.get("purity_matrix") is None else np.asarray(payload["purity_matrix"], dtype=float),
+            purity_sensitivity=tuple(np.asarray(m, dtype=float) for m in payload.get("purity_sensitivity", ())),
             qpcdr_calibration=payload.get("qpcdr_calibration", {}),
-            batch_column_policy=payload.get("batch_column_policy", "as-provided"),
+            olig2_initial_ratio=payload.get("olig2_initial_ratio"),
         )
 
     @classmethod
     def from_simulation_runs(
         cls,
-        runs_by_condition: Mapping[str, Sequence["SimulationResult"] | "SimulationResult"],
+        runs_by_condition: Mapping[str, Sequence[object] | object],
         *,
         conditions: Mapping[str, ConditionSpec] | None = None,
         qpcdr_value_scale: str = DEFAULT_QPCDR_SCALE,
         ectag_hist_max: int | None = None,
     ) -> "CanonicalFitDataset":
-        from core.simulation import SimulationResult
-
-        normalized_runs: dict[str, tuple[SimulationResult, ...]] = {}
-        for condition_name, payload in runs_by_condition.items():
-            if isinstance(payload, SimulationResult):
-                normalized_runs[condition_name] = (payload,)
+        normalized: dict[str, tuple[object, ...]] = {}
+        for condition, payload in runs_by_condition.items():
+            if isinstance(payload, tuple) or isinstance(payload, list):
+                normalized[condition] = tuple(payload)
             else:
-                normalized_runs[condition_name] = tuple(payload)
-            cfg.require(normalized_runs[condition_name], f"Simulation payload for {condition_name} must be non-empty.")
-
-        condition_specs = (
-            {name: ConditionSpec(name=name) for name in normalized_runs}
-            if conditions is None
-            else {name: spec for name, spec in conditions.items()}
-        )
-
+                normalized[condition] = (payload,)
+        specs = {name: ConditionSpec(name) for name in normalized} if conditions is None else dict(conditions)
         flow: list[FlowRecord] = []
         counts: list[CountRecord] = []
         qpcdr: list[QPCDRRecord] = []
         ectag: list[EcTAGRecord] = []
-        week1_copy_rows: dict[str, dict[str, list[list[int]]]] = {}
-
-        for condition_name, results in normalized_runs.items():
-            cfg.require(condition_name in condition_specs, f"Missing ConditionSpec for {condition_name}.")
-            for replicate_index, result in enumerate(results):
-                replicate_id = f"sim{replicate_index}"
-                for time_value, truth_snapshot, observation_snapshot in zip(
-                    result.times,
-                    result.truth_snapshots,
-                    result.observations,
-                ):
+        week1: dict[str, dict[str, list[list[int]]]] = {}
+        for condition, runs in normalized.items():
+            for rep_idx, result in enumerate(runs):
+                replicate = f"sim{rep_idx}"
+                observations = getattr(result, "observations", ())
+                snapshots = getattr(result, "cell_snapshots", ())
+                for time_idx, time_value in enumerate(getattr(result, "times", ())):
                     week = int(round(float(time_value))) + 1
-                    for state_index, state_name in enumerate(cfg.STATE_NAMES):
-                        flow.append(
-                            FlowRecord(
-                                condition=condition_name,
-                                week=week,
-                                state=state_name,
-                                count=int(observation_snapshot["flow_counts"][state_index]),
-                                fraction=float(observation_snapshot["flow_fractions"][state_index]),
-                                total_events=int(sum(observation_snapshot["flow_counts"])),
-                                replicate_id=replicate_id,
-                            )
-                        )
-                    counts.append(
-                        CountRecord(
-                            condition=condition_name,
-                            week=week,
-                            value=float(observation_snapshot["observed_count"]),
-                            replicate_id=replicate_id,
-                        )
-                    )
-                    sorted_state_counts = observation_snapshot.get("sorted_state_counts", {})
-                    for state_name in cfg.STATE_NAMES:
-                        if state_name in sorted_state_counts:
-                            counts.append(
-                                CountRecord(
-                                    condition=condition_name,
-                                    week=week,
-                                    value=float(sorted_state_counts[state_name]),
-                                    replicate_id=replicate_id,
-                                    gate=state_name,
-                                )
-                            )
-
-                    for state_name in cfg.STATE_NAMES:
-                        qpcdr_payload = observation_snapshot["sorted_qpcdr"]["values"][state_name]
-                        ectag_payload = observation_snapshot["sorted_ecTAG"]["values"][state_name]
-                        per_species_lengths = [len(ectag_payload[species_name]) for species_name in cfg.SPECIES]
-                        aligned_ectag = len(set(per_species_lengths)) == 1
-                        for species_name in cfg.SPECIES:
-                            for value_index, value in enumerate(qpcdr_payload[species_name]):
-                                qpcdr.append(
-                                    QPCDRRecord(
-                                        condition=condition_name,
-                                        week=week,
-                                        state=state_name,
-                                        species=species_name,
-                                        value=float(value),
-                                        replicate_id=replicate_id,
-                                        batch=DEFAULT_QPCDR_BATCH,
-                                        value_scale=qpcdr_value_scale,
-                                    )
-                                )
-                            for value_index, value in enumerate(ectag_payload[species_name]):
-                                cell_id = (
-                                    f"{replicate_id}|{condition_name}|week{week}|{state_name}|cell{value_index}"
-                                    if aligned_ectag
-                                    else f"{replicate_id}|{condition_name}|week{week}|{state_name}|{species_name}|obs{value_index}"
-                                )
-                                ectag.append(
-                                    EcTAGRecord(
-                                        condition=condition_name,
-                                        week=week,
-                                        state=state_name,
-                                        species=species_name,
-                                        cell_id=cell_id,
-                                        value=int(value),
-                                        replicate_id=replicate_id,
-                                    )
-                                )
-
-                        if week == WEEK1:
-                            copy_payload = observation_snapshot["sorted_copy_distributions"][state_name]
-                            week1_copy_rows.setdefault(condition_name, {}).setdefault(state_name, []).extend(copy_payload)
-
-        week1_copy_distributions = {
-            condition_name: {state_name: np.asarray(rows, dtype=int) for state_name, rows in by_state.items()}
-            for condition_name, by_state in week1_copy_rows.items()
-        }
-        inferred_hist_max = ectag_hist_max
-        if inferred_hist_max is None and ectag:
-            inferred_hist_max = max(record.value for record in ectag)
-
-        return cls(
-            conditions=condition_specs,
-            flow=tuple(flow),
-            counts=tuple(counts),
-            qpcdr=tuple(qpcdr),
-            ectag=tuple(ectag),
-            week1_copy_distributions=week1_copy_distributions,
-            ectag_hist_max=inferred_hist_max,
-            purity_matrix=None,
-            purity_sensitivity=(),
-            qpcdr_calibration={},
-            batch_column_policy="as-provided",
-        )
+                    obs = observations[time_idx] if time_idx < len(observations) else {}
+                    if obs:
+                        for state_idx, state in enumerate(cfg.STATE_NAMES):
+                            flow.append(FlowRecord(condition, week, state, int(obs["flow_counts"][state_idx]), float(obs["flow_fractions"][state_idx]), int(sum(obs["flow_counts"])), replicate))
+                        counts.append(CountRecord(condition, week, float(obs.get("observed_count", sum(obs["flow_counts"]))), replicate))
+                        for state in cfg.STATE_NAMES:
+                            for species in cfg.SPECIES:
+                                for value in obs.get("sorted_qpcdr", {}).get("values", {}).get(state, {}).get(species, ()):
+                                    qpcdr.append(QPCDRRecord(condition, week, state, species, float(value), replicate, value_scale=qpcdr_value_scale))
+                                for idx, value in enumerate(obs.get("sorted_ecTAG", {}).get("values", {}).get(state, {}).get(species, ())):
+                                    ectag.append(EcTAGRecord(condition, week, state, species, f"{state}|cell{idx}", int(value), replicate))
+                    elif time_idx < len(snapshots):
+                        cells = snapshots[time_idx]
+                        hard_states = [int(np.argmax(cell["soft_state"])) for cell in cells]
+                        for state_idx, state in enumerate(cfg.STATE_NAMES):
+                            state_cells = [cell for cell, hard in zip(cells, hard_states) if hard == state_idx]
+                            flow.append(FlowRecord(condition, week, state, len(state_cells), len(state_cells) / max(len(cells), 1), len(cells), replicate))
+                            if week == WEEK1:
+                                week1.setdefault(condition, {}).setdefault(state, []).extend(np.asarray([cell["copy_numbers"] for cell in state_cells], dtype=int).tolist())
+        week1_arrays = {condition: {state: np.asarray(rows or [[0, 0, 0]], dtype=int) for state, rows in by_state.items()} for condition, by_state in week1.items()}
+        for condition in specs:
+            week1_arrays.setdefault(condition, {state: np.asarray([[0, 0, 0]], dtype=int) for state in cfg.STATE_NAMES})
+            for state in cfg.STATE_NAMES:
+                week1_arrays[condition].setdefault(state, np.asarray([[0, 0, 0]], dtype=int))
+        return cls(specs, tuple(flow), tuple(counts), tuple(qpcdr), tuple(ectag), (), week1_arrays, ectag_hist_max)
 
 
 def load_flow_csv(path: str | Path) -> tuple[FlowRecord, ...]:
-    resolved = _resolve_path(path)
     rows: list[FlowRecord] = []
-    with open(resolved, "r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for raw in reader:
-            rows.append(
-                FlowRecord(
-                    condition=raw["condition"],
-                    week=int(raw["week"]),
-                    state=raw["state"],
-                    count=_int_or_none(raw.get("count")),
-                    fraction=_float_or_none(raw.get("fraction")),
-                    total_events=_int_or_none(raw.get("total_events")),
-                    replicate_id=raw.get("replicate_id") or None,
-                )
-            )
+    with open(_resolve_path(path), "r", encoding="utf-8", newline="") as handle:
+        for raw in csv.DictReader(handle):
+            rows.append(FlowRecord(raw["condition"], int(raw["week"]), raw["state"], _int_or_none(raw.get("count")), _float_or_none(raw.get("fraction")), _int_or_none(raw.get("total_events")), raw.get("replicate_id") or None))
     return tuple(rows)
 
 
 def load_count_csv(path: str | Path) -> tuple[CountRecord, ...]:
-    resolved = _resolve_path(path)
     rows: list[CountRecord] = []
-    with open(resolved, "r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for raw in reader:
-            rows.append(
-                CountRecord(
-                    condition=raw["condition"],
-                    week=int(raw["week"]),
-                    value=float(raw["count"]),
-                    replicate_id=raw.get("replicate_id") or None,
-                    gate=raw.get("gate") or None,
-                )
-            )
+    with open(_resolve_path(path), "r", encoding="utf-8", newline="") as handle:
+        for raw in csv.DictReader(handle):
+            rows.append(CountRecord(raw["condition"], int(raw["week"]), float(raw["count"]), raw.get("replicate_id") or None, raw.get("gate") or None))
     return tuple(rows)
 
 
 def load_qpcdr_csv(path: str | Path) -> tuple[QPCDRRecord, ...]:
-    resolved = _resolve_path(path)
     rows: list[QPCDRRecord] = []
-    with open(resolved, "r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for raw in reader:
-            rows.append(
-                QPCDRRecord(
-                    condition=raw["condition"],
-                    week=int(raw["week"]),
-                    state=raw["state"],
-                    species=raw["species"],
-                    value=float(raw["value"]),
-                    replicate_id=raw.get("replicate_id") or None,
-                    batch=(raw.get("batch") or DEFAULT_QPCDR_BATCH),
-                    value_scale=(raw.get("value_scale") or DEFAULT_QPCDR_SCALE),
-                )
-            )
+    with open(_resolve_path(path), "r", encoding="utf-8", newline="") as handle:
+        for raw in csv.DictReader(handle):
+            rows.append(QPCDRRecord(raw["condition"], int(raw["week"]), raw["state"], raw["species"], float(raw["value"]), raw.get("replicate_id") or None, raw.get("batch") or DEFAULT_QPCDR_BATCH, raw.get("value_scale") or DEFAULT_QPCDR_SCALE))
     return tuple(rows)
 
 
 def load_ectag_csv(path: str | Path) -> tuple[EcTAGRecord, ...]:
-    resolved = _resolve_path(path)
     rows: list[EcTAGRecord] = []
-    with open(resolved, "r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for raw in reader:
-            rows.append(
-                EcTAGRecord(
-                    condition=raw["condition"],
-                    week=int(raw["week"]),
-                    state=raw["state"],
-                    species=raw["species"],
-                    cell_id=raw["cell_id"],
-                    value=int(raw["value"]),
-                    replicate_id=raw.get("replicate_id") or None,
-                )
-            )
+    with open(_resolve_path(path), "r", encoding="utf-8", newline="") as handle:
+        for raw in csv.DictReader(handle):
+            rows.append(EcTAGRecord(raw["condition"], int(raw["week"]), raw["state"], raw["species"], raw["cell_id"], int(float(raw["value"])), raw.get("replicate_id") or None))
     return tuple(rows)
+
+
+def load_ddpcr_csv(path: str | Path) -> tuple[DDPCRRecord, ...]:
+    rows: list[DDPCRRecord] = []
+    with open(_resolve_path(path), "r", encoding="utf-8", newline="") as handle:
+        for raw in csv.DictReader(handle):
+            if raw.get("value") is not None:
+                value = raw["value"]
+            else:
+                value = raw.get("Ratio") or raw.get("ddPCR_copy_number")
+            if value is None or str(value).upper() == "NA" or not str(value).strip():
+                continue
+            species = raw.get("species") or raw.get("Target") or ""
+            species = species.replace("ecMyc", "MYC").replace("ecCDK4", "CDK4").replace("ecPDGFRA", "PDGFRA")
+            condition = raw.get("condition") or raw.get("treatment") or "unknown"
+            week = raw.get("week") or raw.get("day")
+            rows.append(DDPCRRecord(condition, int(float(week)), species, float(value), _float_or_none(raw.get("lower") or raw.get("PoissonRatioMin")), _float_or_none(raw.get("upper") or raw.get("PoissonRatioMax")), raw.get("replicate_id") or raw.get("Well")))
+    return tuple(rows)
+
+
+def build_raw_data_qc_report(dataset: CanonicalFitDataset) -> dict[str, object]:
+    ectag_cells: dict[str, set[str]] = {}
+    for row in dataset.ectag:
+        key = f"{row.condition}|week{row.week}|state={row.state}"
+        ectag_cells.setdefault(key, set()).add(f"{row.replicate_id or ''}|{row.cell_id}")
+    low_ectag = [
+        {"snapshot": key, "n_cells": len(cells), "policy": "mean-level only below 50 cells"}
+        for key, cells in sorted(ectag_cells.items())
+        if len(cells) < 50
+    ]
+    ddpcr_pairs = {(row.week, row.species) for row in dataset.ddpcr}
+    qpcdr_pairs = {(row.week, row.state, row.species) for row in dataset.qpcdr}
+    flow_pairs = {(row.week, row.state) for row in dataset.flow}
+    has_required_modalities = bool(dataset.flow and dataset.qpcdr and dataset.ectag)
+    return {
+        "conditions": dataset.condition_names(),
+        "dynamic_weeks": dataset.dynamic_weeks(),
+        "row_counts": {
+            "flow": len(dataset.flow),
+            "count": len(dataset.counts),
+            "qpcdr": len(dataset.qpcdr),
+            "ectag": len(dataset.ectag),
+            "ddpcr": len(dataset.ddpcr),
+        },
+        "coverage": {
+            "flow_week_state_pairs": len(flow_pairs),
+            "qpcdr_week_state_species_pairs": len(qpcdr_pairs),
+            "ddpcr_week_species_pairs": len(ddpcr_pairs),
+            "ectag_week_state_snapshots": len(ectag_cells),
+        },
+        "criteria": {
+            "flow_present": bool(dataset.flow),
+            "qpcdr_present": bool(dataset.qpcdr),
+            "ectag_present": bool(dataset.ectag),
+            "ddpcr_optional_bulk_anchor_present": bool(dataset.ddpcr),
+            "ddpcr_four_timepoints_three_species": len(ddpcr_pairs) >= 12,
+            "has_real_fit_modalities": has_required_modalities,
+            "olig2_initial_ratio_present": dataset.olig2_initial_ratio is not None,
+        },
+        "low_ectag_histogram_cell_snapshots": low_ectag,
+        "policies": {
+            "ddpcr": "bulk pooled mean anchor only",
+            "ectag": "species-specific single-cell histogram; no config.py max-observed censoring assumption",
+            "low_ectag_cells": "snapshots with fewer than 50 cells should be down-weighted or inspected as mean-level evidence",
+            "olig2": "optional weak initial state prior on (NPC+OPC)/(AC+MES)",
+        },
+        "olig2_initial_ratio": dataset.olig2_initial_ratio,
+    }
+
+
+def _flow_rows(dataset: CanonicalFitDataset) -> list[dict[str, object]]:
+    return [
+        {
+            "condition": row.condition,
+            "week": row.week,
+            "state": row.state,
+            "count": row.count,
+            "fraction": row.fraction,
+            "total_events": row.total_events,
+            "replicate_id": row.replicate_id,
+        }
+        for row in dataset.flow
+    ]
+
+
+def _count_rows(dataset: CanonicalFitDataset) -> list[dict[str, object]]:
+    return [
+        {
+            "condition": row.condition,
+            "week": row.week,
+            "count": row.value,
+            "gate": row.gate,
+            "replicate_id": row.replicate_id,
+        }
+        for row in dataset.counts
+    ]
+
+
+def _qpcdr_rows(dataset: CanonicalFitDataset) -> list[dict[str, object]]:
+    return [
+        {
+            "condition": row.condition,
+            "week": row.week,
+            "state": row.state,
+            "species": row.species,
+            "value": row.value,
+            "value_scale": row.value_scale,
+            "batch": row.batch,
+            "replicate_id": row.replicate_id,
+        }
+        for row in dataset.qpcdr
+    ]
+
+
+def _ectag_rows(dataset: CanonicalFitDataset) -> list[dict[str, object]]:
+    return [
+        {
+            "condition": row.condition,
+            "week": row.week,
+            "state": row.state,
+            "species": row.species,
+            "cell_id": row.cell_id,
+            "ecTAG_count": row.value,
+            "replicate_id": row.replicate_id,
+        }
+        for row in dataset.ectag
+    ]
+
+
+def _ddpcr_rows(dataset: CanonicalFitDataset) -> list[dict[str, object]]:
+    return [
+        {
+            "condition": row.condition,
+            "week": row.week,
+            "species": row.species,
+            "ddPCR_copy_number": row.value,
+            "lower": row.lower,
+            "upper": row.upper,
+            "replicate_id": row.replicate_id,
+        }
+        for row in dataset.ddpcr
+    ]
+
+
+def write_standardized_dataset(output_dir: str | Path, dataset: CanonicalFitDataset) -> dict[str, object]:
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    outputs = {
+        "flow_long": write_table_bundle(destination, "flow_long", _flow_rows(dataset)),
+        "count_long": write_table_bundle(destination, "count_long", _count_rows(dataset)),
+        "qpcdr_long": write_table_bundle(destination, "qpcdr_long", _qpcdr_rows(dataset)),
+        "ectag_cell_long": write_table_bundle(destination, "ectag_cell_long", _ectag_rows(dataset)),
+        "ddpcr_long": write_table_bundle(destination, "ddpcr_long", _ddpcr_rows(dataset)),
+    }
+    qc = build_raw_data_qc_report(dataset)
+    write_json(destination / "raw_data_qc_report.json", qc)
+    markdown = [
+        "# Raw Data QC Report",
+        "",
+        f"- Conditions: {', '.join(dataset.condition_names())}",
+        f"- Dynamic weeks: {list(dataset.dynamic_weeks())}",
+        f"- Flow rows: {len(dataset.flow)}",
+        f"- qPCDR rows: {len(dataset.qpcdr)}",
+        f"- ecTAG rows: {len(dataset.ectag)}",
+        f"- ddPCR rows: {len(dataset.ddpcr)}",
+        "- ddPCR policy: bulk pooled mean anchor only.",
+        "- ecTAG policy: species-specific histograms; no config.py max-observed censoring assumption.",
+    ]
+    if qc["low_ectag_histogram_cell_snapshots"]:
+        markdown.append("- Low ecTAG cell snapshots are listed in raw_data_qc_report.json.")
+    (destination / "raw_data_qc_report.md").write_text("\n".join(markdown) + "\n", encoding="utf-8")
+    index = {
+        "standardized_tables": outputs,
+        "qc_report": str(destination / "raw_data_qc_report.json"),
+        "qc_report_markdown": str(destination / "raw_data_qc_report.md"),
+        "ready_for_real_fit": bool(qc["criteria"]["has_real_fit_modalities"]),
+    }
+    write_json(destination / "analysis_index.json", index)
+    return index

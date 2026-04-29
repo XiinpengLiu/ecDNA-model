@@ -1,10 +1,4 @@
-"""
-Minimal full-to-lite calibration workflow.
-
-This module keeps full-v4 calibration separate from the v4-lite MAP path.  The
-stages below calibrate against coarse v4-lite targets; they are diagnostic
-calibration stages, not a formal full-model Bayesian posterior.
-"""
+"""Full-simulator bridge calibration against v4-lite summaries."""
 
 from __future__ import annotations
 
@@ -13,25 +7,17 @@ import csv
 import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 
 import numpy as np
 from scipy.optimize import minimize
 
 import config as cfg
 from core.simulation import SimulationResult, run_simulation
+from fit.io_utils import write_json, write_netcdf_file, write_npz_or_marker, write_table_bundle, write_text_pdf
 from fit.data import CanonicalFitDataset
 from fit.parameter_registry import ParameterBundle
-from fit.v4_lite import (
-    FullToLiteProjection,
-    V4LiteFitResult,
-    V4LiteStructure,
-    _projection_from_prediction,
-    predict_v4_lite,
-    project_full_to_lite,
-    run_v4_lite_posterior_predictive,
-    summarize_dataset_v4_lite,
-)
+from fit.v4_lite import FullToLiteProjection, V4LiteParameters, V4LiteStructure, _prediction_summary, build_v4_lite_tensor, project_full_to_lite
 
 
 @dataclass(frozen=True)
@@ -45,6 +31,9 @@ class FullCalibrationSettings:
     formal_maxiter: int = 8
     run_formal_raw_refinement: bool = True
     optimizer_method: str = "Powell"
+    smc_particles: int = 32
+    smc_steps: int = 2
+    smc_scale: float = 0.35
 
 
 @dataclass(frozen=True)
@@ -71,515 +60,216 @@ class FullCalibrationResult:
 
 
 @dataclass(frozen=True)
-class _StageParameterSpec:
+class _StageSpec:
     name: str
     getter: Callable[[ParameterBundle], np.ndarray]
     setter: Callable[[ParameterBundle, np.ndarray], None]
-    scale: np.ndarray
+    scale: float
     transform: str = "identity"
-    lower: np.ndarray | None = None
-    upper: np.ndarray | None = None
-
-    def raw_values(self, bundle: ParameterBundle) -> np.ndarray:
-        return np.asarray(self.getter(bundle), dtype=float).reshape(-1)
 
 
 def _default_bundle() -> ParameterBundle:
-    return ParameterBundle(model=copy.deepcopy(cfg.DEFAULT_MODEL_PARAMETERS), observation=copy.deepcopy(cfg.DEFAULT_OBSERVATION_PARAMETERS))
+    return ParameterBundle(copy.deepcopy(cfg.DEFAULT_MODEL_PARAMETERS), copy.deepcopy(cfg.DEFAULT_OBSERVATION_PARAMETERS))
 
 
-def _set_model_array(bundle: ParameterBundle, container_name: str, field_name: str, values: np.ndarray) -> None:
-    target = getattr(getattr(bundle.model, container_name), field_name)
+def _set_array(bundle: ParameterBundle, section: str, field_name: str, values: np.ndarray) -> None:
+    target = getattr(getattr(bundle.model, section), field_name)
     target[...] = np.asarray(values, dtype=float).reshape(target.shape)
 
 
-def _set_model_scalar(bundle: ParameterBundle, container_name: str, field_name: str, value: float) -> None:
-    object.__setattr__(getattr(bundle.model, container_name), field_name, float(value))
+def _set_scalar(bundle: ParameterBundle, section: str, field_name: str, value: float) -> None:
+    object.__setattr__(getattr(bundle.model, section), field_name, float(value))
 
 
-def _set_turnover_scalar(bundle: ParameterBundle, species_name: str, field_name: str, value: float) -> None:
-    object.__setattr__(bundle.model.turnover[species_name], field_name, float(value))
-
-
-def _positive_bounds(center: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    values = np.maximum(np.asarray(center, dtype=float).reshape(-1), 1e-8)
-    return np.maximum(1e-8, 0.10 * values), np.maximum(values + 1.0, 5.0 * values)
-
-
-def _identity_bounds(center: np.ndarray, scale: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    values = np.asarray(center, dtype=float).reshape(-1)
-    widths = np.maximum(0.25, 4.0 * np.asarray(scale, dtype=float).reshape(-1))
-    return values - widths, values + widths
-
-
-def _encode_parameter_delta(spec: _StageParameterSpec, center: np.ndarray, values: np.ndarray) -> np.ndarray:
-    current = np.asarray(values, dtype=float).reshape(-1)
-    base = np.asarray(center, dtype=float).reshape(-1)
-    scale = np.maximum(np.asarray(spec.scale, dtype=float).reshape(-1), 1e-8)
-    if spec.transform == "log":
-        return (np.log(np.clip(current, 1e-12, None)) - np.log(np.clip(base, 1e-12, None))) / scale
-    return (current - base) / scale
-
-
-def _decode_parameter_delta(spec: _StageParameterSpec, center: np.ndarray, delta: np.ndarray) -> np.ndarray:
-    base = np.asarray(center, dtype=float).reshape(-1)
-    scale = np.maximum(np.asarray(spec.scale, dtype=float).reshape(-1), 1e-8)
-    values = np.asarray(delta, dtype=float).reshape(-1)
-    if spec.transform == "log":
-        raw = np.exp(np.log(np.clip(base, 1e-12, None)) + values * scale)
-    else:
-        raw = base + values * scale
-    if spec.lower is not None:
-        raw = np.maximum(raw, np.asarray(spec.lower, dtype=float).reshape(-1))
-    if spec.upper is not None:
-        raw = np.minimum(raw, np.asarray(spec.upper, dtype=float).reshape(-1))
-    return raw
-
-
-def _pack_stage_vector(bundle: ParameterBundle, specs: tuple[_StageParameterSpec, ...], centers: tuple[np.ndarray, ...]) -> np.ndarray:
-    pieces = [_encode_parameter_delta(spec, center, spec.raw_values(bundle)) for spec, center in zip(specs, centers)]
-    return np.concatenate(pieces, axis=0) if pieces else np.zeros(0, dtype=float)
-
-
-def _apply_stage_vector(bundle: ParameterBundle, specs: tuple[_StageParameterSpec, ...], centers: tuple[np.ndarray, ...], vector: np.ndarray) -> None:
-    flat = np.asarray(vector, dtype=float).reshape(-1)
-    offset = 0
-    for spec, center in zip(specs, centers):
-        size = int(center.size)
-        raw = _decode_parameter_delta(spec, center, flat[offset : offset + size])
-        spec.setter(bundle, raw)
-        offset += size
-    cfg.validate_model_parameters(bundle.model)
-    cfg.validate_observation_parameters(bundle.observation)
-
-
-def _spec_array(
-    name: str,
-    getter: Callable[[ParameterBundle], np.ndarray],
-    setter: Callable[[ParameterBundle, np.ndarray], None],
-    center: np.ndarray,
-    *,
-    scale: float,
-    transform: str = "identity",
-) -> _StageParameterSpec:
-    center_values = np.asarray(center, dtype=float).reshape(-1)
-    scale_values = np.full(center_values.size, float(scale), dtype=float)
-    lower, upper = _positive_bounds(center_values) if transform == "log" else _identity_bounds(center_values, scale_values)
-    return _StageParameterSpec(name, getter, setter, scale_values, transform, lower, upper)
-
-
-def _stage_parameter_specs(bundle: ParameterBundle, stage_name: str) -> tuple[_StageParameterSpec, ...]:
+def _stage_specs(bundle: ParameterBundle, stage_name: str) -> tuple[_StageSpec, ...]:
     if stage_name == "F1-state-landscape":
-        alpha_center = bundle.model.landscape.alpha.astype(float).copy()
-        gamma_c = np.array([bundle.model.landscape.gamma_C[cfg.NPC]], dtype=float)
-        gamma_p = np.array([bundle.model.landscape.gamma_P[cfg.OPC]], dtype=float)
-        sigma_m = np.array([bundle.model.landscape.sigma_M], dtype=float)
         return (
-            _spec_array(
+            _StageSpec(
                 "landscape.alpha",
-                lambda current: current.model.landscape.alpha.astype(float).copy(),
-                lambda current, values: _set_model_array(current, "landscape", "alpha", np.asarray(values, dtype=float)),
-                alpha_center,
-                scale=0.20,
+                lambda b: b.model.landscape.alpha.astype(float).copy(),
+                lambda b, v: _set_array(b, "landscape", "alpha", v),
+                0.25,
             ),
-            _spec_array(
+            _StageSpec(
                 "landscape.gamma_C[NPC]",
-                lambda current: np.array([current.model.landscape.gamma_C[cfg.NPC]], dtype=float),
-                lambda current, values: _set_single_array_entry(current, "landscape", "gamma_C", cfg.NPC, float(values[0])),
-                gamma_c,
-                scale=0.20,
+                lambda b: np.array([b.model.landscape.gamma_C[cfg.NPC]], dtype=float),
+                lambda b, v: _set_single_array(b, "landscape", "gamma_C", cfg.NPC, float(v[0])),
+                0.25,
             ),
-            _spec_array(
+            _StageSpec(
                 "landscape.gamma_P[OPC]",
-                lambda current: np.array([current.model.landscape.gamma_P[cfg.OPC]], dtype=float),
-                lambda current, values: _set_single_array_entry(current, "landscape", "gamma_P", cfg.OPC, float(values[0])),
-                gamma_p,
-                scale=0.20,
-            ),
-            _spec_array(
-                "landscape.sigma_M",
-                lambda current: np.array([current.model.landscape.sigma_M], dtype=float),
-                lambda current, values: _set_model_scalar(current, "landscape", "sigma_M", float(values[0])),
-                sigma_m,
-                scale=0.25,
-                transform="log",
+                lambda b: np.array([b.model.landscape.gamma_P[cfg.OPC]], dtype=float),
+                lambda b, v: _set_single_array(b, "landscape", "gamma_P", cfg.OPC, float(v[0])),
+                0.25,
             ),
         )
     if stage_name == "F2-ecDNA-turnover":
-        specs: list[_StageParameterSpec] = []
-        for species_name in cfg.SPECIES:
-            for field_name in ("gain_ceiling", "loss_ceiling"):
-                center = np.array([getattr(bundle.model.turnover[species_name], field_name)], dtype=float)
-                specs.append(
-                    _spec_array(
-                        f"turnover.{species_name}.{field_name}",
-                        lambda current, species_name=species_name, field_name=field_name: np.array(
-                            [getattr(current.model.turnover[species_name], field_name)],
-                            dtype=float,
-                        ),
-                        lambda current, values, species_name=species_name, field_name=field_name: _set_turnover_scalar(
-                            current,
-                            species_name,
-                            field_name,
-                            float(values[0]),
-                        ),
-                        center,
-                        scale=0.20,
-                        transform="log",
-                    )
-                )
-        for species_name, field_name in ((cfg.SPECIES[cfg.CDK4], "b_C"), (cfg.SPECIES[cfg.PDGFRA], "b_P")):
-            center = np.array([getattr(bundle.model.turnover[species_name], field_name)], dtype=float)
-            specs.append(
-                _spec_array(
-                    f"turnover.{species_name}.{field_name}",
-                    lambda current, species_name=species_name, field_name=field_name: np.array(
-                        [getattr(current.model.turnover[species_name], field_name)],
-                        dtype=float,
-                    ),
-                    lambda current, values, species_name=species_name, field_name=field_name: _set_turnover_scalar(
-                        current,
-                        species_name,
-                        field_name,
-                        float(values[0]),
-                    ),
-                    center,
-                    scale=0.20,
-                )
+        return tuple(
+            _StageSpec(
+                f"turnover.{species}.gain_ceiling",
+                lambda b, species=species: np.array([b.model.turnover[species].gain_ceiling], dtype=float),
+                lambda b, v, species=species: object.__setattr__(b.model.turnover[species], "gain_ceiling", max(float(v[0]), 0.0)),
+                0.25,
             )
-        return tuple(specs)
-    if stage_name == "F3-hazard-net-growth":
-        fields = (
-            ("theta_P", "identity", 0.20),
-            ("chi_C", "log", 0.20),
-            ("chi_P", "log", 0.20),
-            ("phi_B", "identity", 0.20),
+            for species in cfg.SPECIES
         )
-        specs = []
-        for field_name, transform, scale in fields:
-            center = np.array([getattr(bundle.model.hazard, field_name)], dtype=float)
-            specs.append(
-                _spec_array(
-                    f"hazard.{field_name}",
-                    lambda current, field_name=field_name: np.array([getattr(current.model.hazard, field_name)], dtype=float),
-                    lambda current, values, field_name=field_name: _set_model_scalar(current, "hazard", field_name, float(values[0])),
-                    center,
-                    scale=scale,
-                    transform=transform,
-                )
-            )
-        return tuple(specs)
+    if stage_name == "F3-hazard-net-growth":
+        return (
+            _StageSpec("hazard.theta_P", lambda b: np.array([b.model.hazard.theta_P], dtype=float), lambda b, v: _set_scalar(b, "hazard", "theta_P", float(v[0])), 0.25),
+            _StageSpec("hazard.phi_B", lambda b: np.array([b.model.hazard.phi_B], dtype=float), lambda b, v: _set_scalar(b, "hazard", "phi_B", float(v[0])), 0.25),
+        )
     return ()
 
 
-def _set_single_array_entry(bundle: ParameterBundle, container_name: str, field_name: str, index: int, value: float) -> None:
-    target = getattr(getattr(bundle.model, container_name), field_name)
+def _set_single_array(bundle: ParameterBundle, section: str, field_name: str, index: int, value: float) -> None:
+    target = getattr(getattr(bundle.model, section), field_name)
     updated = np.asarray(target, dtype=float).copy()
-    updated[int(index)] = float(value)
-    _set_model_array(bundle, container_name, field_name, updated)
+    updated[index] = value
+    _set_array(bundle, section, field_name, updated)
 
 
-def _target_from_fit_result(result: V4LiteFitResult) -> FullToLiteProjection:
-    if result.projection_targets is not None:
-        return result.projection_targets
-    prediction = predict_v4_lite(result.tensor, result.final_params)
-    return _projection_from_prediction(prediction)
+def _pack(bundle: ParameterBundle, specs: tuple[_StageSpec, ...], centers: tuple[np.ndarray, ...]) -> np.ndarray:
+    pieces = []
+    for spec, center in zip(specs, centers):
+        raw = spec.getter(bundle).reshape(-1)
+        if spec.transform == "log":
+            pieces.append((np.log(np.clip(raw, 1e-12, None)) - np.log(np.clip(center, 1e-12, None))) / spec.scale)
+        else:
+            pieces.append((raw - center) / spec.scale)
+    return np.concatenate(pieces) if pieces else np.zeros(0, dtype=float)
 
 
-def _target_uncertainty_from_fit_result(result: V4LiteFitResult) -> dict[str, float]:
-    payload = result.reports.posterior_predictive_report.get("block_rmse", {}) if result.reports is not None else {}
-    if not isinstance(payload, dict):
-        return {}
-    flow_scale = max(float(payload.get("flow_count", 0.0)), float(payload.get("flow_fraction", 0.0)), 1e-8)
-    count_scale = max(float(payload.get("count_total", 0.0)), float(payload.get("count_gate", 0.0)), 1e-8)
-    tag_scale = max(float(payload.get("ectag_hist", 0.0)), float(payload.get("ectag_moments", 0.0)), float(payload.get("qpcdr", 0.0)), 1e-8)
-    return {
-        "state_abundance": max(flow_scale, count_scale),
-        "copy_distribution": tag_scale,
-        "transition_matrix": flow_scale,
-        "growth_rate": count_scale,
-        "copy_kernel": tag_scale,
-    }
-
-
-def _finite_rmse(values: np.ndarray) -> float:
-    flat = np.asarray(values, dtype=float).reshape(-1)
-    flat = flat[np.isfinite(flat)]
-    if flat.size == 0:
-        return float("nan")
-    return float(np.sqrt(np.mean(np.square(flat))))
-
-
-def _block_residual(block: str, observed: np.ndarray, predicted: np.ndarray, *, uncertainty: float | None = None, weight: float = 1.0) -> dict[str, object]:
-    observed_values = np.asarray(observed, dtype=float)
-    predicted_values = np.asarray(predicted, dtype=float)
-    residual = predicted_values - observed_values
-    rmse = _finite_rmse(residual)
-    scale = max(float(uncertainty) if uncertainty is not None and np.isfinite(float(uncertainty)) else _finite_rmse(observed_values), 1e-8)
-    return {
-        "block": block,
-        "rmse": rmse,
-        "relative_rmse": float(rmse / scale) if np.isfinite(rmse) else float("nan"),
-        "weight": float(weight),
-        "weighted_relative_rmse": float(weight * rmse / scale) if np.isfinite(rmse) else float("nan"),
-        "scale_source": "target_uncertainty" if uncertainty is not None else "target_rms",
-        "n": int(residual.size),
-    }
-
-
-def coarse_residual_report(
-    target: FullToLiteProjection,
-    projection: FullToLiteProjection,
-    *,
-    target_uncertainty: dict[str, float] | None = None,
-    block_weights: dict[str, float] | None = None,
-) -> dict[str, object]:
-    uncertainty = {} if target_uncertainty is None else dict(target_uncertainty)
-    weights = {} if block_weights is None else dict(block_weights)
-
-    def block_weight(block_name: str) -> float:
-        return float(weights.get(block_name, 1.0))
-
-    target_week_to_index = {week: index for index, week in enumerate(target.weeks)}
-    projection_week_to_index = {week: index for index, week in enumerate(projection.weeks)}
-    common_weeks = tuple(week for week in target.weeks if week in projection_week_to_index)
-    rows: list[dict[str, object]] = []
-    if common_weeks:
-        target_indices = [target_week_to_index[week] for week in common_weeks]
-        projection_indices = [projection_week_to_index[week] for week in common_weeks]
-        rows.append(
-            _block_residual(
-                "state_abundance",
-                target.state_abundance[target_indices, :],
-                projection.state_abundance[projection_indices, :],
-                uncertainty=uncertainty.get("state_abundance"),
-                weight=block_weight("state_abundance"),
-            )
-        )
-        rows.append(
-            _block_residual(
-                "copy_distribution",
-                target.copy_distributions[target_indices, :, :, :],
-                projection.copy_distributions[projection_indices, :, :, :],
-                uncertainty=uncertainty.get("copy_distribution"),
-                weight=block_weight("copy_distribution"),
-            )
-        )
-
-    interval_count = min(
-        0 if target.transition_matrices is None else int(target.transition_matrices.shape[0]),
-        0 if projection.transition_matrices is None else int(projection.transition_matrices.shape[0]),
-    )
-    if interval_count:
-        rows.append(
-            _block_residual(
-                "transition_matrix",
-                target.transition_matrices[:interval_count],
-                projection.transition_matrices[:interval_count],
-                uncertainty=uncertainty.get("transition_matrix"),
-                weight=block_weight("transition_matrix"),
-            )
-        )
-    growth_count = min(
-        0 if target.growth_rates is None else int(target.growth_rates.shape[0]),
-        0 if projection.growth_rates is None else int(projection.growth_rates.shape[0]),
-    )
-    if growth_count:
-        rows.append(
-            _block_residual(
-                "growth_rate",
-                target.growth_rates[:growth_count],
-                projection.growth_rates[:growth_count],
-                uncertainty=uncertainty.get("growth_rate"),
-                weight=block_weight("growth_rate"),
-            )
-        )
-    kernel_count = min(
-        0 if target.copy_kernels is None else int(target.copy_kernels.shape[0]),
-        0 if projection.copy_kernels is None else int(projection.copy_kernels.shape[0]),
-    )
-    if kernel_count:
-        rows.append(
-            _block_residual(
-                "copy_kernel",
-                target.copy_kernels[:kernel_count],
-                projection.copy_kernels[:kernel_count],
-                uncertainty=uncertainty.get("copy_kernel"),
-                weight=block_weight("copy_kernel"),
-            )
-        )
-
-    finite_relative = [float(row["weighted_relative_rmse"]) for row in rows if np.isfinite(float(row["weighted_relative_rmse"])) and float(row["weight"]) > 0.0]
-    weighted_rmse = float(np.mean(finite_relative)) if finite_relative else float("nan")
-    return {
-        "mode_label": "coarse_calibration_residuals",
-        "common_weeks": common_weeks,
-        "weighted_relative_rmse": weighted_rmse,
-        "rows": rows,
-        "target_uncertainty": uncertainty,
-        "block_weights": weights,
-        "double_counting_policy": "calibration mode may use v4-lite coarse targets; formal inference mode must fit raw observations only.",
-    }
-
-
-def _report_objective(report: dict[str, object]) -> float | None:
-    value = report.get("weighted_relative_rmse")
-    if value is None:
-        return None
-    numeric = float(value)
-    return numeric if np.isfinite(numeric) else None
-
-
-def _expanded_parameter_names(specs: tuple[_StageParameterSpec, ...]) -> tuple[str, ...]:
+def _spec_parameter_names(specs: tuple[_StageSpec, ...], centers: tuple[np.ndarray, ...]) -> tuple[str, ...]:
     names: list[str] = []
-    for spec in specs:
-        size = int(np.asarray(spec.scale, dtype=float).size)
+    for spec, center in zip(specs, centers):
+        size = int(np.asarray(center).size)
         if size == 1:
             names.append(spec.name)
         else:
-            names.extend(f"{spec.name}[{index}]" for index in range(size))
+            names.extend(f"{spec.name}[{idx}]" for idx in range(size))
     return tuple(names)
 
 
-def _summary_distribution_residual_report(observed, simulated) -> dict[str, object]:
-    rows: list[dict[str, object]] = []
-    for block_name in observed.block_names():
-        if block_name not in simulated.blocks:
-            continue
-        observed_block = observed.blocks[block_name]
-        simulated_block = simulated.blocks[block_name]
-        observed_mapping = observed_block.as_mapping()
-        simulated_mapping = simulated_block.as_mapping()
-        common_keys = tuple(key for key in observed_block.keys if key in simulated_mapping)
-        if common_keys:
-            observed_values = np.asarray([observed_mapping[key] for key in common_keys], dtype=float)
-            simulated_values = np.asarray([simulated_mapping[key] for key in common_keys], dtype=float)
-            matching = "key"
+def _apply(bundle: ParameterBundle, specs: tuple[_StageSpec, ...], centers: tuple[np.ndarray, ...], vector: np.ndarray) -> None:
+    flat = np.asarray(vector, dtype=float).reshape(-1)
+    offset = 0
+    for spec, center in zip(specs, centers):
+        size = center.size
+        chunk = flat[offset : offset + size]
+        offset += size
+        if spec.transform == "log":
+            raw = np.exp(np.log(np.clip(center, 1e-12, None)) + chunk * spec.scale)
         else:
-            observed_values = np.sort(np.asarray(observed_block.values, dtype=float).reshape(-1))
-            simulated_values = np.sort(np.asarray(simulated_block.values, dtype=float).reshape(-1))
-            n = min(observed_values.size, simulated_values.size)
-            if n == 0:
-                continue
-            observed_values = observed_values[:n]
-            simulated_values = simulated_values[:n]
-            matching = "distribution_order_statistic"
-        residual = simulated_values - observed_values
-        rmse = _finite_rmse(residual)
-        scale = max(_finite_rmse(observed_values), 1e-8)
-        rows.append(
-            {
-                "block": block_name,
-                "matching": matching,
-                "rmse": rmse,
-                "relative_rmse": float(rmse / scale) if np.isfinite(rmse) else float("nan"),
-                "n": int(residual.size),
-            }
-        )
-    finite = [float(row["relative_rmse"]) for row in rows if np.isfinite(float(row["relative_rmse"]))]
+            raw = center + chunk * spec.scale
+        spec.setter(bundle, raw)
+
+
+def _rmse(observed: np.ndarray, predicted: np.ndarray) -> float:
+    residual = np.asarray(predicted, dtype=float) - np.asarray(observed, dtype=float)
+    return float(np.sqrt(np.mean(np.square(residual)))) if residual.size else 0.0
+
+
+def coarse_residual_report(target: FullToLiteProjection, projection: FullToLiteProjection, *, target_uncertainty: dict[str, float] | None = None, block_weights: dict[str, float] | None = None) -> dict[str, object]:
+    weights = {} if block_weights is None else dict(block_weights)
+    rows: list[dict[str, object]] = []
+
+    def add(block: str, observed: np.ndarray | None, predicted: np.ndarray | None) -> None:
+        if observed is None or predicted is None:
+            return
+        n0 = min(observed.shape[0], predicted.shape[0])
+        if n0 == 0:
+            return
+        rmse = _rmse(observed[:n0], predicted[:n0])
+        scale = max(_rmse(observed[:n0], np.zeros_like(observed[:n0])), 1e-8)
+        weight = float(weights.get(block, 1.0))
+        rows.append({"block": block, "rmse": rmse, "relative_rmse": rmse / scale, "weighted_relative_rmse": weight * rmse / scale, "weight": weight, "n": int(np.asarray(observed[:n0]).size)})
+
+    add("state_abundance", target.state_abundance, projection.state_abundance)
+    add("copy_distribution", target.copy_distributions, projection.copy_distributions)
+    add("transition_matrix", target.transition_matrices, projection.transition_matrices)
+    add("growth_rate", target.growth_rates, projection.growth_rates)
+    add("copy_kernel", target.copy_kernels, projection.copy_kernels)
+    finite = [float(row["weighted_relative_rmse"]) for row in rows if np.isfinite(float(row["weighted_relative_rmse"])) and float(row["weight"]) > 0.0]
     return {
-        "mode_label": "formal_raw_observation_summary_residuals",
+        "mode_label": "coarse_calibration_residuals",
         "weighted_relative_rmse": float(np.mean(finite)) if finite else float("nan"),
         "rows": rows,
-        "observed_blocks": observed.block_names(),
-        "simulated_blocks": simulated.block_names(),
+        "double_counting_policy": "calibration may use v4-lite targets; formal raw inference must exclude those targets.",
     }
 
 
+def _objective_value(report: dict[str, object]) -> float | None:
+    value = float(report.get("weighted_relative_rmse", float("nan")))
+    return value if np.isfinite(value) else None
+
+
 class FullCalibrationRunner:
-    def __init__(
-        self,
-        dataset: CanonicalFitDataset,
-        lite_targets: V4LiteFitResult | FullToLiteProjection,
-        *,
-        base_bundle: ParameterBundle | None = None,
-        structure: V4LiteStructure | None = None,
-        settings: FullCalibrationSettings | None = None,
-    ) -> None:
+    def __init__(self, dataset: CanonicalFitDataset, target: FullToLiteProjection, *, base_bundle: ParameterBundle | None = None, target_uncertainty: dict[str, float] | None = None, structure: V4LiteStructure | None = None, settings: FullCalibrationSettings | None = None):
         self.dataset = dataset
-        self.target = _target_from_fit_result(lite_targets) if isinstance(lite_targets, V4LiteFitResult) else lite_targets
-        self.target_uncertainty = _target_uncertainty_from_fit_result(lite_targets) if isinstance(lite_targets, V4LiteFitResult) else {}
+        self.target = target
+        self.target_uncertainty = {} if target_uncertainty is None else dict(target_uncertainty)
         self.bundle = _default_bundle() if base_bundle is None else base_bundle.deep_copy()
         self.structure = V4LiteStructure.default() if structure is None else structure
         self.settings = FullCalibrationSettings() if settings is None else settings
 
-    def run_all_stages(self, *, condition_name: str | None = None) -> FullCalibrationResult:
-        selected_condition = self._resolve_condition(condition_name)
-        bundle = self.bundle.deep_copy()
-        simulation_result = self._run_full_simulation(condition_name=selected_condition, bundle=bundle)
+    def run_f0_from_simulation_result(self, simulation_result: SimulationResult) -> FullCalibrationResult:
         projection = project_full_to_lite(simulation_result, structure=self.structure, purity_matrix=self.dataset.purity_matrix)
-        residuals = self._coarse_report(projection)
-        objective = _report_objective(residuals)
-        f0_diagnostics = {
-            "source": "full_simulator",
-            "has_N": projection.state_abundance.size > 0,
-            "has_p": projection.copy_distributions.size > 0,
-            "has_T": projection.transition_matrices is not None,
-            "has_g": projection.growth_rates is not None,
-            "has_G": projection.copy_kernels is not None,
-            "projection_diagnostics": projection.diagnostics,
-        }
-        stage_results: list[FullCalibrationStageResult] = [
-            FullCalibrationStageResult(
-                "F0-skeleton",
-                (),
-                None,
-                objective,
-                residuals,
-                accepted=bool(f0_diagnostics["has_N"] and f0_diagnostics["has_p"]),
-                diagnostics=f0_diagnostics,
-            )
-        ]
-        stage_plan = (
+        return self._build_result_from_projection(projection, "provided_simulation_result")
+
+    def run_all_stages(self, *, condition_name: str | None = None) -> FullCalibrationResult:
+        condition = self._resolve_condition(condition_name)
+        bundle = self.bundle.deep_copy()
+        projection = self._project_bundle(bundle, condition)
+        report = self._coarse_report(projection)
+        f0 = FullCalibrationStageResult("F0-skeleton", (), None, _objective_value(report), report, True, diagnostics={"source": "full_simulator"})
+        self._print_stage(f0)
+        stages = [f0]
+        for stage_name, weights in (
             ("F1-state-landscape", {"state_abundance": 1.0, "transition_matrix": 1.0, "copy_distribution": 0.0, "growth_rate": 0.0, "copy_kernel": 0.0}),
             ("F2-ecDNA-turnover", {"state_abundance": 0.0, "transition_matrix": 0.0, "copy_distribution": 1.0, "growth_rate": 0.0, "copy_kernel": 1.0}),
             ("F3-hazard-net-growth", {"state_abundance": 0.5, "transition_matrix": 0.0, "copy_distribution": 0.0, "growth_rate": 1.0, "copy_kernel": 0.0}),
-        )
-        for stage_name, weights in stage_plan:
-            stage_result, bundle, projection = self._optimize_calibration_stage(bundle, selected_condition, stage_name, weights)
-            stage_results.append(stage_result)
-
-        formal_report: dict[str, object]
+        ):
+            stage, bundle, projection = self._optimize_calibration_stage(bundle, condition, stage_name, weights)
+            stages.append(stage)
+            self._print_stage(stage)
+        formal_report = {"mode": "not_requested", "formal_mode": "not_requested"}
         if self.settings.run_formal_raw_refinement:
-            formal_stage, bundle, projection, formal_report = self._run_formal_raw_refinement(bundle, selected_condition)
-            stage_results.append(formal_stage)
-        else:
-            formal_report = {"mode": "direct_raw_observation_map_skipped_by_settings"}
-
-        final_residuals = self._coarse_report(projection)
-        skipped = self._skipped_stages()
+            formal, bundle, projection, formal_report = self._run_formal_raw_refinement(bundle, condition)
+            stages.append(formal)
+            self._print_stage(formal)
+        final_report = self._coarse_report(projection)
         return FullCalibrationResult(
-            stage_results=tuple(stage_results),
-            calibrated_bundle=bundle.deep_copy(),
-            projection=projection,
-            coarse_residual_report={
-                **final_residuals,
-                "calibration_mode": "v4_lite_summary_target",
-                "formal_inference_mode": formal_report.get("mode", "direct_raw_observation_map"),
-                "posterior_label": "map_or_diagnostic_not_full_bayesian_posterior",
-            },
-            skipped_stages=skipped,
-            formal_inference_report=formal_report,
+            tuple(stages),
+            bundle.deep_copy(),
+            projection,
+            {**final_report, "calibration_mode": "v4_lite_summary_target", "formal_inference_mode": formal_report.get("formal_mode", formal_report.get("mode", "not_requested")), "posterior_label": "smc_style_particle_posterior" if "particle_posterior" in formal_report else "map_or_diagnostic_not_full_bayesian_posterior"},
+            self._skipped_stages(),
+            formal_report,
+            mode_label="restricted_full_smc_style_particle_posterior" if "particle_posterior" in formal_report else "calibration_not_formal_full_bayesian_posterior",
         )
 
-    def run_f0_from_simulation_result(self, simulation_result: SimulationResult) -> FullCalibrationResult:
-        projection = project_full_to_lite(simulation_result, structure=self.structure, purity_matrix=self.dataset.purity_matrix)
-        return self._build_result_from_projection(projection, f0_source="provided_simulation_result")
+    @staticmethod
+    def _print_stage(stage: FullCalibrationStageResult) -> None:
+        print(
+            "[fit-full] "
+            f"{stage.stage_name}: opened_parameters={stage.opened_parameters} accepted={stage.accepted} "
+            f"before={stage.objective_before} after={stage.objective_after} skip={stage.skipped_reason}"
+        )
 
     def _record_times(self) -> tuple[float, ...]:
         if self.settings.record_times is not None:
-            return tuple(float(value) for value in self.settings.record_times)
+            return tuple(float(v) for v in self.settings.record_times)
         return tuple(float(week - 1) for week in self.target.weeks)
 
     def _resolve_condition(self, condition_name: str | None) -> str:
-        selected_condition = condition_name or next(iter(self.dataset.conditions))
-        cfg.require(selected_condition in self.dataset.conditions, f"Unknown condition {selected_condition}.")
-        return selected_condition
+        condition = condition_name or next(iter(self.dataset.conditions))
+        cfg.require(condition in self.dataset.conditions, f"Unknown condition {condition}.")
+        return condition
 
     def _prepared_bundle(self, bundle: ParameterBundle | None = None) -> ParameterBundle:
         source = self.bundle if bundle is None else bundle
         record_times = self._record_times()
-        simulation_params = replace(
+        sim = replace(
             source.model.simulation,
             record_times=record_times,
             t_max=float(record_times[-1]),
@@ -590,201 +280,186 @@ class FullCalibrationRunner:
             record_full_snapshots=True,
             record_events=True,
         )
-        model = replace(source.model, simulation=simulation_params)
-        return ParameterBundle(model=copy.deepcopy(model), observation=copy.deepcopy(source.observation))
+        return ParameterBundle(replace(source.model, simulation=sim), copy.deepcopy(source.observation))
 
     def _run_full_simulation(self, *, condition_name: str | None, bundle: ParameterBundle | None = None) -> SimulationResult:
-        selected_condition = self._resolve_condition(condition_name)
-        prepared_bundle = self._prepared_bundle(bundle)
-        record_times = self._record_times()
-        seed = int(self.settings.seeds[0])
+        selected = self._resolve_condition(condition_name)
+        prepared = self._prepared_bundle(bundle)
+        times = self._record_times()
         return run_simulation(
-            params=prepared_bundle.model,
-            observation_params=prepared_bundle.observation,
-            initialization=self.dataset.build_empirical_initialization(selected_condition),
-            input_schedules=self.dataset.conditions[selected_condition].build_input_schedules(),
-            seed=seed,
-            record_times=record_times,
-            t_max=float(record_times[-1]),
+            params=prepared.model,
+            observation_params=prepared.observation,
+            initialization=self.dataset.build_empirical_initialization(selected),
+            input_schedules=self.dataset.conditions[selected].build_input_schedules(),
+            seed=int(self.settings.seeds[0]),
+            record_times=times,
+            t_max=float(times[-1]),
             n_init=self.settings.n_init,
             max_pop_size=self.settings.max_pop_size,
             verbose=self.settings.verbose,
         )
 
-    def _coarse_report(self, projection: FullToLiteProjection, block_weights: dict[str, float] | None = None) -> dict[str, object]:
-        return coarse_residual_report(
-            self.target,
-            projection,
-            target_uncertainty=self.target_uncertainty,
-            block_weights=block_weights,
-        )
-
     def _project_bundle(self, bundle: ParameterBundle, condition_name: str) -> FullToLiteProjection:
-        simulation_result = self._run_full_simulation(condition_name=condition_name, bundle=bundle)
-        return project_full_to_lite(simulation_result, structure=self.structure, purity_matrix=self.dataset.purity_matrix)
+        return project_full_to_lite(self._run_full_simulation(condition_name=condition_name, bundle=bundle), structure=self.structure, purity_matrix=self.dataset.purity_matrix)
 
-    def _optimize_calibration_stage(
-        self,
-        bundle: ParameterBundle,
-        condition_name: str,
-        stage_name: str,
-        block_weights: dict[str, float],
-    ) -> tuple[FullCalibrationStageResult, ParameterBundle, FullToLiteProjection]:
-        specs = _stage_parameter_specs(bundle, stage_name)
-        opened = tuple(spec.name for spec in specs)
+    def _coarse_report(self, projection: FullToLiteProjection, block_weights: dict[str, float] | None = None) -> dict[str, object]:
+        return coarse_residual_report(self.target, projection, target_uncertainty=self.target_uncertainty, block_weights=block_weights)
+
+    def _optimize_calibration_stage(self, bundle: ParameterBundle, condition_name: str, stage_name: str, block_weights: dict[str, float]) -> tuple[FullCalibrationStageResult, ParameterBundle, FullToLiteProjection]:
+        specs = _stage_specs(bundle, stage_name)
         if not specs:
             projection = self._project_bundle(bundle, condition_name)
-            residuals = self._coarse_report(projection, block_weights)
-            return (
-                FullCalibrationStageResult(stage_name, opened, None, _report_objective(residuals), residuals, accepted=False, skipped_reason="No stage parameters configured."),
-                bundle.deep_copy(),
-                projection,
-            )
-        centers = tuple(spec.raw_values(bundle) for spec in specs)
-        initial = _pack_stage_vector(bundle, specs, centers)
+            report = self._coarse_report(projection, block_weights)
+            return FullCalibrationStageResult(stage_name, (), None, _objective_value(report), report, False, skipped_reason="No parameters configured."), bundle.deep_copy(), projection
+        centers = tuple(spec.getter(bundle) for spec in specs)
+        initial = _pack(bundle, specs, centers)
         before_projection = self._project_bundle(bundle, condition_name)
         before_report = self._coarse_report(before_projection, block_weights)
-        before = _report_objective(before_report)
+        before = _objective_value(before_report)
 
         def objective(vector: np.ndarray) -> float:
             trial = bundle.deep_copy()
-            try:
-                _apply_stage_vector(trial, specs, centers, vector)
-                projection = self._project_bundle(trial, condition_name)
-                report = self._coarse_report(projection, block_weights)
-                score = _report_objective(report)
-                if score is None:
-                    return 1e12
-                prior = 0.02 * float(np.mean(np.square(np.asarray(vector, dtype=float)))) if vector.size else 0.0
-                return float(score + prior)
-            except Exception:
-                return 1e12
+            _apply(trial, specs, centers, vector)
+            report = self._coarse_report(self._project_bundle(trial, condition_name), block_weights)
+            value = _objective_value(report)
+            penalty = 0.01 * float(np.mean(np.square(vector))) if vector.size else 0.0
+            return 1e12 if value is None else float(value + penalty)
 
-        result = minimize(
-            objective,
-            initial,
-            method=self.settings.optimizer_method,
-            options={"maxiter": int(self.settings.maxiter), "disp": False},
-        )
-        best_vector = np.asarray(result.x if result.success or np.isfinite(result.fun) else initial, dtype=float)
+        result = minimize(objective, initial, method=self.settings.optimizer_method, options={"maxiter": int(self.settings.maxiter), "disp": False})
+        best_vector = np.asarray(result.x if np.isfinite(result.fun) else initial, dtype=float)
         best_bundle = bundle.deep_copy()
-        _apply_stage_vector(best_bundle, specs, centers, best_vector)
+        _apply(best_bundle, specs, centers, best_vector)
         best_projection = self._project_bundle(best_bundle, condition_name)
         best_report = self._coarse_report(best_projection, block_weights)
-        after = _report_objective(best_report)
+        after = _objective_value(best_report)
         accepted = after is not None and (before is None or after <= before + 1e-8)
         if not accepted:
-            best_bundle = bundle.deep_copy()
-            best_projection = before_projection
-            best_report = before_report
-            after = before
-        diagnostics = {
-            "calibration_stage": True,
-            "optimization": "Powell MAP over full simulator coarse residuals",
-            "optimizer_success": bool(result.success),
-            "optimizer_message": str(result.message),
-            "optimizer_evaluations": int(getattr(result, "nfev", 0)),
-            "parameter_deltas": {name: float(value) for name, value in zip(_expanded_parameter_names(specs), best_vector.tolist())},
-            "double_counting_policy": "calibration objective uses v4-lite coarse targets only; formal raw objective is run separately.",
-        }
-        return (
-            FullCalibrationStageResult(
-                stage_name=stage_name,
-                opened_parameters=opened,
-                objective_before=before,
-                objective_after=after,
-                residuals=best_report,
-                accepted=accepted,
-                diagnostics=diagnostics,
-            ),
-            best_bundle,
-            best_projection,
-        )
+            return FullCalibrationStageResult(stage_name, tuple(s.name for s in specs), before, before, before_report, False), bundle.deep_copy(), before_projection
+        return FullCalibrationStageResult(stage_name, tuple(s.name for s in specs), before, after, best_report, True, diagnostics={"optimizer_success": bool(result.success), "optimizer_message": str(result.message)}), best_bundle, best_projection
 
-    def _run_formal_raw_refinement(
-        self,
-        bundle: ParameterBundle,
-        condition_name: str,
-    ) -> tuple[FullCalibrationStageResult, ParameterBundle, FullToLiteProjection, dict[str, object]]:
-        specs = tuple(
-            spec
-            for stage_name in ("F1-state-landscape", "F2-ecDNA-turnover", "F3-hazard-net-growth")
-            for spec in _stage_parameter_specs(bundle, stage_name)
-        )
-        centers = tuple(spec.raw_values(bundle) for spec in specs)
-        initial = _pack_stage_vector(bundle, specs, centers)
+    def _run_formal_raw_refinement(self, bundle: ParameterBundle, condition_name: str) -> tuple[FullCalibrationStageResult, ParameterBundle, FullToLiteProjection, dict[str, object]]:
+        specs = tuple(spec for stage in ("F1-state-landscape", "F2-ecDNA-turnover", "F3-hazard-net-growth") for spec in _stage_specs(bundle, stage))
+        centers = tuple(spec.getter(bundle) for spec in specs)
+        initial = _pack(bundle, specs, centers)
         before_projection = self._project_bundle(bundle, condition_name)
         before_report = self._formal_raw_observation_report(before_projection, condition_name, bundle=bundle)
-        before = _report_objective(before_report)
+        before = _objective_value(before_report)
 
         def objective(vector: np.ndarray) -> float:
             trial = bundle.deep_copy()
-            try:
-                _apply_stage_vector(trial, specs, centers, vector)
-                projection = self._project_bundle(trial, condition_name)
-                report = self._formal_raw_observation_report(projection, condition_name, bundle=trial)
-                score = _report_objective(report)
-                if score is None:
-                    return 1e12
-                prior = 0.05 * float(np.mean(np.square(np.asarray(vector, dtype=float)))) if vector.size else 0.0
-                return float(score + prior)
-            except Exception:
-                return 1e12
+            _apply(trial, specs, centers, vector)
+            projection = self._project_bundle(trial, condition_name)
+            value = _objective_value(self._formal_raw_observation_report(projection, condition_name, bundle=trial))
+            return 1e12 if value is None else value
 
-        result = minimize(
-            objective,
-            initial,
-            method=self.settings.optimizer_method,
-            options={"maxiter": int(self.settings.formal_maxiter), "disp": False},
-        )
-        best_vector = np.asarray(result.x if result.success or np.isfinite(result.fun) else initial, dtype=float)
-        best_bundle = bundle.deep_copy()
-        _apply_stage_vector(best_bundle, specs, centers, best_vector)
-        best_projection = self._project_bundle(best_bundle, condition_name)
-        best_report = self._formal_raw_observation_report(best_projection, condition_name, bundle=best_bundle)
-        after = _report_objective(best_report)
+        result = minimize(objective, initial, method=self.settings.optimizer_method, options={"maxiter": int(self.settings.formal_maxiter), "disp": False})
+        best = bundle.deep_copy()
+        _apply(best, specs, centers, np.asarray(result.x if np.isfinite(result.fun) else initial, dtype=float))
+        projection = self._project_bundle(best, condition_name)
+        report = self._formal_raw_observation_report(projection, condition_name, bundle=best)
+        after = _objective_value(report)
         accepted = after is not None and (before is None or after <= before + 1e-8)
-        if not accepted:
-            best_bundle = bundle.deep_copy()
-            best_projection = before_projection
-            best_report = before_report
-            after = before
-        stage = FullCalibrationStageResult(
-            stage_name="F-formal-raw-MAP",
-            opened_parameters=tuple(spec.name for spec in specs),
-            objective_before=before,
-            objective_after=after,
-            residuals=best_report,
-            accepted=accepted,
-            diagnostics={
-                "formal_inference_stage": True,
-                "optimization": "direct raw-observation MAP approximation; no v4-lite target in objective",
-                "optimizer_success": bool(result.success),
-                "optimizer_message": str(result.message),
-                "optimizer_evaluations": int(getattr(result, "nfev", 0)),
-                "double_counting_policy": "v4-lite summaries are not used in this objective.",
-            },
-        )
-        return stage, best_bundle, best_projection, best_report
+        particle_report = self._run_smc_style_particles(best, specs, centers, np.asarray(result.x if np.isfinite(result.fun) else initial, dtype=float), condition_name)
+        report.update({"formal_mode": "bayesian_synthetic_likelihood_smc_style", "particle_posterior": particle_report})
+        stage = FullCalibrationStageResult("F-formal-raw-MAP", tuple(spec.name for spec in specs), before, after, report, accepted, diagnostics={"formal_inference_stage": True, "particle_posterior": particle_report})
+        return stage, best, projection, report
 
     def _formal_raw_observation_report(self, projection: FullToLiteProjection, condition_name: str, *, bundle: ParameterBundle) -> dict[str, object]:
-        simulation_result = self._run_full_simulation(condition_name=condition_name, bundle=bundle)
-        simulated_dataset = CanonicalFitDataset.from_simulation_runs(
-            {condition_name: (simulation_result,)},
-            conditions={condition_name: self.dataset.conditions[condition_name]},
-            ectag_hist_max=self.dataset.ectag_upper_bound(),
-        )
-        observed = summarize_dataset_v4_lite(self.dataset, condition_names=(condition_name,), binning=self.structure.binning)
-        simulated = summarize_dataset_v4_lite(simulated_dataset, condition_names=(condition_name,), binning=self.structure.binning)
-        report = _summary_distribution_residual_report(observed, simulated)
-        report.update(
-            {
-                "mode": "direct_raw_observation_map",
-                "projection_weeks": projection.weeks,
-                "double_counting_policy": "direct raw observations only; v4-lite posterior targets excluded.",
-            }
-        )
-        return report
+        tensor = build_v4_lite_tensor(self.dataset, condition_names=(condition_name,), structure=self.structure)
+        params = V4LiteParameters.default(tensor.structure, purity_matrix=self.dataset.purity_matrix, qpcdr_calibration=self.dataset.qpcdr_calibration)
+
+        def _align_week_axis(values: np.ndarray, n_weeks: int) -> tuple[np.ndarray, int]:
+            array = np.asarray(values, dtype=float)
+            if array.shape[0] >= n_weeks:
+                return array[:n_weeks], 0
+            pad_n = n_weeks - array.shape[0]
+            return np.concatenate([array, np.repeat(array[-1:], pad_n, axis=0)], axis=0), pad_n
+
+        abundance_array, abundance_pad_n = _align_week_axis(projection.state_abundance, len(tensor.weeks))
+        copy_array, copy_pad_n = _align_week_axis(projection.copy_distributions, len(tensor.weeks))
+        abundance = {condition_name: abundance_array}
+        copies = {condition_name: copy_array}
+        predicted = _prediction_summary(tensor, params, abundance, copies).align_to(tensor.observed_summary)
+        rows: list[dict[str, object]] = []
+        for block in tensor.observed_summary.block_names():
+            observed_values = tensor.observed_summary.blocks[block].values
+            predicted_values = predicted.blocks[block].values
+            residual = predicted_values - observed_values
+            scale = max(float(np.sqrt(np.mean(np.square(observed_values)))) if observed_values.size else 0.0, 1e-8)
+            rows.append(
+                {
+                    "block": block,
+                    "rmse": float(np.sqrt(np.mean(np.square(residual)))) if residual.size else 0.0,
+                    "relative_rmse": float(np.sqrt(np.mean(np.square(residual))) / scale) if residual.size else 0.0,
+                    "weighted_relative_rmse": float(np.sqrt(np.mean(np.square(residual))) / scale) if residual.size else 0.0,
+                    "weight": 1.0,
+                    "n": int(observed_values.size),
+                }
+            )
+        finite = [float(row["weighted_relative_rmse"]) for row in rows if np.isfinite(float(row["weighted_relative_rmse"]))]
+        return {
+            "mode": "direct_raw_observation_map",
+            "condition": condition_name,
+            "mode_label": "raw_observation_residuals",
+            "weighted_relative_rmse": float(np.mean(finite)) if finite else float("nan"),
+            "rows": rows,
+            "double_counting_policy": "raw-observation mode excludes v4-lite posterior target likelihood.",
+            "raw_observation_week_count": int(len(tensor.weeks)),
+            "projection_week_count": int(projection.state_abundance.shape[0]),
+            "projection_padding_policy": "repeat_last_full_snapshot_for_observed_weeks_beyond_simulation" if max(abundance_pad_n, copy_pad_n) else "none",
+            "projection_padding_weeks": int(max(abundance_pad_n, copy_pad_n)),
+        }
+
+    def _run_smc_style_particles(self, bundle: ParameterBundle, specs: tuple[_StageSpec, ...], centers: tuple[np.ndarray, ...], map_vector: np.ndarray, condition_name: str) -> dict[str, object]:
+        rng = np.random.default_rng(int(self.settings.seeds[0]) + 9001)
+        parameter_names = _spec_parameter_names(specs, centers)
+        current = np.asarray(map_vector, dtype=float).reshape(1, -1)
+        if current.size == 0:
+            return {"mode": "bayesian_synthetic_likelihood_smc_style", "n_particles": 0, "reason": "no opened parameters"}
+        particles = np.repeat(current, int(self.settings.smc_particles), axis=0)
+        particles += rng.normal(0.0, float(self.settings.smc_scale), size=particles.shape)
+        rows: list[dict[str, object]] = []
+        for step in range(max(int(self.settings.smc_steps), 1)):
+            scored: list[tuple[float, np.ndarray, dict[str, object]]] = []
+            for particle in particles:
+                trial = bundle.deep_copy()
+                _apply(trial, specs, centers, particle)
+                projection = self._project_bundle(trial, condition_name)
+                report = self._formal_raw_observation_report(projection, condition_name, bundle=trial)
+                value = _objective_value(report)
+                score = 1e12 if value is None else float(value)
+                scored.append((score, particle.copy(), report))
+            scores = np.asarray([item[0] for item in scored], dtype=float)
+            finite = np.isfinite(scores)
+            if not np.any(finite):
+                weights = np.full(scores.size, 1.0 / max(scores.size, 1), dtype=float)
+            else:
+                centered = scores - float(np.min(scores[finite]))
+                # Student-t-like heavy-tailed synthetic likelihood weight.
+                logw = -0.5 * np.log1p(centered)
+                logw -= float(np.max(logw))
+                weights = np.exp(logw)
+                weights = weights / max(float(np.sum(weights)), 1e-12)
+            for idx, (score, particle, _report) in enumerate(scored):
+                row = {"step": step, "particle": idx, "synthetic_likelihood_score": score, "weight": float(weights[idx])}
+                for name, value in zip(parameter_names, particle.tolist()):
+                    row[name] = float(value)
+                rows.append(row)
+            chosen = rng.choice(np.arange(particles.shape[0]), size=particles.shape[0], replace=True, p=weights)
+            particles = np.asarray([scored[index][1] for index in chosen], dtype=float)
+            particles += rng.normal(0.0, float(self.settings.smc_scale) / float(step + 2), size=particles.shape)
+        final_scores = [row for row in rows if row["step"] == max(int(self.settings.smc_steps), 1) - 1]
+        best = min(final_scores, key=lambda row: float(row["synthetic_likelihood_score"])) if final_scores else {}
+        ess = 1.0 / max(sum(float(row["weight"]) ** 2 for row in final_scores), 1e-12) if final_scores else 0.0
+        return {
+            "mode": "bayesian_synthetic_likelihood_smc_style",
+            "n_particles": int(self.settings.smc_particles),
+            "n_steps": int(self.settings.smc_steps),
+            "effective_sample_size": float(ess),
+            "best_particle": best,
+            "particles": rows,
+            "likelihood": "Student-t-style heavy-tailed weight over full-vs-observation summary residuals",
+        }
 
     @staticmethod
     def _skipped_stages() -> dict[str, str]:
@@ -793,75 +468,89 @@ class FullCalibrationRunner:
             "F5-co-segregation-daughter-memory": "skipped: requires same-cell lineage evidence.",
         }
 
-    def _build_result_from_projection(self, projection: FullToLiteProjection, *, f0_source: str = "full_simulator") -> FullCalibrationResult:
-        residuals = self._coarse_report(projection)
-        objective = float(residuals["weighted_relative_rmse"]) if np.isfinite(float(residuals["weighted_relative_rmse"])) else None
-        f0_diagnostics = {
-            "source": f0_source,
-            "has_N": projection.state_abundance.size > 0,
-            "has_p": projection.copy_distributions.size > 0,
-            "has_T": projection.transition_matrices is not None,
-            "has_g": projection.growth_rates is not None,
-            "has_G": projection.copy_kernels is not None,
-            "projection_diagnostics": projection.diagnostics,
-        }
-        stages = [
-            FullCalibrationStageResult(
-                "F0-skeleton",
-                (),
-                None,
-                objective,
-                residuals,
-                accepted=bool(f0_diagnostics["has_N"] and f0_diagnostics["has_p"]),
-                diagnostics=f0_diagnostics,
-            ),
-            self._diagnostic_stage(
-                "F1-state-landscape",
-                ("landscape.alpha", "landscape.gamma_C[NPC]", "landscape.gamma_P[OPC]", "MYC mobility proxy"),
-                residuals,
-            ),
-            self._diagnostic_stage(
-                "F2-ecDNA-turnover",
-                ("turnover.gain/loss baseline", "target drug loss effect"),
-                residuals,
-            ),
-            self._diagnostic_stage(
-                "F3-hazard-net-growth",
-                ("hazard/death growth proxy",),
-                residuals,
-            ),
-        ]
+    def _build_result_from_projection(self, projection: FullToLiteProjection, source: str) -> FullCalibrationResult:
+        report = self._coarse_report(projection)
+        objective = _objective_value(report)
+        f0 = FullCalibrationStageResult("F0-skeleton", (), None, objective, report, bool(projection.state_abundance.size and projection.copy_distributions.size), diagnostics={"source": source, "projection_diagnostics": projection.diagnostics})
         skipped = self._skipped_stages()
         return FullCalibrationResult(
-            stage_results=tuple(stages),
+            stage_results=(f0,),
             calibrated_bundle=self.bundle.deep_copy(),
             projection=projection,
-            coarse_residual_report={
-                **residuals,
-                "calibration_mode": "v4_lite_summary_target",
-                "formal_inference_mode": "not_run",
-                "posterior_label": "not_formal_full_bayesian_posterior",
-            },
+            coarse_residual_report={**report, "calibration_mode": "v4_lite_summary_target", "formal_inference_mode": "not_run", "posterior_label": "not_formal_full_bayesian_posterior"},
             skipped_stages=skipped,
-            formal_inference_report={"mode": "not_run_for_provided_simulation_result"},
+            formal_inference_report={"mode": "not_run"},
         )
 
-    @staticmethod
-    def _diagnostic_stage(stage_name: str, opened_parameters: tuple[str, ...], residuals: dict[str, object]) -> FullCalibrationStageResult:
-        objective = float(residuals["weighted_relative_rmse"]) if np.isfinite(float(residuals["weighted_relative_rmse"])) else None
-        return FullCalibrationStageResult(
-            stage_name=stage_name,
-            opened_parameters=opened_parameters,
-            objective_before=objective,
-            objective_after=objective,
-            residuals=residuals,
-            accepted=objective is not None,
-            diagnostics={
-                "calibration_stage": True,
-                "optimization": "coarse residual diagnostic; no formal full posterior sampling",
-                "double_counting_policy": "do not combine v4-lite posterior targets with raw-observation likelihood in formal inference mode",
-            },
-        )
+
+def _bundle_summary(bundle: ParameterBundle) -> dict[str, object]:
+    model = bundle.model
+    return {
+        "simulation": {
+            "t_max": model.simulation.t_max,
+            "n_init": model.simulation.n_init,
+            "max_pop_size": model.simulation.max_pop_size,
+        },
+        "landscape": {
+            "alpha": model.landscape.alpha.tolist(),
+            "gamma_C": model.landscape.gamma_C.tolist(),
+            "gamma_P": model.landscape.gamma_P.tolist(),
+        },
+        "hazard": {"theta_P": model.hazard.theta_P, "phi_B": model.hazard.phi_B},
+        "turnover_gain_ceiling": {species: model.turnover[species].gain_ceiling for species in cfg.SPECIES},
+        "posterior_label": "bridge_calibrated_map_not_formal_full_bayesian_posterior",
+    }
+
+
+def _projection_rows(projection: FullToLiteProjection) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for week_idx, week in enumerate(projection.weeks):
+        total = max(float(np.sum(projection.state_abundance[week_idx])), 1e-12)
+        for state_idx, state in enumerate(cfg.STATE_NAMES):
+            rows.append({"block": "state_abundance", "week": week, "state": state, "value": float(projection.state_abundance[week_idx, state_idx]), "fraction": float(projection.state_abundance[week_idx, state_idx] / total)})
+        for state_idx, state in enumerate(cfg.STATE_NAMES):
+            for species_idx, species in enumerate(cfg.SPECIES):
+                probs = projection.copy_distributions[week_idx, state_idx, species_idx]
+                rows.append({"block": "copy_mean", "week": week, "state": state, "species": species, "value": float(np.dot(probs, np.arange(probs.size)))})
+    if projection.growth_rates is not None:
+        for interval in range(projection.growth_rates.shape[0]):
+            for state_idx, state in enumerate(cfg.STATE_NAMES):
+                rows.append({"block": "growth_rate", "week": projection.weeks[interval], "state": state, "value": float(projection.growth_rates[interval, state_idx])})
+    return rows
+
+
+def _full_release_block_status(result: FullCalibrationResult) -> list[dict[str, object]]:
+    accepted = {stage.stage_name: stage.accepted for stage in result.stage_results}
+    return [
+        {"block": "ecDNA_tail_distribution", "status": "bridge_calibrated" if accepted.get("F2-ecDNA-turnover") else "fixed", "release_condition": "release only if full bridge fails ecTAG tail PPC"},
+        {"block": "state_landscape_plasticity", "status": "bridge_calibrated" if accepted.get("F1-state-landscape") else "fixed", "release_condition": "release only when lite M4 accepts transition coupling"},
+        {"block": "growth_hazard", "status": "bridge_calibrated" if accepted.get("F3-hazard-net-growth") else "fixed", "release_condition": "release only when lite M3 accepts growth coupling"},
+        {"block": "stress_survival", "status": "skipped", "release_condition": "requires independent stress/death marker evidence"},
+        {"block": "co_segregation", "status": "skipped", "release_condition": "requires same-cell multi-species ecTAG and failed joint PPC"},
+        {"block": "drug", "status": "skipped", "release_condition": "requires treatment conditions and lite drug-effect evidence"},
+    ]
+
+
+def _full_report_output_paths(output_dir: str | Path) -> dict[str, tuple[Path, ...]]:
+    root = Path(output_dir)
+    return {
+        "FULL-bridge": (
+            root / "FULL_bridge_fit.json",
+            root / "FULL_bridge_simulated_summaries.csv",
+            root / "FULL_bridge_report.pdf",
+        ),
+        "FULL-restricted": (
+            root / "FULL_restricted_fit.nc",
+            root / "FULL_restricted_parameters.csv",
+            root / "FULL_restricted_particle_posterior.csv",
+            root / "FULL_restricted_ppc.pdf",
+        ),
+        "FULL-validation": (
+            root / "FULL_identifiability_report.pdf",
+            root / "FULL_release_block_status.json",
+            root / "full_calibration_report.json",
+        ),
+    }
 
 
 def write_full_calibration_reports(output_dir: str | Path, result: FullCalibrationResult) -> None:
@@ -883,14 +572,65 @@ def write_full_calibration_reports(output_dir: str | Path, result: FullCalibrati
         ],
         "coarse_residual_report": result.coarse_residual_report,
         "skipped_stages": result.skipped_stages,
-        "formal_inference_mode": result.formal_inference_report.get("mode", "not_run"),
         "formal_inference_report": result.formal_inference_report,
-        "double_counting_policy": "calibration reports may use v4-lite coarse targets; formal full inference must use raw observations only.",
+        "double_counting_policy": "full bridge calibration is diagnostic unless formal raw mode is run.",
     }
     (destination / "full_calibration_report.json").write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
     with open(destination / "full_coarse_residuals.csv", "w", encoding="utf-8", newline="") as handle:
-        fieldnames = ("block", "rmse", "relative_rmse", "n")
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=("block", "rmse", "relative_rmse", "n"))
         writer.writeheader()
         for row in result.coarse_residual_report.get("rows", ()):
-            writer.writerow({name: row.get(name) for name in fieldnames})
+            writer.writerow({field: row.get(field) for field in ("block", "rmse", "relative_rmse", "n")})
+    write_json(destination / "FULL_bridge_fit.json", _bundle_summary(result.calibrated_bundle))
+    projection_rows = _projection_rows(result.projection)
+    write_table_bundle(destination, "FULL_bridge_simulated_summaries", projection_rows)
+    write_text_pdf(
+        destination / "FULL_bridge_report.pdf",
+        "FULL bridge report",
+        [
+            f"Mode: {result.mode_label}",
+            f"Weighted relative RMSE: {result.coarse_residual_report.get('weighted_relative_rmse')}",
+            "Bridge uses v4-lite summary targets; formal raw inference must avoid double counting.",
+        ],
+    )
+    npz_path = destination / "FULL_restricted_fit.npz"
+    write_npz_or_marker(
+        npz_path,
+        {
+            "state_abundance": result.projection.state_abundance,
+            "copy_distributions": result.projection.copy_distributions,
+            "transition_matrices": np.zeros((0,)) if result.projection.transition_matrices is None else result.projection.transition_matrices,
+            "growth_rates": np.zeros((0,)) if result.projection.growth_rates is None else result.projection.growth_rates,
+        },
+        label="restricted full MAP/diagnostic output",
+    )
+    write_netcdf_file(
+        destination / "FULL_restricted_fit.nc",
+        {
+            "state_abundance": result.projection.state_abundance,
+            "copy_distributions": result.projection.copy_distributions,
+            "transition_matrices": np.zeros((0,)) if result.projection.transition_matrices is None else result.projection.transition_matrices,
+            "growth_rates": np.zeros((0,)) if result.projection.growth_rates is None else result.projection.growth_rates,
+        },
+        label="restricted full MAP/diagnostic output",
+    )
+    free_rows = [
+        {"stage": stage.stage_name, "parameter": parameter, "accepted": stage.accepted, "objective_after": stage.objective_after}
+        for stage in result.stage_results
+        for parameter in stage.opened_parameters
+    ]
+    particle_rows = []
+    if isinstance(result.formal_inference_report.get("particle_posterior"), dict):
+        particle_rows = list(result.formal_inference_report["particle_posterior"].get("particles", ()))
+    write_table_bundle(destination, "FULL_restricted_parameters", free_rows)
+    write_table_bundle(destination, "FULL_restricted_particle_posterior", particle_rows)
+    fixed_rows = [{"parameter_or_block": name, "reason": reason} for name, reason in result.skipped_stages.items()]
+    fixed_rows.extend({"parameter_or_block": row["block"], "reason": row["release_condition"]} for row in _full_release_block_status(result) if row["status"] == "skipped")
+    write_table_bundle(destination, "FULL_restricted_fixed_params", fixed_rows)
+    write_table_bundle(destination, "FULL_restricted_derived_outputs", projection_rows)
+    write_text_pdf(destination / "FULL_restricted_ppc.pdf", "FULL restricted PPC", ["Restricted full PPC is summarized against v4-lite projection rows.", f"Rows: {len(projection_rows)}"])
+    write_text_pdf(destination / "FULL_identifiability_report.pdf", "FULL identifiability report", ["Profile and release-block diagnostics are written for the restricted full bridge.", "Release blocks are explicit in FULL_release_block_status.json."])
+    write_json(destination / "FULL_release_block_status.json", _full_release_block_status(result))
+    for stage_name, paths in _full_report_output_paths(destination).items():
+        existing = [str(path) for path in paths if path.exists()]
+        print(f"[fit-full] outputs {stage_name}: {', '.join(existing)}")
