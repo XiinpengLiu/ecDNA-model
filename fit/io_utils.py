@@ -1,195 +1,109 @@
-"""Small output helpers for fit artifacts.
-
-The fitting code writes CSV/JSON/NPZ unconditionally and writes optional
-parquet-style artifacts only when the local environment already supports them.
-"""
+"""File IO utilities for deterministic fit stages."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Any
 
 import numpy as np
+import pandas as pd
 
 
-def json_default(value):
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
+def ensure_dir(path: str | Path) -> Path:
+    resolved = Path(path)
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def read_json(path: str | Path) -> dict[str, Any]:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_json(path: str | Path, payload: Any) -> Path:
+    resolved = Path(path)
+    ensure_dir(resolved.parent)
+    with resolved.open("w", encoding="utf-8") as handle:
+        json.dump(_to_jsonable(payload), handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return resolved
+
+
+def read_table(path: str | Path) -> pd.DataFrame:
+    resolved = Path(path)
+    suffix = resolved.suffix.lower()
+    if suffix == ".parquet":
+        return pd.read_parquet(resolved)
+    if suffix in {".csv", ".txt"}:
+        return pd.read_csv(resolved)
+    if suffix == ".tsv":
+        return pd.read_csv(resolved, sep="\t")
+    if suffix == ".json":
+        return pd.read_json(resolved)
+    raise ValueError(f"Unsupported table extension for {resolved}")
+
+
+def write_table(df: pd.DataFrame, path: str | Path) -> Path:
+    resolved = Path(path)
+    ensure_dir(resolved.parent)
+    suffix = resolved.suffix.lower()
+    if suffix == ".parquet":
+        df.to_parquet(resolved, index=False)
+    elif suffix == ".csv":
+        df.to_csv(resolved, index=False)
+    elif suffix == ".tsv":
+        df.to_csv(resolved, index=False, sep="\t")
+    else:
+        raise ValueError(f"Unsupported table extension for {resolved}")
+    return resolved
+
+
+def write_jsonl(path: str | Path, rows: list[dict[str, Any]]) -> Path:
+    resolved = Path(path)
+    ensure_dir(resolved.parent)
+    with resolved.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(_to_jsonable(row), sort_keys=True) + "\n")
+    return resolved
+
+
+def write_npz(path: str | Path, **arrays: Any) -> Path:
+    resolved = Path(path)
+    ensure_dir(resolved.parent)
+    np.savez(resolved, **arrays)
+    return resolved
+
+
+def write_markdown_report(path: str | Path, title: str, sections: list[tuple[str, str]]) -> Path:
+    resolved = Path(path)
+    ensure_dir(resolved.parent)
+    lines = [f"# {title}", ""]
+    for heading, body in sections:
+        lines.extend([f"## {heading}", "", body.strip(), ""])
+    resolved.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return resolved
+
+
+def require_paths(paths: list[str | Path], label: str) -> None:
+    missing = [str(path) for path in paths if not Path(path).exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing {label}: {', '.join(missing)}")
+
+
+def _to_jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(item) for item in value]
     if isinstance(value, Path):
         return str(value)
-    return str(value)
-
-
-def write_json(path: str | Path, payload: object) -> None:
-    Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True, default=json_default), encoding="utf-8")
-
-
-def write_rows_csv(path: str | Path, rows: Sequence[Mapping[str, object]], fieldnames: Sequence[str] | None = None) -> None:
-    destination = Path(path)
-    if fieldnames is None:
-        keys: list[str] = []
-        for row in rows:
-            for key in row:
-                if key not in keys:
-                    keys.append(key)
-        fieldnames = tuple(keys)
-    try:
-        import pandas as pd  # type: ignore
-
-        dataframe = pd.DataFrame([{field: row.get(field) for field in fieldnames} for row in rows], columns=list(fieldnames))
-        dataframe.to_csv(destination, index=False)
-    except Exception:
-        import csv
-
-        with open(destination, "w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=tuple(fieldnames))
-            writer.writeheader()
-            for row in rows:
-                writer.writerow({field: row.get(field) for field in fieldnames})
-
-
-def write_optional_parquet(path: str | Path, rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
-    destination = Path(path)
-    try:
-        import pandas as pd  # type: ignore
-
-        dataframe = pd.DataFrame(list(rows))
-        dataframe.to_parquet(destination, index=False)
-        return {"path": str(destination), "written": True, "format": "parquet"}
-    except Exception as exc:
-        marker = destination.with_suffix(destination.suffix + ".SKIPPED.json")
-        write_json(
-            marker,
-            {
-                "path": str(destination),
-                "written": False,
-                "reason": f"optional parquet support unavailable: {type(exc).__name__}: {exc}",
-                "csv_fallback": str(destination.with_suffix(".csv")),
-            },
-        )
-        return {"path": str(destination), "written": False, "reason": str(exc)}
-
-
-def write_table_bundle(output_dir: str | Path, stem: str, rows: Sequence[Mapping[str, object]], fieldnames: Sequence[str] | None = None) -> dict[str, object]:
-    destination = Path(output_dir)
-    csv_path = destination / f"{stem}.csv"
-    write_rows_csv(csv_path, rows, fieldnames)
-    parquet_status = write_optional_parquet(destination / f"{stem}.parquet", rows)
-    return {"csv": str(csv_path), "parquet": parquet_status}
-
-
-def write_npz_or_marker(path: str | Path, arrays: Mapping[str, np.ndarray], *, label: str) -> dict[str, object]:
-    destination = Path(path)
-    try:
-        np.savez(destination, **{name: np.asarray(value) for name, value in arrays.items()})
-        return {"path": str(destination), "written": True, "label": label}
-    except Exception as exc:
-        marker = destination.with_suffix(destination.suffix + ".SKIPPED.json")
-        write_json(marker, {"path": str(destination), "written": False, "label": label, "reason": str(exc)})
-        return {"path": str(destination), "written": False, "label": label, "reason": str(exc)}
-
-
-def write_netcdf_skip_marker(path: str | Path, *, npz_fallback: str | Path, label: str) -> None:
-    write_json(
-        Path(path).with_suffix(Path(path).suffix + ".SKIPPED.json"),
-        {
-            "path": str(path),
-            "written": False,
-            "label": label,
-            "reason": "NetCDF writing failed; see write_netcdf_file return status.",
-            "npz_fallback": str(npz_fallback),
-        },
-    )
-
-
-def _write_xarray_netcdf(destination: Path, arrays: Mapping[str, np.ndarray], *, label: str) -> None:
-    import xarray as xr  # type: ignore
-
-    data_vars = {}
-    for name, value in arrays.items():
-        array = np.asarray(value, dtype=float)
-        if array.ndim == 0:
-            array = array.reshape(1)
-        dims = tuple(f"{name}_dim{axis}" for axis in range(array.ndim))
-        data_vars[name] = (dims, array)
-    dataset = xr.Dataset(data_vars=data_vars, attrs={"history": label})
-    dataset.to_netcdf(destination)
-
-
-def _write_scipy_netcdf(destination: Path, arrays: Mapping[str, np.ndarray], *, label: str) -> None:
-    from scipy.io import netcdf_file  # type: ignore
-
-    with netcdf_file(str(destination), mode="w") as handle:
-        handle.history = label
-        for name, value in arrays.items():
-            array = np.asarray(value, dtype=float)
-            if array.ndim == 0:
-                array = array.reshape(1)
-            dim_names = []
-            for axis, size in enumerate(array.shape):
-                dim = f"{name}_dim{axis}"
-                handle.createDimension(dim, int(size))
-                dim_names.append(dim)
-            variable = handle.createVariable(name, "f8", tuple(dim_names))
-            variable[:] = array
-
-
-def write_netcdf_file(path: str | Path, arrays: Mapping[str, np.ndarray], *, label: str) -> dict[str, object]:
-    destination = Path(path)
-    try:
-        _write_xarray_netcdf(destination, arrays, label=label)
-        return {"path": str(destination), "written": True, "label": label, "backend": "xarray"}
-    except Exception as xarray_exc:
-        try:
-            _write_scipy_netcdf(destination, arrays, label=label)
-            return {"path": str(destination), "written": True, "label": label, "backend": "scipy.io.netcdf_file", "xarray_error": str(xarray_exc)}
-        except Exception as scipy_exc:
-            write_netcdf_skip_marker(destination, npz_fallback=destination.with_suffix(".npz"), label=label)
-            return {"path": str(destination), "written": False, "label": label, "reason": f"xarray: {xarray_exc}; scipy: {scipy_exc}"}
-
-
-def write_text_pdf(path: str | Path, title: str, lines: Iterable[str]) -> None:
-    """Write a minimal one-page PDF with plain ASCII diagnostic text."""
-
-    rendered = [title, ""] + [str(line) for line in lines]
-    safe_lines = []
-    for line in rendered[:48]:
-        ascii_line = line.encode("latin-1", "replace").decode("latin-1")
-        ascii_line = ascii_line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-        safe_lines.append(ascii_line[:110])
-    content = ["BT", "/F1 10 Tf", "72 760 Td"]
-    first = True
-    for line in safe_lines:
-        if first:
-            content.append(f"({line}) Tj")
-            first = False
-        else:
-            content.append("0 -14 Td")
-            content.append(f"({line}) Tj")
-    content.append("ET")
-    stream = "\n".join(content).encode("latin-1")
-    objects = [
-        b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-        b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream",
-    ]
-    payload = bytearray(b"%PDF-1.4\n")
-    offsets = []
-    for index, obj in enumerate(objects, start=1):
-        offsets.append(len(payload))
-        payload.extend(f"{index} 0 obj\n".encode("ascii"))
-        payload.extend(obj)
-        payload.extend(b"\nendobj\n")
-    xref = len(payload)
-    payload.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
-    payload.extend(b"0000000000 65535 f \n")
-    for offset in offsets:
-        payload.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
-    payload.extend(f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode("ascii"))
-    with open(Path(path), "wb") as handle:
-        handle.write(bytes(payload))
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    return value

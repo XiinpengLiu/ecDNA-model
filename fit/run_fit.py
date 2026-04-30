@@ -1,132 +1,153 @@
-"""Command line entry point for v4-lite fitting."""
+"""Command line interface for the fit_method.md pipeline."""
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
 from pathlib import Path
 
-import numpy as np
-
-import config as cfg
-from fit.data import CanonicalFitDataset, ConditionSpec, CountRecord, EcTAGRecord, FlowRecord, QPCDRRecord
-from fit.full_calibration import FullCalibrationRunner, FullCalibrationSettings, write_full_calibration_reports
-from fit.io_utils import write_json
-from fit.v4_lite import V4LiteFitRunner, V4LiteOptimizationSettings, V4LiteStructure, build_lite_release_table_rows, build_lite_to_full_priors, build_obs_params_for_full
-
-
-def _synthetic_dataset() -> CanonicalFitDataset:
-    conditions = {"ctrl": ConditionSpec("ctrl")}
-    flow = []
-    for week, fractions in ((1, (0.4, 0.3, 0.2, 0.1)), (2, (0.35, 0.35, 0.2, 0.1)), (3, (0.3, 0.38, 0.22, 0.1))):
-        for state, fraction in zip(cfg.STATE_NAMES, fractions):
-            flow.append(FlowRecord("ctrl", week, state, int(round(1000 * fraction)), fraction, 1000, "r1"))
-    counts = (CountRecord("ctrl", 2, 1100.0, "r1"), CountRecord("ctrl", 3, 1200.0, "r1"))
-    qpcdr = tuple(QPCDRRecord("ctrl", week, state, species, 2.0 + 0.1 * week, "r1") for week in (2, 3) for state in cfg.STATE_NAMES for species in cfg.SPECIES)
-    ectag = tuple(EcTAGRecord("ctrl", week, state, species, f"{species}-cell{i}", i % 6, "r1") for week in (2, 3) for state in cfg.STATE_NAMES for species in cfg.SPECIES for i in range(8))
-    week1 = {
-        "ctrl": {
-            state: np.asarray([[1 + idx, 2, 3], [2 + idx, 3, 4], [3 + idx, 4, 5], [4 + idx, 5, 6]], dtype=int)
-            for idx, state in enumerate(cfg.STATE_NAMES)
-        }
-    }
-    return CanonicalFitDataset(conditions=conditions, flow=tuple(flow), counts=counts, qpcdr=qpcdr, ectag=ectag, week1_copy_distributions=week1)
+from fit.empirical import build_empirical_summaries
+from fit.full_smc import aggregate_accepted_histories, create_full_initial_particles, run_full_reconstruction
+from fit.objective import score_particles_from_files
+from fit.observation import fit_observation_model
+from fit.ppc import run_full_ppc
+from fit.raw import create_synthetic_raw_dataset, ingest_raw_data
+from fit.scenarios import classify_scenarios_from_files
+from fit.schemas import ResultLayout
+from fit.stage_runner import run_pipeline_from_raw
+from fit.validation import validate_method_contracts
+from fit.v4_lite import fit_v4_lite_summary_posterior
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the ecDNA v4-lite fitting pipeline.")
-    parser.add_argument("--manifest", type=Path)
-    parser.add_argument("--output", type=Path, default=Path("fit_outputs/smoke"))
-    parser.add_argument("--synthetic-smoke", action="store_true")
-    parser.add_argument("--full-bridge", action="store_true", help="Also run the full-simulator bridge against the v4-lite projection.")
-    parser.add_argument("--full-formal", action="store_true", help="Run restricted full raw-summary refinement after the bridge.")
-    parser.add_argument("--maxiter", type=int, default=8)
-    parser.add_argument("--posterior-backend", choices=("auto", "emcee", "laplace"), default="auto")
-    parser.add_argument("--emcee-walkers", type=int, default=0)
-    parser.add_argument("--emcee-steps", type=int, default=0)
-    parser.add_argument("--emcee-burnin", type=int, default=16)
-    parser.add_argument("--synthetic-recovery-datasets", type=int, default=50)
-    parser.add_argument("--sbc-datasets", type=int, default=12)
-    parser.add_argument("--full-max-pop-size", type=int, default=200000)
-    parser.add_argument("--full-n-init", type=int)
-    parser.add_argument("--full-smc-particles", type=int, default=32)
-    parser.add_argument("--full-smc-steps", type=int, default=2)
-    parser.add_argument("--include-optional-npc-ac-edge", action="store_true")
-    parser.add_argument("--use-olig2-prior", action="store_true", help="Use a weak OLIG2 week1 prior; defaults to ratio 2.0 if the manifest has no olig2_initial_ratio.")
-    parser.add_argument("--min-ectag-cells-for-hist", type=int, default=50)
-    parser.add_argument("--skip-full-f1", action="store_true")
-    parser.add_argument("--skip-full-f2", action="store_true")
-    parser.add_argument("--skip-full-f3", action="store_true")
-    args = parser.parse_args()
-    if args.synthetic_smoke:
-        dataset = _synthetic_dataset()
-    elif args.manifest is not None:
-        dataset = CanonicalFitDataset.from_manifest(args.manifest)
-    else:
-        raise SystemExit("Provide --manifest or --synthetic-smoke.")
-    if args.use_olig2_prior and dataset.olig2_initial_ratio is None:
-        dataset = replace(dataset, olig2_initial_ratio=2.0)
-    runner = V4LiteFitRunner(
-        dataset,
-        output_dir=args.output,
-        structure=V4LiteStructure.default(include_optional_edge=bool(args.include_optional_npc_ac_edge), qpcdr_batches=dataset.qpcdr_batches()),
-        optimization_settings=V4LiteOptimizationSettings(
-            maxiter=args.maxiter,
-            posterior_draws=16,
-            posterior_backend=args.posterior_backend,
-            emcee_walkers=args.emcee_walkers,
-            emcee_steps=args.emcee_steps,
-            emcee_burnin=args.emcee_burnin,
-            synthetic_recovery_datasets=args.synthetic_recovery_datasets,
-            sbc_datasets=args.sbc_datasets,
-            min_ectag_cells_for_hist=args.min_ectag_cells_for_hist,
-        ),
-    )
-    result = runner.run_all()
-    if args.full_bridge or args.full_formal:
-        if result.projection_targets is None:
-            raise SystemExit("v4-lite projection target was not produced.")
-        release_table = build_lite_release_table_rows(result.stage_results)
-        lite_priors = build_lite_to_full_priors(result, release_table)
-        obs_params = build_obs_params_for_full(result)
-        projection_targets = result.projection_targets_by_condition or {str(result.projection_targets.diagnostics.get("condition", next(iter(dataset.conditions)))): result.projection_targets}
-        full_runner = FullCalibrationRunner(
-            dataset,
-            projection_targets,
-            structure=result.tensor.structure,
-            settings=FullCalibrationSettings(
-                maxiter=max(1, min(args.maxiter, 4)),
-                formal_maxiter=max(1, min(args.maxiter, 2)),
-                run_formal_raw_refinement=bool(args.full_formal),
-                max_pop_size=args.full_max_pop_size,
-                n_init=args.full_n_init,
-                smc_particles=args.full_smc_particles,
-                smc_steps=args.full_smc_steps,
-                skip_f1=bool(args.skip_full_f1),
-                skip_f2=bool(args.skip_full_f2),
-                skip_f3=bool(args.skip_full_f3),
-            ),
-            release_table=release_table,
-            lite_to_full_priors=lite_priors,
-            obs_params_for_full=obs_params,
-        )
-        full_output = args.output / "full_bridge"
-        full_results = full_runner.run_all_conditions()
-        if len(full_results) == 1:
-            write_full_calibration_reports(full_output, next(iter(full_results.values())))
-        else:
-            for condition, full_result in full_results.items():
-                write_full_calibration_reports(full_output / condition, full_result)
-            write_json(
-                full_output / "FULL_bridge_condition_index.json",
-                {
-                    "conditions": tuple(full_results),
-                    "mode": "multi_condition_full_bridge_calibration",
-                    "is_final_full_model_fit": False,
-                    "condition_outputs": {condition: str(full_output / condition) for condition in full_results},
-                },
-            )
-        print(f"[fit] full bridge reports written to {full_output}")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="ecDNA fit pipeline aligned to markdown/fit_method.md")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("make-synthetic-raw", help="Create a small deterministic raw-data fixture.")
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--seed", type=int, default=1)
+
+    p = sub.add_parser("ingest-raw", help="Standardize raw flow/qPCDR/ecTAG/ddPCR/cell-count tables.")
+    p.add_argument("--raw-dir", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+
+    p = sub.add_parser("fit-observation-model", help="Fit and lock observation calibration.")
+    p.add_argument("--clean-dir", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--seed", type=int, default=1)
+
+    p = sub.add_parser("build-empirical-summaries", help="Build empirical snapshot summaries.")
+    p.add_argument("--clean-dir", type=Path, required=True)
+    p.add_argument("--obs-params", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--min-ectag-cells-for-hist", type=int, default=50)
+
+    p = sub.add_parser("fit-lite", help="Generate v4-lite calibrated summary posterior artifacts.")
+    p.add_argument("--empirical-dir", type=Path, required=True)
+    p.add_argument("--obs-params", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--draws", type=int, default=64)
+
+    p = sub.add_parser("create-full-initial-particles", help="Sample full week-1 representative particles from lite sampler.")
+    p.add_argument("--lite-dir", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--particles", type=int, default=16)
+    p.add_argument("--cells", type=int, default=200)
+    p.add_argument("--seed", type=int, default=1)
+
+    p = sub.add_parser("run-full-reconstruction", help="Run full conditional particle reconstruction and scoring.")
+    p.add_argument("--lite-dir", type=Path, required=True)
+    p.add_argument("--obs-params", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--particles", type=int, default=32)
+    p.add_argument("--cells", type=int, default=300)
+    p.add_argument("--seed", type=int, default=1)
+
+    p = sub.add_parser("score-particles", help="Score existing particle summary features against lite/raw targets.")
+    p.add_argument("--particle-features", type=Path, required=True)
+    p.add_argument("--lite-target", type=Path, required=True)
+    p.add_argument("--distance-weights", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+
+    p = sub.add_parser("aggregate-accepted-histories", help="Aggregate accepted full histories.")
+    p.add_argument("--full-dir", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+
+    p = sub.add_parser("run-ppc", help="Run posterior predictive checks from full particles.")
+    p.add_argument("--full-dir", type=Path, required=True)
+    p.add_argument("--lite-dir", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+
+    p = sub.add_parser("classify-scenarios", help="Classify scenario labels from full histories.")
+    p.add_argument("--full-dir", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+
+    p = sub.add_parser("run-all", help="Run the complete file-based pipeline from raw inputs.")
+    p.add_argument("--raw-dir", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--draws", type=int, default=64)
+    p.add_argument("--particles", type=int, default=32)
+    p.add_argument("--cells", type=int, default=300)
+
+    p = sub.add_parser("run-synthetic-smoke", help="Run a complete synthetic smoke pipeline.")
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--draws", type=int, default=16)
+    p.add_argument("--particles", type=int, default=8)
+    p.add_argument("--cells", type=int, default=80)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    if args.command == "make-synthetic-raw":
+        create_synthetic_raw_dataset(args.output, seed=args.seed)
+        return
+    if args.command == "ingest-raw":
+        ingest_raw_data(args.raw_dir, args.output)
+        return
+    if args.command == "fit-observation-model":
+        fit_observation_model(args.clean_dir, args.output, seed=args.seed)
+        return
+    if args.command == "build-empirical-summaries":
+        build_empirical_summaries(args.clean_dir, args.obs_params, args.output, args.min_ectag_cells_for_hist)
+        return
+    if args.command == "fit-lite":
+        fit_v4_lite_summary_posterior(args.empirical_dir, args.obs_params, args.output, seed=args.seed, posterior_draws=args.draws)
+        return
+    if args.command == "create-full-initial-particles":
+        create_full_initial_particles(args.lite_dir, args.output, particles=args.particles, cells=args.cells, seed=args.seed)
+        return
+    if args.command == "run-full-reconstruction":
+        run_full_reconstruction(args.lite_dir, args.obs_params, args.output, particles=args.particles, cells=args.cells, seed=args.seed)
+        return
+    if args.command == "score-particles":
+        score_particles_from_files(args.particle_features, args.lite_target, args.distance_weights, args.output)
+        return
+    if args.command == "aggregate-accepted-histories":
+        aggregate_accepted_histories(args.full_dir, args.output)
+        return
+    if args.command == "run-ppc":
+        run_full_ppc(args.full_dir, args.lite_dir, args.output)
+        return
+    if args.command == "classify-scenarios":
+        classify_scenarios_from_files(args.full_dir, args.output)
+        return
+    if args.command == "run-all":
+        run_pipeline_from_raw(args.raw_dir, args.output, seed=args.seed, posterior_draws=args.draws, particles=args.particles, cells=args.cells)
+        layout = ResultLayout(args.output)
+        validate_method_contracts(layout.observation, layout.lite, layout.full_smc)
+        return
+    if args.command == "run-synthetic-smoke":
+        raw_dir = args.output / "raw_fixture"
+        create_synthetic_raw_dataset(raw_dir, seed=args.seed)
+        run_pipeline_from_raw(raw_dir, args.output / "results", seed=args.seed, posterior_draws=args.draws, particles=args.particles, cells=args.cells)
+        layout = ResultLayout(args.output / "results")
+        validate_method_contracts(layout.observation, layout.lite, layout.full_smc)
+        return
+    raise SystemExit(f"Unhandled command: {args.command}")
 
 
 if __name__ == "__main__":

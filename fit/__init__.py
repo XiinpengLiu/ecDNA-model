@@ -1,68 +1,38 @@
-"""Fitting pipeline public API."""
+"""Fit pipeline public API aligned to markdown/fit_method.md."""
 
-from fit.data import (
-    CanonicalFitDataset,
-    ConditionSpec,
-    CountRecord,
-    DDPCRRecord,
-    EcTAGRecord,
-    FlowRecord,
-    QPCDRRecord,
-    build_raw_data_qc_report,
-    load_count_csv,
-    load_ddpcr_csv,
-    load_ectag_csv,
-    load_flow_csv,
-    load_qpcdr_csv,
-    write_standardized_dataset,
-)
-from fit.full_calibration import (
-    FullCalibrationResult,
-    FullCalibrationRunner,
-    FullCalibrationSettings,
-    FullCalibrationStageResult,
-    coarse_residual_report,
-    full_model_capability_report,
-    write_full_calibration_reports,
-)
-from fit.v4_lite import (
-    CopyNumberBinning,
-    FullToLiteProjection,
-    V4_LITE_STAGE_SEQUENCE,
-    V4LiteFitResult,
-    V4LiteFitRunner,
-    V4LiteModelVersion,
-    V4LiteObjective,
-    V4LiteOptimizationSettings,
-    V4LiteParameters,
-    V4LitePrediction,
-    V4LiteReports,
-    V4LiteStageDefinition,
-    V4LiteStageFitResult,
-    V4LiteStructure,
-    V4LiteTensor,
-    build_parameter_status_table,
-    build_lite_release_table_rows,
-    build_lite_to_full_priors,
-    build_obs_params_for_full,
-    build_prior_diagnostics_report,
-    build_v4_lite_reports,
-    build_v4_lite_tensor,
-    predict_v4_lite,
-    predict_observation_only,
-    project_full_to_lite,
-    run_leave_one_week_out,
-    run_v4_lite_fake_data_recovery,
-    run_v4_lite_hmc,
-    run_v4_lite_posterior_predictive,
-    run_v4_lite_prior_predictive,
-    run_v4_lite_profile_likelihood,
-    run_v4_lite_sbc,
-    sample_prior_parameters,
-    simulate_replicated_observations,
-    summarize_dataset_v4_lite,
-    write_fit_method_artifacts,
-    write_v4_lite_reports,
-)
+from fit.empirical import build_empirical_summaries
+from fit.full_smc import aggregate_accepted_histories, create_full_initial_particles, run_full_reconstruction
+from fit.observation import calculate_ddpcr_pooled_mean, fit_observation_model, load_observation_params, validate_observation_params
+from fit.objective import score_particle_summary, score_particles_from_files
+from fit.raw import create_synthetic_raw_dataset, ingest_raw_data, load_clean_tables, load_raw_tables, standardize_raw_tables, validate_raw_tables
+from fit.scenarios import classify_scenarios, classify_scenarios_from_files
+from fit.stage_runner import run_pipeline_from_raw
+from fit.validation import validate_full_artifacts, validate_method_contracts
+from fit.v4_lite import fit_v4_lite_summary_posterior, load_lite_artifacts, validate_lite_artifacts
 
-__all__ = [name for name in globals() if not name.startswith("_")]
+__all__ = [
+    "aggregate_accepted_histories",
+    "build_empirical_summaries",
+    "calculate_ddpcr_pooled_mean",
+    "classify_scenarios",
+    "classify_scenarios_from_files",
+    "create_full_initial_particles",
+    "create_synthetic_raw_dataset",
+    "fit_observation_model",
+    "fit_v4_lite_summary_posterior",
+    "ingest_raw_data",
+    "load_clean_tables",
+    "load_lite_artifacts",
+    "load_observation_params",
+    "load_raw_tables",
+    "run_full_reconstruction",
+    "run_pipeline_from_raw",
+    "score_particle_summary",
+    "score_particles_from_files",
+    "standardize_raw_tables",
+    "validate_full_artifacts",
+    "validate_lite_artifacts",
+    "validate_method_contracts",
+    "validate_observation_params",
+    "validate_raw_tables",
+]
