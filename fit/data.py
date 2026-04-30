@@ -18,6 +18,7 @@ WEEK1 = 1
 DEFAULT_QPCDR_BATCH = "default"
 DEFAULT_QPCDR_SCALE = "copy_number"
 SUPPORTED_QPCDR_SCALES = {DEFAULT_QPCDR_SCALE, "ct"}
+ECTAG_HIST_MAX_METADATA_FLAG = "ectag_hist_max_from_metadata"
 
 
 def _resolve_path(path: str | Path, *, base_dir: Path | None = None) -> Path:
@@ -38,6 +39,19 @@ def _int_or_none(value: str | None) -> int | None:
     if value is None or not str(value).strip():
         return None
     return int(float(value))
+
+
+def _manifest_ectag_hist_max(payload: Mapping[str, object]) -> int | None:
+    value = payload.get("ectag_hist_max")
+    if value is None:
+        return None
+    cfg.require(
+        payload.get(ECTAG_HIST_MAX_METADATA_FLAG) is True,
+        f"manifest ectag_hist_max is only allowed when experimental metadata states an ecTAG observation limit; set {ECTAG_HIST_MAX_METADATA_FLAG}: true.",
+    )
+    maximum = int(float(value))
+    cfg.require(maximum >= 0, "manifest ectag_hist_max must be non-negative.")
+    return maximum
 
 
 def _piecewise_constant(points: Sequence[tuple[float, float]]) -> Callable[[float], float]:
@@ -194,6 +208,10 @@ class CanonicalFitDataset:
         object.__setattr__(self, "ectag", tuple(self.ectag))
         object.__setattr__(self, "ddpcr", tuple(self.ddpcr))
         object.__setattr__(self, "week1_copy_distributions", self._normalize_week1(self.week1_copy_distributions))
+        if self.ectag_hist_max is not None:
+            maximum = int(self.ectag_hist_max)
+            cfg.require(maximum >= 0, "ectag_hist_max must be non-negative.")
+            object.__setattr__(self, "ectag_hist_max", maximum)
         if self.purity_matrix is not None:
             object.__setattr__(self, "purity_matrix", self._normalize_purity(self.purity_matrix))
         object.__setattr__(self, "purity_sensitivity", tuple(self._normalize_purity(m) for m in self.purity_sensitivity))
@@ -202,17 +220,37 @@ class CanonicalFitDataset:
         self.validate()
 
     @staticmethod
-    def _normalize_week1(payload: Mapping[str, Mapping[str, np.ndarray]]) -> dict[str, dict[str, np.ndarray]]:
+    def _week1_matrix_from_marginals(payload: Mapping[str, Sequence[int] | np.ndarray]) -> np.ndarray:
+        cfg.require(set(payload) == set(cfg.SPECIES), "species-specific week1 marginals must cover all ecDNA species.")
+        columns: list[np.ndarray] = []
+        n_rows = 0
+        for species in cfg.SPECIES:
+            values = np.asarray(payload[species], dtype=int).reshape(-1)
+            cfg.require(values.size > 0, f"week1 marginal for {species} must be non-empty.")
+            cfg.require(np.all(values >= 0), f"week1 marginal for {species} must be non-negative.")
+            columns.append(values)
+            n_rows = max(n_rows, int(values.size))
+        return np.column_stack([np.resize(values, n_rows) for values in columns]).astype(int, copy=False)
+
+    @staticmethod
+    def _validate_week1_matrix(matrix: np.ndarray, *, label: str) -> np.ndarray:
+        array = np.asarray(matrix, dtype=int)
+        cfg.require(array.ndim == 2 and array.shape[1] == cfg.N_SPECIES, f"{label} week1 copy matrix must be n x species.")
+        cfg.require(array.shape[0] > 0, f"{label} week1 copy matrix must be non-empty.")
+        cfg.require(np.all(array >= 0), f"{label} week1 copy matrix must be non-negative.")
+        return array.copy()
+
+    @staticmethod
+    def _normalize_week1(payload: Mapping[str, Mapping[str, object]]) -> dict[str, dict[str, np.ndarray]]:
         normalized: dict[str, dict[str, np.ndarray]] = {}
         for condition, by_state in payload.items():
             normalized[condition] = {}
-            for state_name, matrix in by_state.items():
+            for state_name, raw in by_state.items():
                 cfg.require(state_name in cfg.STATE_NAMES, f"Invalid week1 state {state_name}.")
-                array = np.asarray(matrix, dtype=int)
-                cfg.require(array.ndim == 2 and array.shape[1] == cfg.N_SPECIES, "week1 copy matrices must be n x species.")
-                cfg.require(array.shape[0] > 0, "week1 copy matrices must be non-empty.")
-                cfg.require(np.all(array >= 0), "week1 copy matrices must be non-negative.")
-                normalized[condition][state_name] = array.copy()
+                if isinstance(raw, Mapping):
+                    normalized[condition][state_name] = CanonicalFitDataset._week1_matrix_from_marginals(raw)
+                else:
+                    normalized[condition][state_name] = CanonicalFitDataset._validate_week1_matrix(np.asarray(raw, dtype=int), label=f"{condition}/{state_name}")
         return normalized
 
     @staticmethod
@@ -279,9 +317,9 @@ class CanonicalFitDataset:
         cfg.require(set(grouped) == set(cfg.STATE_NAMES), f"week1 ecTAG must cover every state for {condition}.")
         for state_name, cells in grouped.items():
             cfg.require(bool(cells), f"week1 ecTAG has no cells for {condition}/{state_name}.")
-            for cell_id, species_values in cells.items():
-                missing = set(cfg.SPECIES) - set(species_values)
-                cfg.require(not missing, f"week1 ecTAG cell {cell_id} is missing {sorted(missing)}.")
+            species_present = {species for species_values in cells.values() for species in species_values}
+            missing = set(cfg.SPECIES) - species_present
+            cfg.require(not missing, f"week1 ecTAG for {condition}/{state_name} is missing species marginals {sorted(missing)}.")
 
     def _week1_ectag_grouped(self, condition: str) -> dict[str, dict[str, dict[str, int]]]:
         grouped: dict[str, dict[str, dict[str, int]]] = {}
@@ -316,6 +354,7 @@ class CanonicalFitDataset:
     def _week1_flow_fractions(self, condition: str) -> np.ndarray:
         rows = [row for row in self.flow if row.condition == condition and row.week == WEEK1]
         totals = np.zeros(cfg.N_STATES, dtype=float)
+        uses_event_counts = any(row.count is not None or (row.fraction is not None and row.total_events is not None) for row in rows)
         if any(row.count is not None for row in rows):
             for row in rows:
                 if row.count is not None:
@@ -327,9 +366,34 @@ class CanonicalFitDataset:
                 totals[cfg.STATE_INDEX[row.state]] += float(row.fraction or 0.0)
         total = float(np.sum(totals))
         cfg.require(total > 0.0, f"week1 flow total must be positive for {condition}.")
+        olig2_prior = self._olig2_dirichlet_prior()
+        if olig2_prior is not None:
+            if not uses_event_counts:
+                totals = totals * float(np.sum(olig2_prior))
+            totals = totals + olig2_prior
+            total = float(np.sum(totals))
         fractions = totals / total
         cfg.validate_probability_vector(fractions, name="week1 flow fractions", expected_shape=(cfg.N_STATES,))
         return fractions
+
+    def _olig2_dirichlet_prior(self, *, strength: float = 40.0) -> np.ndarray | None:
+        if self.olig2_initial_ratio is None:
+            return None
+        ratio = max(float(self.olig2_initial_ratio), 1e-8)
+        high_mass = ratio / (1.0 + ratio)
+        low_mass = 1.0 / (1.0 + ratio)
+        npc_opc_split = np.array([0.34, 0.32], dtype=float)
+        ac_mes_split = np.array([0.17, 0.16], dtype=float)
+        fractions = np.array(
+            [
+                high_mass * npc_opc_split[0] / float(np.sum(npc_opc_split)),
+                high_mass * npc_opc_split[1] / float(np.sum(npc_opc_split)),
+                low_mass * ac_mes_split[0] / float(np.sum(ac_mes_split)),
+                low_mass * ac_mes_split[1] / float(np.sum(ac_mes_split)),
+            ],
+            dtype=float,
+        )
+        return float(strength) * fractions
 
     def _week1_copy_distributions(self, condition: str) -> dict[str, np.ndarray]:
         if condition in self.week1_copy_distributions:
@@ -337,8 +401,23 @@ class CanonicalFitDataset:
         grouped = self._week1_ectag_grouped(condition)
         matrices: dict[str, np.ndarray] = {}
         for state_name in cfg.STATE_NAMES:
-            rows = [[species_values[species] for species in cfg.SPECIES] for _cell, species_values in sorted(grouped[state_name].items())]
-            matrices[state_name] = np.asarray(rows, dtype=int)
+            cells = grouped[state_name]
+            complete_rows = [
+                [species_values[species] for species in cfg.SPECIES]
+                for _cell, species_values in sorted(cells.items())
+                if set(species_values) == set(cfg.SPECIES)
+            ]
+            if complete_rows and len(complete_rows) == len(cells):
+                matrices[state_name] = np.asarray(complete_rows, dtype=int)
+                continue
+            marginals = {
+                species: np.asarray(
+                    [species_values[species] for _cell, species_values in sorted(cells.items()) if species in species_values],
+                    dtype=int,
+                )
+                for species in cfg.SPECIES
+            }
+            matrices[state_name] = self._week1_matrix_from_marginals(marginals)
         return matrices
 
     @classmethod
@@ -346,6 +425,7 @@ class CanonicalFitDataset:
         manifest = _resolve_path(path)
         payload = json.loads(manifest.read_text(encoding="utf-8"))
         base = manifest.parent
+        ectag_hist_max = _manifest_ectag_hist_max(payload)
         conditions = {
             name: ConditionSpec(name, spec.get("schedules", {}), spec.get("initialization_source"))
             for name, spec in payload["conditions"].items()
@@ -354,7 +434,7 @@ class CanonicalFitDataset:
         week1: dict[str, dict[str, np.ndarray]] = {}
         if files.get("week1_copy_distributions"):
             raw = json.loads(_resolve_path(files["week1_copy_distributions"], base_dir=base).read_text(encoding="utf-8"))
-            week1 = {condition: {state: np.asarray(matrix, dtype=int) for state, matrix in by_state.items()} for condition, by_state in raw.items()}
+            week1 = {condition: dict(by_state) for condition, by_state in raw.items()}
         return cls(
             conditions=conditions,
             flow=load_flow_csv(_resolve_path(files["flow"], base_dir=base)) if files.get("flow") else (),
@@ -363,7 +443,7 @@ class CanonicalFitDataset:
             ectag=load_ectag_csv(_resolve_path(files["ectag"], base_dir=base)) if files.get("ectag") else (),
             ddpcr=load_ddpcr_csv(_resolve_path(files["ddpcr"], base_dir=base)) if files.get("ddpcr") else (),
             week1_copy_distributions=week1,
-            ectag_hist_max=payload.get("ectag_hist_max"),
+            ectag_hist_max=ectag_hist_max,
             purity_matrix=None if payload.get("purity_matrix") is None else np.asarray(payload["purity_matrix"], dtype=float),
             purity_sensitivity=tuple(np.asarray(m, dtype=float) for m in payload.get("purity_sensitivity", ())),
             qpcdr_calibration=payload.get("qpcdr_calibration", {}),
