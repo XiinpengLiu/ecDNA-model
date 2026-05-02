@@ -7,11 +7,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.spatial.distance import mahalanobis
+from scipy.stats import dirichlet_multinomial, entropy, wasserstein_distance
 
 from fit.io_utils import read_json, read_table
 
 
-SCORE_COMPONENTS: tuple[str, ...] = ("flow", "ectag", "qpcdr", "ddpcr", "lite_summary", "prior", "biology")
+SCORE_COMPONENTS: tuple[str, ...] = ("flow", "ectag", "qpcdr", "ddpcr", "cell_count", "lite_summary", "prior", "biology")
 
 
 def score_particle_summary(
@@ -37,22 +39,23 @@ def score_particle_summary(
         missing_ids = merged.loc[merged["value"].isna(), "feature_id"].head(5).tolist()
         raise ValueError(f"Particle summary is missing target features, examples: {missing_ids}")
 
-    feature_weights = distance_weights.get("feature_weights", {})
-    values = merged["value"].astype(float).to_numpy()
-    targets = merged["target"].astype(float).to_numpy()
-    variances = merged["variance"].astype(float).clip(lower=1e-9).to_numpy()
-    weights = np.asarray([float(feature_weights.get(fid, weight)) for fid, weight in zip(merged["feature_id"], merged["weight"])])
-    deltas = values - targets
-
-    log_channels = merged["channel"].isin(["qpcdr", "ddpcr"]).to_numpy()
-    positive = log_channels & (values > 0.0) & (targets > 0.0)
-    deltas[positive] = np.log(values[positive]) - np.log(targets[positive])
-
     merged = merged.copy()
-    merged["component_score"] = weights * (deltas * deltas) / variances
+    feature_weights = distance_weights.get("feature_weights", {})
+    merged["score_weight"] = [
+        float(feature_weights.get(fid, weight)) for fid, weight in zip(merged["feature_id"], merged["weight"])
+    ]
+    log_channels = merged["channel"].isin(["qpcdr", "ddpcr", "cell_count"])
+    merged["score_value"] = merged["value"].astype(float)
+    merged["score_target"] = merged["target"].astype(float)
+    merged.loc[log_channels, "score_value"] = np.log(merged.loc[log_channels, "score_value"].astype(float).clip(lower=1e-9))
+    merged.loc[log_channels, "score_target"] = np.log(merged.loc[log_channels, "score_target"].astype(float).clip(lower=1e-9))
     contribution = {name: 0.0 for name in SCORE_COMPONENTS}
     for channel, group in merged.groupby("channel"):
-        contribution[str(channel)] = float(group["component_score"].sum())
+        channel_name = str(channel)
+        if channel_name == "ectag":
+            contribution[channel_name] = _ectag_species_histogram_score(group)
+        else:
+            contribution[channel_name] = _weighted_mahalanobis_score(group)
     contribution["prior"] = _prior_penalty(params or {})
     contribution["biology"] = float(max(0.0, biology_penalty))
     total = float(sum(contribution.values()))
@@ -83,6 +86,77 @@ def score_particles_from_files(
 
         write_table(result, output_path)
     return result
+
+
+def _weighted_mahalanobis_score(group: pd.DataFrame) -> float:
+    values = group["score_value"].astype(float).to_numpy()
+    targets = group["score_target"].astype(float).to_numpy()
+    variances = group["variance"].astype(float).clip(lower=1e-9).to_numpy()
+    weights = group["score_weight"].astype(float).clip(lower=1e-9).to_numpy()
+    inv_cov = np.diag(weights / variances)
+    return float(mahalanobis(values, targets, inv_cov) ** 2)
+
+
+def _ectag_species_histogram_score(group: pd.DataFrame) -> float:
+    required = {"week", "condition", "replicate", "state_gate", "species", "bin_label"}
+    missing = required.difference(group.columns)
+    if missing:
+        raise ValueError(f"ecTAG score rows missing required grouping columns: {sorted(missing)}")
+    total = 0.0
+    keys = ["week", "condition", "replicate", "state_gate", "species"]
+    for _, hist in group.groupby(keys, dropna=False):
+        hist = hist.sort_values("bin_label", key=lambda labels: labels.map(_bin_sort_key))
+        target_p = _probability_vector(hist["target"].to_numpy(dtype=float))
+        particle_p = _probability_vector(hist["value"].to_numpy(dtype=float))
+        n_cells = _histogram_cell_count(hist)
+        counts = _integer_counts_from_probabilities(target_p, n_cells)
+        concentration = max(float(n_cells), float(len(particle_p)))
+        alpha = np.clip(particle_p * concentration, 1e-6, None)
+        dm_nll = -float(dirichlet_multinomial.logpmf(counts, alpha, int(n_cells)))
+        positions = np.asarray([_bin_sort_key(label) for label in hist["bin_label"]], dtype=float)
+        wasserstein = float(wasserstein_distance(positions, positions, target_p, particle_p))
+        support_span = float(np.ptp(positions)) if positions.size else 0.0
+        support = max(1.0, support_span)
+        kl = float(entropy(target_p, particle_p))
+        weight = float(hist["score_weight"].astype(float).mean())
+        total += weight * ((dm_nll / max(1, n_cells)) + kl + (wasserstein / support))
+    return float(total)
+
+
+def _probability_vector(values: np.ndarray) -> np.ndarray:
+    clipped = np.clip(np.asarray(values, dtype=float), 1e-9, None)
+    total = float(np.sum(clipped))
+    if total <= 0.0 or not np.isfinite(total):
+        return np.ones(clipped.size, dtype=float) / max(1, clipped.size)
+    return clipped / total
+
+
+def _histogram_cell_count(hist: pd.DataFrame) -> int:
+    if "n_cells" in hist.columns and hist["n_cells"].notna().any():
+        return int(max(1, round(float(hist["n_cells"].dropna().astype(float).median()))))
+    p = hist["target"].astype(float).to_numpy()
+    v = hist["variance"].astype(float).clip(lower=1e-9).to_numpy()
+    inferred = np.nanmedian(np.clip(p * (1.0 - p) / v, 1.0, None))
+    return int(max(1, round(float(inferred)))) if np.isfinite(inferred) else 1
+
+
+def _integer_counts_from_probabilities(probabilities: np.ndarray, n_cells: int) -> np.ndarray:
+    raw = probabilities * int(n_cells)
+    counts = np.floor(raw).astype(int)
+    remainder = int(n_cells) - int(counts.sum())
+    if remainder > 0:
+        order = np.argsort(raw - counts)[::-1]
+        counts[order[:remainder]] += 1
+    return counts
+
+
+def _bin_sort_key(label: object) -> int:
+    text = str(label)
+    if text.endswith("+"):
+        return int(text[:-1])
+    if "-" in text:
+        return int(text.split("-", 1)[0])
+    return int(text)
 
 
 def _prior_penalty(params: dict) -> float:

@@ -1,130 +1,194 @@
 [
   {
-    "requirement": "Read markdown/fit_method.md as the source of truth for fit behavior.",
+    "requirement": "Use markdown/fit_method.md as the source of truth for fitting behavior.",
     "implemented": true,
     "optional": false,
-    "files": ["markdown/fit_method.md", "fit/IMPLEMENTATION_STATUS.md"],
-    "tests": ["tests/test_fit_method_pipeline.py::test_import_main_fit_modules"],
-    "notes": "Implementation is organized around the method document's raw -> calibrated lite summary posterior -> full conditional history ensemble flow."
+    "files": ["markdown/fit_method.md", "fit/IMPLEMENTATION_STATUS.md", "fit/implementation_checklist.json"],
+    "tests": ["tests/test_v4_lite.py::test_import_main_fit_modules"],
+    "notes": "The package follows raw complete data -> calibrated v4-lite summary posterior -> full conditional single-cell history ensemble."
+  },
+  {
+    "requirement": "Step 0 run manifest and schema lock with analysis index.",
+    "implemented": true,
+    "optional": false,
+    "files": ["fit/manifest.py", "fit/stage_runner.py", "fit/run_fit.py"],
+    "tests": ["tests/test_v4_lite.py::test_cli_synthetic_smoke_runs"],
+    "notes": "build_run_manifest writes run_manifest.json, analysis_index.parquet, and schema_check_report.md before downstream stages."
   },
   {
     "requirement": "Raw and clean data ingestion helpers for flow, qPCDR, ecTAG, ddPCR, and cell count.",
     "implemented": true,
     "optional": false,
-    "files": ["fit/raw.py", "fit/run_fit.py"],
-    "tests": ["tests/test_fit_method_pipeline.py::test_schema_validation_identifies_missing_required_fields", "tests/test_fit_method_pipeline.py::test_cli_synthetic_smoke_runs"],
-    "notes": "Ingestion writes deterministic parquet clean tables and a QC report without biological inference."
+    "files": ["fit/raw.py", "fit/schemas.py", "fit/run_fit.py"],
+    "tests": ["tests/test_v4_lite.py::test_schema_validation_identifies_missing_required_fields", "tests/test_v4_lite.py::test_cli_synthetic_smoke_runs"],
+    "notes": "Ingestion writes deterministic clean parquet tables and a QC report without biological inference."
   },
   {
     "requirement": "Observation calibration is fixed or strongly constrained before full fitting.",
     "implemented": true,
     "optional": false,
-    "files": ["fit/observation.py", "fit/validation.py"],
-    "tests": ["tests/test_fit_method_pipeline.py::test_lite_output_artifact_schema_complete", "tests/test_fit_method_pipeline.py::test_cli_synthetic_smoke_runs"],
-    "notes": "obs_params_for_lite.json and obs_params_for_full.json carry locked_for_full=true and explicit channel policies."
+    "files": ["fit/observation.py", "fit/validation.py", "fit/io_utils.py"],
+    "tests": ["tests/test_v4_lite.py::test_lite_output_artifact_schema_complete", "tests/test_v4_lite.py::test_cli_synthetic_smoke_runs"],
+    "notes": "obs_params_for_lite.json and obs_params_for_full.json are locked for full reconstruction and observation fit artifacts include NetCDF, PDF, markdown, and JSON reports."
   },
   {
-    "requirement": "ddPCR constrains only sum_s f[w,s] * mu[w,s,j].",
+    "requirement": "ddPCR constrains only sum_s f[w,c,r,s] * mu[w,c,r,s,j].",
     "implemented": true,
     "optional": false,
-    "files": ["fit/observation.py", "fit/full_smc.py", "fit/v4_lite.py"],
-    "tests": ["tests/test_fit_method_pipeline.py::test_ddpcr_pooled_mean_formula", "tests/test_fit_method_pipeline.py::test_full_particle_score_reads_lite_and_observation_outputs"],
-    "notes": "ddPCR features are scored as bulk_pooled_mean and are never expanded into a single-cell distribution."
+    "files": ["fit/observation.py", "fit/v4_lite.py", "fit/full_smc.py", "fit/objective.py"],
+    "tests": ["tests/test_v4_lite.py::test_ddpcr_pooled_mean_formula", "tests/test_v4_lite.py::test_full_particle_score_reads_lite_and_observation_outputs"],
+    "notes": "ddPCR features are bulk_pooled_mean anchors and are never converted into a single-cell copy-number distribution."
   },
   {
     "requirement": "ecTAG histograms are species-specific for MYC, CDK4, and PDGFRA.",
     "implemented": true,
     "optional": false,
-    "files": ["fit/empirical.py", "fit/v4_lite.py", "fit/full_smc.py"],
-    "tests": ["tests/test_fit_method_pipeline.py::test_ectag_histogram_is_species_specific"],
-    "notes": "Histogram keys include species and no total-species histogram is used as the primary target."
+    "files": ["fit/empirical.py", "fit/v4_lite.py", "fit/objective.py", "fit/full_smc.py"],
+    "tests": ["tests/test_v4_lite.py::test_ectag_histogram_is_species_specific"],
+    "notes": "Histogram keys include species; scoring groups ecTAG by week, condition, replicate, state, species, and bin."
   },
   {
-    "requirement": "Total ecDNA burden is derived, not the primary ecTAG likelihood.",
+    "requirement": "Total ecDNA burden is derived and does not replace the species-specific ecTAG likelihood.",
     "implemented": true,
     "optional": false,
-    "files": ["fit/empirical.py"],
-    "tests": ["tests/test_fit_method_pipeline.py::test_ectag_histogram_is_species_specific"],
-    "notes": "derived_total_burden is stored in snapshot summaries; ecTAG scoring uses species histogram features."
+    "files": ["fit/empirical.py", "fit/full_smc.py"],
+    "tests": ["tests/test_v4_lite.py::test_ectag_histogram_is_species_specific"],
+    "notes": "derived_total_burden and FULL_derived_Q are derived summaries; primary ecTAG scoring remains species-specific."
   },
   {
-    "requirement": "v4-lite generates calibrated summary posterior artifacts, not fake raw data.",
+    "requirement": "v4-lite produces calibrated summary posterior artifacts rather than simulated raw observations.",
     "implemented": true,
     "optional": false,
     "files": ["fit/v4_lite.py"],
-    "tests": ["tests/test_fit_method_pipeline.py::test_lite_output_artifact_schema_complete"],
-    "notes": "Lite artifacts include posterior draws around empirical calibrated summaries, target vector, covariance, weights, sampler, and broad prior scales."
+    "tests": ["tests/test_v4_lite.py::test_lite_output_artifact_schema_complete"],
+    "notes": "Lite writes LITE_final_fit.nc/json, posterior draws, target vector, covariance, transition/growth, coupling, distance weights, sampler, prior scales, and reports."
   },
   {
-    "requirement": "Lite-to-full bridge artifacts are produced.",
+    "requirement": "v4-lite includes week-level transition/growth and ecDNA-state coupling summaries.",
     "implemented": true,
     "optional": false,
-    "files": ["fit/v4_lite.py", "fit/full_smc.py"],
-    "tests": ["tests/test_fit_method_pipeline.py::test_lite_output_artifact_schema_complete"],
-    "notes": "LITE_initial_population_sampler.json, LITE_distance_weights.json, LITE_summary_covariance.npz, and LITE_to_FULL_prior_scales.json are required and validated."
+    "files": ["fit/v4_lite.py"],
+    "tests": ["tests/test_v4_lite.py::test_lite_output_artifact_schema_complete"],
+    "notes": "Transition rows respect the method graph and disallow primary NPC-MES and OPC-MES direct edges; coupling summaries are proposal information, not a full release gate."
   },
   {
-    "requirement": "Full model output is a conditional single-cell history particle ensemble, not a unique best-fit parameter.",
+    "requirement": "Lite-to-full bridge artifacts are produced and validated.",
+    "implemented": true,
+    "optional": false,
+    "files": ["fit/v4_lite.py", "fit/full_smc.py", "fit/validation.py"],
+    "tests": ["tests/test_v4_lite.py::test_lite_output_artifact_schema_complete"],
+    "notes": "The bridge includes LITE_summary_target_vector.parquet, LITE_summary_covariance.npz, LITE_distance_weights.json, LITE_initial_population_sampler.json, and LITE_to_FULL_prior_scales.json."
+  },
+  {
+    "requirement": "Full model output is a conditional single-cell history particle ensemble, not a single best-fit parameter.",
     "implemented": true,
     "optional": false,
     "files": ["fit/full_smc.py"],
-    "tests": ["tests/test_fit_method_pipeline.py::test_full_reconstruction_outputs_history_ensemble_not_single_parameter"],
-    "notes": "Accepted histories are JSONL records with cell-level state and species copy numbers across weeks."
+    "tests": ["tests/test_v4_lite.py::test_full_reconstruction_outputs_history_ensemble_not_single_parameter"],
+    "notes": "Accepted histories include per-cell K, X, latent U, R, V, A, age, parent, state, event summaries, scores, weights, and scenario labels."
   },
   {
-    "requirement": "Full particle score includes flow, qPCDR, ecTAG, ddPCR, lite summary, prior, and biology components.",
+    "requirement": "Full reconstruction uses SMC-ABC style rounds with resampling, perturbation, scoring, and tolerance filtering.",
+    "implemented": true,
+    "optional": false,
+    "files": ["fit/full_smc.py", "fit/objective.py"],
+    "tests": ["tests/test_v4_lite.py::test_full_particle_score_reads_lite_and_observation_outputs", "tests/test_v4_lite.py::test_cli_synthetic_smoke_runs"],
+    "notes": "run_full_reconstruction supports deterministic seed and smc_steps; later rounds perturb accepted proposal-bank parameters and retain a final weighted history ensemble."
+  },
+  {
+    "requirement": "Full particle score is traceable to flow, qPCDR, ecTAG, ddPCR, lite summary, prior, and biology components.",
     "implemented": true,
     "optional": false,
     "files": ["fit/objective.py", "fit/full_smc.py"],
-    "tests": ["tests/test_fit_method_pipeline.py::test_full_particle_score_reads_lite_and_observation_outputs"],
-    "notes": "particle_weights.parquet stores each contribution column and normalized posterior weights."
+    "tests": ["tests/test_v4_lite.py::test_full_particle_score_reads_lite_and_observation_outputs"],
+    "notes": "Scores use SciPy Mahalanobis distances for vector summaries and SciPy Dirichlet-multinomial/KL/Wasserstein terms for species-specific ecTAG histograms."
   },
   {
-    "requirement": "Full SMC saves history, summary, score, weight, and scenario labels.",
+    "requirement": "Full outputs save history, summary, score, posterior weight, event summaries, and scenario labels.",
     "implemented": true,
     "optional": false,
-    "files": ["fit/full_smc.py", "fit/scenarios.py"],
-    "tests": ["tests/test_fit_method_pipeline.py::test_full_reconstruction_outputs_history_ensemble_not_single_parameter"],
-    "notes": "Full outputs include accepted_histories.jsonl, full_snapshot_summaries.parquet, particle_weights.parquet, event_summaries.parquet, and scenario_classes.parquet."
+    "files": ["fit/full_smc.py", "fit/scenarios.py", "fit/validation.py"],
+    "tests": ["tests/test_v4_lite.py::test_full_reconstruction_outputs_history_ensemble_not_single_parameter"],
+    "notes": "Outputs include accepted_histories.jsonl, particle weights, particle parameters, snapshots, events, scenario classes, FULL_* parquet files, and a real zarr ZipStore history ensemble."
+  },
+  {
+    "requirement": "Posterior predictive checks compare accepted full history ensemble summaries against raw/lite targets.",
+    "implemented": true,
+    "optional": false,
+    "files": ["fit/ppc.py", "fit/full_smc.py"],
+    "tests": ["tests/test_v4_lite.py::test_cli_synthetic_smoke_runs"],
+    "notes": "full_ppc_report.md/json and FULL_ppc_raw_observables.parquet are generated from weighted particle summaries."
   },
   {
     "requirement": "Scenario classification handles selection, turnover, transition, segregation, mixed, and measurement-conflict labels.",
     "implemented": true,
     "optional": false,
-    "files": ["fit/scenarios.py"],
-    "tests": ["tests/test_fit_method_pipeline.py::test_scenario_classification_handles_synthetic_particles"],
-    "notes": "Classification uses event summaries and snapshot changes, then reports posterior weight per particle."
+    "files": ["fit/scenarios.py", "fit/run_fit.py"],
+    "tests": ["tests/test_v4_lite.py::test_scenario_classification_handles_synthetic_particles"],
+    "notes": "Classification uses event summaries, snapshot shifts, scores, and posterior weights."
   },
   {
-    "requirement": "Posterior predictive checks compare full history ensemble summaries against raw/lite targets.",
+    "requirement": "Main stages expose deterministic CLI or callable interfaces with explicit inputs and outputs.",
     "implemented": true,
     "optional": false,
-    "files": ["fit/ppc.py", "fit/full_smc.py", "fit/diagnostics.py"],
-    "tests": ["tests/test_fit_method_pipeline.py::test_cli_synthetic_smoke_runs"],
-    "notes": "full_ppc_report.md/json and channel error or coverage tables are generated from weighted particles."
+    "files": ["fit/run_fit.py", "fit/stage_runner.py", "fit/__init__.py"],
+    "tests": ["tests/test_v4_lite.py::test_cli_synthetic_smoke_runs"],
+    "notes": "CLI includes build-manifest, ingest-raw, fit-observation-model, build-empirical-summaries, fit-lite, create-full-initial-particles, run-full-reconstruction, score-particles, aggregate-accepted-histories, run-ppc, classify-scenarios, run-all, and run-synthetic-smoke."
   },
   {
-    "requirement": "Main stages have CLI-callable deterministic interfaces with explicit inputs and outputs.",
+    "requirement": "A synthetic small fixture smoke pipeline runs observation, lite, full scoring, validation, and PPC artifacts.",
     "implemented": true,
     "optional": false,
-    "files": ["fit/run_fit.py", "fit/stage_runner.py"],
-    "tests": ["tests/test_fit_method_pipeline.py::test_cli_synthetic_smoke_runs"],
-    "notes": "CLI includes ingest-raw, fit-observation-model, build-empirical-summaries, fit-lite, create-full-initial-particles, run-full-reconstruction, score-particles, aggregate-accepted-histories, run-ppc, classify-scenarios, run-all, and run-synthetic-smoke."
+    "files": ["fit/raw.py", "fit/stage_runner.py", "fit/run_fit.py", "tests/test_v4_lite.py"],
+    "tests": ["tests/test_v4_lite.py::test_cli_synthetic_smoke_runs"],
+    "notes": "run-synthetic-smoke creates raw fixture files and runs the complete file-based pipeline with deterministic seeds."
   },
   {
-    "requirement": "Synthetic or small fixture smoke test can run observation, lite, and full scoring.",
+    "requirement": "Snakemake workflow exists with file-based stage dependencies.",
     "implemented": true,
     "optional": false,
-    "files": ["fit/raw.py", "fit/stage_runner.py", "fit/run_fit.py"],
-    "tests": ["tests/test_fit_method_pipeline.py::test_cli_synthetic_smoke_runs"],
-    "notes": "run-synthetic-smoke creates raw fixture files and runs the full file-based pipeline."
+    "files": ["workflow/Snakefile", "workflow/rules/00_manifest.smk", "workflow/rules/01_ingest.smk", "workflow/rules/02_observation.smk", "workflow/rules/03_empirical.smk", "workflow/rules/04_lite.smk", "workflow/rules/05_full.smk", "workflow/rules/06_reports.smk", "configs/experiment.example.yaml", "configs/model_schema.yaml", "configs/plausibility_bounds.yaml"],
+    "tests": ["snakemake --snakefile workflow/Snakefile --dry-run"],
+    "notes": "The workflow DAG calls the deterministic CLI stages and materializes final report artifacts."
   },
   {
-    "requirement": "No unexplained deferred core fit implementation remains in fit/.",
+    "requirement": "fit_method.md directory names are generated in addition to CLI compatibility paths.",
+    "implemented": true,
+    "optional": false,
+    "files": ["fit/final_report.py", "fit/schemas.py", "fit/stage_runner.py"],
+    "tests": ["tests/test_v4_lite.py::test_cli_synthetic_smoke_runs"],
+    "notes": "The pipeline mirrors 03_v4_lite to 04_v4_lite, 04_full_initialization to 05_full_initialization, and 05_full_smc to 06_full_history_reconstruction."
+  },
+  {
+    "requirement": "Final report layer writes FINAL raw PPC, single-cell histories, event summary, scenario summary, and parameter appendix.",
+    "implemented": true,
+    "optional": false,
+    "files": ["fit/final_report.py", "fit/run_fit.py", "fit/stage_runner.py", "fit/validation.py"],
+    "tests": ["tests/test_v4_lite.py::test_cli_synthetic_smoke_runs"],
+    "notes": "08_final_report contains FINAL_raw_ppc_report.pdf, FINAL_single_cell_histories.zarr, FINAL_event_history_summary.parquet, FINAL_scenario_summary.pdf, FINAL_parameter_appendix.csv, and a manifest."
+  },
+  {
+    "requirement": "Full initialization preserves same-cell species correlation when available and uses calibrated tail means.",
+    "implemented": true,
+    "optional": false,
+    "files": ["fit/v4_lite.py", "fit/full_smc.py"],
+    "tests": ["tests/test_v4_lite.py::test_full_reconstruction_outputs_history_ensemble_not_single_parameter", "tests/test_v4_lite.py::test_lite_output_artifact_schema_complete"],
+    "notes": "Lite sampler now carries state-specific species correlation matrices, stratum-specific initial state probabilities, and state/species tail means; full initialization uses a Gaussian copula and open-tail sampling."
+  },
+  {
+    "requirement": "R and V are non-negative biological expressions derived through softplus-style latent variables.",
+    "implemented": true,
+    "optional": false,
+    "files": ["fit/full_smc.py", "fit/schemas.py"],
+    "tests": ["tests/test_v4_lite.py::test_full_reconstruction_outputs_history_ensemble_not_single_parameter"],
+    "notes": "History rows store latent_R_raw, latent_V_raw, R, and V; R/V are non-negative outputs."
+  },
+  {
+    "requirement": "No deferred core fit implementation remains in fit/.",
     "implemented": true,
     "optional": false,
     "files": ["fit/*.py"],
-    "tests": ["manual Select-String check for deferred-implementation markers"],
-    "notes": "Compatibility-only fit modules were removed; remaining fit source files are method-aligned."
+    "tests": ["Select-String deferred-marker scan", "python -m pytest -q"],
+    "notes": "The remaining fit source files are used by the new method, CLI, validation, tests, status docs, or shared IO/schema contracts."
   }
 ]

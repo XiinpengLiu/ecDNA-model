@@ -1,0 +1,21 @@
+expected_initial_state_ratio:
+  numerator:
+    - NPC-like
+    - OPC-like
+  denominator:
+    - AC-like
+    - MES-like
+  expected_median: 2.0
+  warning_range:
+    - 1.2
+    - 3.0
+  use_as: sanity_check_only_not_prior
+expected_bulk_ddpcr_copy_range:
+  species:
+    - MYC
+    - CDK4
+    - PDGFRA
+  approximate_range:
+    - 30
+    - 60
+  use_as: sanity_check_only_not_distribution

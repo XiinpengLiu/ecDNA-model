@@ -6,7 +6,11 @@ import argparse
 from pathlib import Path
 
 from fit.empirical import build_empirical_summaries
+from fit.final_report import build_final_report_layer, materialize_method_layout
+from fit.full_exact_replay import run_full_exact_replay
+from fit.full_raw_ppc import generate_full_raw_table_ppc
 from fit.full_smc import aggregate_accepted_histories, create_full_initial_particles, run_full_reconstruction
+from fit.manifest import build_run_manifest
 from fit.objective import score_particles_from_files
 from fit.observation import fit_observation_model
 from fit.ppc import run_full_ppc
@@ -30,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--raw-dir", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
 
+    p = sub.add_parser("build-manifest", help="Build run manifest, analysis index, and schema check report.")
+    p.add_argument("--raw-dir", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--experiment-config", type=Path)
+    p.add_argument("--model-schema", type=Path)
+
     p = sub.add_parser("fit-observation-model", help="Fit and lock observation calibration.")
     p.add_argument("--clean-dir", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
@@ -52,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lite-dir", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--particles", type=int, default=16)
-    p.add_argument("--cells", type=int, default=200)
+    p.add_argument("--cells", type=int, default=10000)
     p.add_argument("--seed", type=int, default=1)
 
     p = sub.add_parser("run-full-reconstruction", help="Run full conditional particle reconstruction and scoring.")
@@ -60,8 +70,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--obs-params", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--particles", type=int, default=32)
-    p.add_argument("--cells", type=int, default=300)
+    p.add_argument("--cells", type=int, default=10000)
+    p.add_argument("--smc-steps", type=int, default=3)
     p.add_argument("--seed", type=int, default=1)
+
+    p = sub.add_parser("run-exact-replay", help="Replay accepted full particles with the core exact v4 event queue.")
+    p.add_argument("--full-dir", type=Path, required=True)
+    p.add_argument("--lite-dir", type=Path, required=True)
+    p.add_argument("--obs-params", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--acceptance-quantile", type=float, default=0.5)
 
     p = sub.add_parser("score-particles", help="Score existing particle summary features against lite/raw targets.")
     p.add_argument("--particle-features", type=Path, required=True)
@@ -78,9 +97,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lite-dir", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
 
+    p = sub.add_parser("run-raw-table-ppc", help="Generate synthetic raw tables from accepted full histories.")
+    p.add_argument("--full-dir", type=Path, required=True)
+    p.add_argument("--obs-params", type=Path, required=True)
+    p.add_argument("--lite-dir", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--seed", type=int, default=1)
+
     p = sub.add_parser("classify-scenarios", help="Classify scenario labels from full histories.")
     p.add_argument("--full-dir", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
+
+    p = sub.add_parser("build-final-report", help="Build FINAL_* report artifacts and method-level report layer.")
+    p.add_argument("--observation-dir", type=Path, required=True)
+    p.add_argument("--lite-dir", type=Path, required=True)
+    p.add_argument("--full-dir", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+
+    p = sub.add_parser("materialize-method-layout", help="Mirror outputs into fit_method.md directory names.")
+    p.add_argument("--output-root", type=Path, required=True)
 
     p = sub.add_parser("run-all", help="Run the complete file-based pipeline from raw inputs.")
     p.add_argument("--raw-dir", type=Path, required=True)
@@ -88,7 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--draws", type=int, default=64)
     p.add_argument("--particles", type=int, default=32)
-    p.add_argument("--cells", type=int, default=300)
+    p.add_argument("--cells", type=int, default=10000)
 
     p = sub.add_parser("run-synthetic-smoke", help="Run a complete synthetic smoke pipeline.")
     p.add_argument("--output", type=Path, required=True)
@@ -108,6 +143,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "ingest-raw":
         ingest_raw_data(args.raw_dir, args.output)
         return
+    if args.command == "build-manifest":
+        build_run_manifest(args.raw_dir, args.output, args.experiment_config, args.model_schema)
+        return
     if args.command == "fit-observation-model":
         fit_observation_model(args.clean_dir, args.output, seed=args.seed)
         return
@@ -121,7 +159,11 @@ def main(argv: list[str] | None = None) -> None:
         create_full_initial_particles(args.lite_dir, args.output, particles=args.particles, cells=args.cells, seed=args.seed)
         return
     if args.command == "run-full-reconstruction":
-        run_full_reconstruction(args.lite_dir, args.obs_params, args.output, particles=args.particles, cells=args.cells, seed=args.seed)
+        run_full_reconstruction(args.lite_dir, args.obs_params, args.output, particles=args.particles, cells=args.cells, seed=args.seed, smc_steps=args.smc_steps)
+        return
+    if args.command == "run-exact-replay":
+        run_full_exact_replay(args.full_dir, args.lite_dir, args.obs_params, args.output, seed=args.seed, acceptance_quantile=args.acceptance_quantile)
+        classify_scenarios_from_files(args.output, args.output)
         return
     if args.command == "score-particles":
         score_particles_from_files(args.particle_features, args.lite_target, args.distance_weights, args.output)
@@ -132,20 +174,29 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "run-ppc":
         run_full_ppc(args.full_dir, args.lite_dir, args.output)
         return
+    if args.command == "run-raw-table-ppc":
+        generate_full_raw_table_ppc(args.full_dir, args.obs_params, args.lite_dir, args.output, seed=args.seed)
+        return
     if args.command == "classify-scenarios":
         classify_scenarios_from_files(args.full_dir, args.output)
+        return
+    if args.command == "build-final-report":
+        build_final_report_layer(args.observation_dir, args.lite_dir, args.full_dir, args.output)
+        return
+    if args.command == "materialize-method-layout":
+        materialize_method_layout(args.output_root)
         return
     if args.command == "run-all":
         run_pipeline_from_raw(args.raw_dir, args.output, seed=args.seed, posterior_draws=args.draws, particles=args.particles, cells=args.cells)
         layout = ResultLayout(args.output)
-        validate_method_contracts(layout.observation, layout.lite, layout.full_smc)
+        validate_method_contracts(layout.observation, layout.lite, layout.full_smc, layout.final_report)
         return
     if args.command == "run-synthetic-smoke":
         raw_dir = args.output / "raw_fixture"
         create_synthetic_raw_dataset(raw_dir, seed=args.seed)
         run_pipeline_from_raw(raw_dir, args.output / "results", seed=args.seed, posterior_draws=args.draws, particles=args.particles, cells=args.cells)
         layout = ResultLayout(args.output / "results")
-        validate_method_contracts(layout.observation, layout.lite, layout.full_smc)
+        validate_method_contracts(layout.observation, layout.lite, layout.full_smc, layout.final_report)
         return
     raise SystemExit(f"Unhandled command: {args.command}")
 

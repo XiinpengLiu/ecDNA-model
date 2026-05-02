@@ -77,18 +77,25 @@ RAW_TABLE_SCHEMAS: dict[str, tuple[str, ...]] = {
 OBSERVATION_OUTPUTS: tuple[str, ...] = (
     "obs_params_for_lite.json",
     "obs_params_for_full.json",
+    "obs_calibration_fit.nc",
+    "obs_calibration_ppc.pdf",
     "obs_calibration_report.md",
+    "obs_calibration_report.json",
 )
 
 LITE_OUTPUTS: tuple[str, ...] = (
+    "LITE_final_fit.nc",
     "LITE_final_fit.json",
     "LITE_snapshot_posterior.parquet",
+    "LITE_transition_growth_summary.parquet",
+    "LITE_coupling_summary.csv",
     "LITE_summary_target_vector.parquet",
     "LITE_summary_covariance.npz",
     "LITE_distance_weights.json",
     "LITE_initial_population_sampler.json",
     "LITE_to_FULL_prior_scales.json",
     "LITE_final_report.md",
+    "LITE_final_report.pdf",
 )
 
 FULL_OUTPUTS: tuple[str, ...] = (
@@ -99,6 +106,44 @@ FULL_OUTPUTS: tuple[str, ...] = (
     "event_summaries.parquet",
     "scenario_classes.parquet",
     "full_ppc_report.md",
+    "full_ppc_report.json",
+    "FULL_particles_final.zarr",
+    "FULL_particle_parameters.parquet",
+    "FULL_particle_weights.parquet",
+    "FULL_snapshot_summaries.parquet",
+    "FULL_event_summaries.parquet",
+    "FULL_single_cell_history_samples.parquet",
+    "FULL_derived_Q.parquet",
+    "FULL_ppc_raw_observables.parquet",
+    "synthetic_flow_long.parquet",
+    "synthetic_qpcdr_long.parquet",
+    "synthetic_ectag_cell_long.parquet",
+    "synthetic_ddpcr_long.parquet",
+    "synthetic_cell_count_long.parquet",
+    "raw_table_ppc_summary_coverage.parquet",
+    "raw_table_ppc_replicate_diagnostics.parquet",
+    "raw_table_ppc_report.json",
+    "raw_table_ppc_report.md",
+    "FULL_exact_replay_histories.parquet",
+    "FULL_exact_replay_snapshot_summaries.parquet",
+    "FULL_exact_replay_event_log.parquet",
+    "FULL_exact_replay_event_summaries.parquet",
+    "FULL_exact_replay_scores.parquet",
+    "FULL_exact_replay_particle_weights.parquet",
+    "FULL_exact_replay_report.md",
+    "FULL_exact_replay_manifest.json",
+    "FULL_history_reconstruction_report.pdf",
+)
+
+FINAL_OUTPUTS: tuple[str, ...] = (
+    "FINAL_raw_ppc_report.pdf",
+    "FINAL_single_cell_histories.zarr",
+    "FINAL_event_history_summary.parquet",
+    "FINAL_scenario_summary.pdf",
+    "FINAL_scenario_summary.parquet",
+    "FINAL_parameter_appendix.csv",
+    "FULL_scenario_classes.parquet",
+    "FINAL_report_manifest.json",
 )
 
 
@@ -113,6 +158,10 @@ class ResultLayout:
         return self.root / "01_clean_data"
 
     @property
+    def manifest(self) -> Path:
+        return self.root / "00_manifest"
+
+    @property
     def observation(self) -> Path:
         return self.root / "02_observation_model"
 
@@ -125,12 +174,28 @@ class ResultLayout:
         return self.root / "03_v4_lite"
 
     @property
+    def method_lite(self) -> Path:
+        return self.root / "04_v4_lite"
+
+    @property
     def full_init(self) -> Path:
         return self.root / "04_full_initialization"
 
     @property
+    def method_full_init(self) -> Path:
+        return self.root / "05_full_initialization"
+
+    @property
     def full_smc(self) -> Path:
         return self.root / "05_full_smc"
+
+    @property
+    def full_history(self) -> Path:
+        return self.root / "06_full_history_reconstruction"
+
+    @property
+    def final_report(self) -> Path:
+        return self.root / "08_final_report"
 
 
 def require(condition: bool, message: str) -> None:

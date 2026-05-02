@@ -85,6 +85,45 @@ def write_markdown_report(path: str | Path, title: str, sections: list[tuple[str
     return resolved
 
 
+def write_text_pdf(path: str | Path, title: str, lines: list[str]) -> Path:
+    """Write a small deterministic PDF report using matplotlib."""
+
+    resolved = Path(path)
+    ensure_dir(resolved.parent)
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(8.27, 11.69))
+    fig.patch.set_facecolor("white")
+    fig.text(0.08, 0.95, title, fontsize=16, fontweight="bold", va="top")
+    y = 0.90
+    for line in lines:
+        fig.text(0.08, y, str(line), fontsize=9, va="top", wrap=True)
+        y -= 0.035
+        if y < 0.08:
+            break
+    fig.savefig(resolved, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+    return resolved
+
+
+def write_dataset_netcdf(path: str | Path, variables: dict[str, Any], attrs: dict[str, Any] | None = None) -> Path:
+    resolved = Path(path)
+    ensure_dir(resolved.parent)
+    import xarray as xr
+
+    data_vars = {}
+    for name, values in variables.items():
+        arr = np.asarray(values)
+        dims = tuple(f"{name}_dim_{idx}" for idx in range(arr.ndim))
+        data_vars[name] = (dims, arr)
+    dataset = xr.Dataset(data_vars=data_vars, attrs=_to_jsonable(attrs or {}))
+    dataset.to_netcdf(resolved)
+    return resolved
+
+
 def require_paths(paths: list[str | Path], label: str) -> None:
     missing = [str(path) for path in paths if not Path(path).exists()]
     if missing:

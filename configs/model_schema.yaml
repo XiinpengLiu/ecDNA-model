@@ -1,0 +1,11 @@
+states:
+  - NPC-like
+  - OPC-like
+  - AC-like
+  - MES-like
+species:
+  - MYC
+  - CDK4
+  - PDGFRA
+ddpcr_interpretation: bulk_pooled_mean_anchor_only
+ectag_histogram_policy: species_specific_open_support

@@ -25,11 +25,11 @@ class CleanDataPaths:
 def table_paths_from_raw_dir(raw_dir: str | Path) -> dict[str, Path]:
     base = Path(raw_dir)
     return {
-        "flow": base / "flow.csv",
-        "qpcdr": base / "qpcdr.csv",
-        "ectag": base / "ectag.csv",
-        "ddpcr": base / "ddpcr.csv",
-        "cell_count": base / "cell_count.csv",
+        "flow": _find_raw_table(base, "flow"),
+        "qpcdr": _find_raw_table(base, "qpcdr"),
+        "ectag": _find_raw_table(base, "ectag"),
+        "ddpcr": _find_raw_table(base, "ddpcr"),
+        "cell_count": _find_raw_table(base, "cell_count"),
     }
 
 
@@ -254,6 +254,20 @@ def create_synthetic_raw_dataset(output_dir: str | Path, seed: int = 1) -> dict[
     pd.DataFrame(ddpcr_rows).to_csv(outputs["ddpcr"], index=False)
     pd.DataFrame(cell_count_rows).to_csv(outputs["cell_count"], index=False)
     return outputs
+
+
+def _find_raw_table(base: Path, name: str) -> Path:
+    direct = base / f"{name}.csv"
+    if direct.exists():
+        return direct
+    folder = base / name
+    if folder.exists():
+        matches = sorted([path for path in folder.iterdir() if path.suffix.lower() in {".csv", ".tsv", ".parquet"}])
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(f"Raw input folder {folder} contains multiple candidate tables; pass explicit paths")
+    return direct
 
 
 def _clean_flow(df: pd.DataFrame) -> pd.DataFrame:

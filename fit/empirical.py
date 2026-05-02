@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from fit import schemas
-from fit.io_utils import ensure_dir, write_markdown_report, write_table
+from fit.io_utils import ensure_dir, write_markdown_report, write_table, write_text_pdf
 from fit.observation import load_observation_params
 from fit.raw import load_clean_tables
 
@@ -29,6 +29,7 @@ def build_empirical_summaries(
     snapshot = _snapshot_summary(tables["ectag"], flow_summary, bins)
     qpcdr_summary = _qpcdr_summary(tables["qpcdr"])
     ddpcr_summary = _ddpcr_summary(tables["ddpcr"])
+    cell_count_summary = _cell_count_summary(tables["cell_count"])
     joint = _joint_species_summary(tables["ectag"])
 
     paths = {
@@ -38,6 +39,8 @@ def build_empirical_summaries(
         "ddpcr_bulk_anchor_summary": out / "ddpcr_bulk_anchor_summary.parquet",
         "qpcdr_state_species_summary": out / "qpcdr_state_species_summary.parquet",
         "flow_fraction_summary": out / "flow_fraction_summary.parquet",
+        "cell_count_summary": out / "cell_count_summary.parquet",
+        "plots": out / "empirical_summary_plots.pdf",
         "report": out / "empirical_summary_report.md",
     }
     write_table(snapshot, paths["snapshot_summary"])
@@ -46,6 +49,17 @@ def build_empirical_summaries(
     write_table(ddpcr_summary, paths["ddpcr_bulk_anchor_summary"])
     write_table(qpcdr_summary, paths["qpcdr_state_species_summary"])
     write_table(flow_summary, paths["flow_fraction_summary"])
+    write_table(cell_count_summary, paths["cell_count_summary"])
+    write_text_pdf(
+        paths["plots"],
+        "Empirical Summary Plots",
+        [
+            "Snapshot summaries were generated from raw observations.",
+            "ecTAG histograms are species-specific.",
+            "ddPCR is retained as a bulk anchor table.",
+            f"snapshot rows={len(snapshot)}, histogram rows={len(ectag_hist)}",
+        ],
+    )
     write_markdown_report(
         paths["report"],
         "Empirical Summary Report",
@@ -59,7 +73,13 @@ def build_empirical_summaries(
                 "ddPCR",
                 "ddPCR is preserved as a bulk anchor table only. Single-cell copy-number distribution summaries come from ecTAG.",
             ),
-            ("Rows", f"snapshot_summary={len(snapshot)}, ectag_histograms={len(ectag_hist)}, qpcdr={len(qpcdr_summary)}, ddpcr={len(ddpcr_summary)}"),
+            (
+                "Rows",
+                (
+                    f"snapshot_summary={len(snapshot)}, ectag_histograms={len(ectag_hist)}, "
+                    f"qpcdr={len(qpcdr_summary)}, ddpcr={len(ddpcr_summary)}, cell_count={len(cell_count_summary)}"
+                ),
+            ),
         ],
     )
     return paths
@@ -136,6 +156,16 @@ def _ddpcr_summary(ddpcr: pd.DataFrame) -> pd.DataFrame:
     return (
         ddpcr.groupby(group_cols, as_index=False)
         .agg(ddpcr_copy_number=("ddpcr_copy_number", "mean"), ddpcr_sd_or_ci=("ddpcr_sd_or_ci", "mean"))
+        .sort_values(group_cols)
+        .reset_index(drop=True)
+    )
+
+
+def _cell_count_summary(cell_count: pd.DataFrame) -> pd.DataFrame:
+    group_cols = ["week", "condition", "replicate"]
+    return (
+        cell_count.groupby(group_cols, as_index=False)
+        .agg(total_cell_count=("total_cell_count", "mean"), viability=("viability", "mean"))
         .sort_values(group_cols)
         .reset_index(drop=True)
     )

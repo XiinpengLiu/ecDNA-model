@@ -1,0 +1,7 @@
+raw_dir: raw
+results_dir: results
+seed: 1
+posterior_draws: 64
+particles: 32
+cells: 10000
+smc_steps: 3
