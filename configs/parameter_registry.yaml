@@ -1,0 +1,53 @@
+parameters:
+  net_growth_rate:
+    role: active_effective_control
+    transform: bounded_logit
+    min_per_week: -3.0
+    max_per_week: 3.0
+    fitted_from: cell_count
+  bulk_copy_velocity:
+    role: active_effective_control
+    transform: bounded_logit
+    min_log_change_per_week: -1.5
+    max_log_change_per_week: 1.5
+    fitted_from: ddpcr
+  flow3_projection_bias:
+    role: active_effective_control
+    transform: bounded_logit
+    min: -0.25
+    max: 0.25
+    fitted_from: flow3_steady
+  division_death_turnover:
+    role: prior_constrained_nuisance
+    transform: bounded_logit
+    min_per_week: 0.0
+    max_per_week: 8.0
+    fitted_from: none
+    interpretation: not data-identified
+  ecDNA_gain_loss_turnover:
+    role: prior_constrained_nuisance
+    transform: bounded_logit
+    min_per_week: 0.0
+    max_per_week: 10.0
+    fitted_from: none
+    interpretation: not data-identified
+  hidden_npc_opc_split:
+    role: prior_only
+    transform: logit
+    prior: Beta(2,2)
+    fitted_from: none
+    interpretation: prior-driven
+  state_specific_copy_enrichment:
+    role: prior_constrained_nuisance
+    transform: bounded_logit
+    min_log_fold: -2.0
+    max_log_fold: 2.0
+    fitted_from: none
+    interpretation: not data-identified without qPCDR/ecTAG
+  co_segregation_strength:
+    role: prior_constrained_nuisance
+    transform: bounded_logit
+    min: -0.8
+    max: 0.8
+    fitted_from: none
+    interpretation: not data-identified without same-cell ecTAG

@@ -1,0 +1,24 @@
+analysis_name: v4_bulkfit_sparse_week1_10
+analysis_mode: v4_bulkfit_sparse
+raw_dir: raw
+results_dir: results
+seed: 1
+posterior_draws: 64
+particles: 3000
+cells: 10000
+smc_steps: 4
+moment_candidates: 200000
+moment_keep_top: 10000
+
+available_modalities:
+  ddpcr_bulk: true
+  cell_count: true
+  flow_3group_early: true
+  flow_4state: false
+  qpcdr_sorted: false
+  ectag_single_cell: false
+
+fit_phases:
+  phase_1: [1, 2, 3]
+  phase_2: [4, 5, 6]
+  phase_3: [7, 8, 9, 10]

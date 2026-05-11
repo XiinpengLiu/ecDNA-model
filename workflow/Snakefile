@@ -2,26 +2,193 @@ config.setdefault("raw_dir", "raw")
 config.setdefault("results_dir", "results")
 config.setdefault("seed", 1)
 config.setdefault("posterior_draws", 64)
-config.setdefault("particles", 32)
+config.setdefault("particles", 3000)
 config.setdefault("cells", 10000)
-config.setdefault("smc_steps", 3)
+config.setdefault("smc_steps", 4)
+config.setdefault("moment_candidates", 200000)
+config.setdefault("moment_keep_top", 10000)
+config.setdefault("fit_workers", 1)
 
 RESULTS = config["results_dir"]
 
-include: "rules/00_manifest.smk"
-include: "rules/01_ingest.smk"
-include: "rules/02_observation.smk"
-include: "rules/03_empirical.smk"
-include: "rules/04_lite.smk"
-include: "rules/05_full.smk"
-include: "rules/06_reports.smk"
-
 rule all:
     input:
-        f"{RESULTS}/08_final_report/FINAL_raw_ppc_report.pdf",
-        f"{RESULTS}/08_final_report/FINAL_single_cell_histories.zarr",
-        f"{RESULTS}/08_final_report/FINAL_event_history_summary.parquet",
-        f"{RESULTS}/08_final_report/FINAL_scenario_summary.pdf",
-        f"{RESULTS}/08_final_report/FINAL_parameter_appendix.csv",
-        f"{RESULTS}/04_v4_lite/LITE_summary_target_vector.parquet",
-        f"{RESULTS}/06_full_history_reconstruction/FULL_particles_final.zarr"
+        f"{RESULTS}/10_final_report/FINAL_bulkfit_main_report.pdf",
+        f"{RESULTS}/10_final_report/FINAL_data_constrained_results.csv",
+        f"{RESULTS}/10_final_report/FINAL_latent_model_dependent_results.csv",
+        f"{RESULTS}/10_final_report/FINAL_parameter_interpretability_table.csv",
+        f"{RESULTS}/10_final_report/FINAL_scenario_summary.pdf",
+        f"{RESULTS}/10_final_report/FINAL_method_manifest.json",
+        f"{RESULTS}/10_final_report/FULL_latent_history_samples.zarr",
+        f"{RESULTS}/10_final_report/FULL_hidden_4state_summary.parquet",
+        f"{RESULTS}/10_final_report/FULL_hidden_copy_distribution_summary.parquet",
+        f"{RESULTS}/10_final_report/FULL_event_summary.parquet",
+        f"{RESULTS}/10_final_report/FULL_scenario_classes.parquet",
+        f"{RESULTS}/10_final_report/FULL_scenario_summary.pdf"
+
+rule build_manifest:
+    output:
+        manifest=f"{RESULTS}/00_manifest/run_manifest.json",
+        index=f"{RESULTS}/00_manifest/analysis_index.parquet",
+        mask=f"{RESULTS}/00_manifest/available_data_mask.json"
+    shell:
+        "python -m fit.run_fit build-manifest --raw-dir \"{config[raw_dir]}\" --output \"{RESULTS}/00_manifest\""
+
+rule ingest_raw:
+    input:
+        manifest=f"{RESULTS}/00_manifest/run_manifest.json"
+    output:
+        ddpcr=f"{RESULTS}/01_clean_data/ddpcr_long.parquet",
+        cell_count=f"{RESULTS}/01_clean_data/cell_count_long.parquet",
+        flow3=f"{RESULTS}/01_clean_data/flow3_early_long.parquet",
+        metadata=f"{RESULTS}/01_clean_data/drug_metadata_long.parquet",
+        qpcdr=f"{RESULTS}/01_clean_data/qpcdr_unavailable.json",
+        ectag=f"{RESULTS}/01_clean_data/ectag_unavailable.json",
+        report=f"{RESULTS}/01_clean_data/clean_qc_report.md"
+    shell:
+        "python -m fit.run_fit ingest-raw --raw-dir \"{config[raw_dir]}\" --output \"{RESULTS}/01_clean_data\""
+
+rule fit_observation_model:
+    input:
+        ddpcr=f"{RESULTS}/01_clean_data/ddpcr_long.parquet",
+        cell_count=f"{RESULTS}/01_clean_data/cell_count_long.parquet",
+        flow3=f"{RESULTS}/01_clean_data/flow3_early_long.parquet",
+        metadata=f"{RESULTS}/01_clean_data/drug_metadata_long.parquet"
+    output:
+        lite=f"{RESULTS}/02_observation_model/obs_params_for_bulk_lite.json",
+        full=f"{RESULTS}/02_observation_model/obs_params_for_full.json",
+        projection=f"{RESULTS}/02_observation_model/flow3_projection_matrix.npy",
+        target=f"{RESULTS}/02_observation_model/flow3_steady_target.json",
+        report=f"{RESULTS}/02_observation_model/observation_qc_report.md"
+    shell:
+        "python -m fit.run_fit fit-observation-model --clean-dir \"{RESULTS}/01_clean_data\" --output \"{RESULTS}/02_observation_model\" --seed {config[seed]}"
+
+rule fit_v4_lite_bulk:
+    input:
+        ddpcr=f"{RESULTS}/01_clean_data/ddpcr_long.parquet",
+        cell_count=f"{RESULTS}/01_clean_data/cell_count_long.parquet",
+        flow3=f"{RESULTS}/01_clean_data/flow3_early_long.parquet",
+        obs=f"{RESULTS}/02_observation_model/obs_params_for_bulk_lite.json"
+    output:
+        fit=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_final_fit.nc",
+        ddpcr=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_ddpcr_trajectories.parquet",
+        cell_count=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_cell_count_trajectories.parquet",
+        growth=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_growth_velocity.parquet",
+        copy_velocity=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_copy_velocity.parquet",
+        flow3=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_flow3_steady.json",
+        initializer=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_hidden_4state_initializer.parquet",
+        sampler=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_initial_population_sampler.json",
+        priors=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_to_FULL_prior_scales.json",
+        mask=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_to_FULL_fit_mask.json",
+        unavailable=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_unavailable_modalities.json",
+        report=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_ppc_report.pdf"
+    shell:
+        "python -m fit.run_fit fit-lite --clean-dir \"{RESULTS}/01_clean_data\" --obs-params \"{input.obs}\" --output \"{RESULTS}/03_v4_lite_bulk\" --seed {config[seed]} --draws {config[posterior_draws]}"
+
+rule build_parameter_registry:
+    input:
+        priors=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_to_FULL_prior_scales.json"
+    output:
+        registry=f"{RESULTS}/04_parameter_registry/PARAMETER_registry_resolved.yaml",
+        active=f"{RESULTS}/04_parameter_registry/PARAMETER_active_blocks.json",
+        nuisance=f"{RESULTS}/04_parameter_registry/PARAMETER_nuisance_blocks.json",
+        bounds=f"{RESULTS}/04_parameter_registry/PARAMETER_hard_bounds.json",
+        interpretability=f"{RESULTS}/04_parameter_registry/PARAMETER_interpretability_prior_table.csv"
+    shell:
+        "python -m fit.run_fit build-parameter-registry --lite-dir \"{RESULTS}/03_v4_lite_bulk\" --output \"{RESULTS}/04_parameter_registry\""
+
+rule run_prior_predictive_gate:
+    input:
+        registry=f"{RESULTS}/04_parameter_registry/PARAMETER_registry_resolved.yaml",
+        priors=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_to_FULL_prior_scales.json",
+        sampler=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_initial_population_sampler.json",
+        obs=f"{RESULTS}/02_observation_model/obs_params_for_full.json"
+    output:
+        report=f"{RESULTS}/05_prior_predictive/PRIOR_predictive_gate_report.pdf",
+        accepted=f"{RESULTS}/05_prior_predictive/PRIOR_predictive_accepted_region.parquet",
+        rejected=f"{RESULTS}/05_prior_predictive/PRIOR_predictive_rejection_reasons.csv"
+    shell:
+        "python -m fit.run_fit run-prior-predictive-gate --registry-dir \"{RESULTS}/04_parameter_registry\" --lite-dir \"{RESULTS}/03_v4_lite_bulk\" --obs-params \"{input.obs}\" --output \"{RESULTS}/05_prior_predictive\" --seed {config[seed]}"
+
+rule run_moment_prescreen:
+    input:
+        growth=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_growth_velocity.parquet",
+        copy_velocity=f"{RESULTS}/03_v4_lite_bulk/BULK_LITE_copy_velocity.parquet",
+        accepted=f"{RESULTS}/05_prior_predictive/PRIOR_predictive_accepted_region.parquet"
+    output:
+        candidates=f"{RESULTS}/06_moment_prescreen/MOMENT_candidate_parameters.parquet",
+        scores=f"{RESULTS}/06_moment_prescreen/MOMENT_scores.parquet",
+        keep=f"{RESULTS}/06_moment_prescreen/MOMENT_keep_top_particles.parquet",
+        report=f"{RESULTS}/06_moment_prescreen/MOMENT_prescreen_report.pdf"
+    threads: int(config["fit_workers"])
+    shell:
+        "python -m fit.run_fit run-moment-prescreen --lite-dir \"{RESULTS}/03_v4_lite_bulk\" --prior-dir \"{RESULTS}/05_prior_predictive\" --output \"{RESULTS}/06_moment_prescreen\" --seed {config[seed]} --n-candidates {config[moment_candidates]} --keep-top {config[moment_keep_top]} --workers {threads}"
+
+rule create_full_initial_particles:
+    input:
+        keep=f"{RESULTS}/06_moment_prescreen/MOMENT_keep_top_particles.parquet"
+    output:
+        population=f"{RESULTS}/07_full_initialization/FULL_initial_population.zarr",
+        summary=f"{RESULTS}/07_full_initialization/FULL_initial_population_summary.parquet",
+        particles=f"{RESULTS}/07_full_initialization/FULL_initial_parameter_particles.parquet",
+        report=f"{RESULTS}/07_full_initialization/FULL_initialization_report.pdf"
+    shell:
+        "python -m fit.run_fit create-full-initial-particles --lite-dir \"{RESULTS}/03_v4_lite_bulk\" --moment-dir \"{RESULTS}/06_moment_prescreen\" --output \"{RESULTS}/07_full_initialization\" --particles {config[particles]} --cells {config[cells]} --seed {config[seed]}"
+
+rule run_full_partialobs_smc:
+    input:
+        init=f"{RESULTS}/07_full_initialization/FULL_initial_parameter_particles.parquet",
+        obs=f"{RESULTS}/02_observation_model/obs_params_for_full.json"
+    output:
+        coarse_particles=f"{RESULTS}/08_full_smc/FULL_coarse_particles.parquet",
+        coarse_scores=f"{RESULTS}/08_full_smc/FULL_coarse_scores.parquet",
+        particles_zarr=f"{RESULTS}/08_full_smc/FULL_particles_final.zarr",
+        parameters=f"{RESULTS}/08_full_smc/FULL_particle_parameters.parquet",
+        weights=f"{RESULTS}/08_full_smc/FULL_particle_weights.parquet",
+        scores=f"{RESULTS}/08_full_smc/FULL_particle_scores.parquet",
+        adaptation=f"{RESULTS}/08_full_smc/FULL_smc_adaptation_log.parquet",
+        early=f"{RESULTS}/08_full_smc/FULL_early_rejection_log.parquet",
+        mc=f"{RESULTS}/08_full_smc/FULL_monte_carlo_noise_report.csv",
+        replay=f"{RESULTS}/08_full_smc/FULL_replay_histories.zarr"
+    threads: int(config["fit_workers"])
+    shell:
+        "python -m fit.run_fit run-full-reconstruction --lite-dir \"{RESULTS}/03_v4_lite_bulk\" --obs-params \"{input.obs}\" --moment-dir \"{RESULTS}/06_moment_prescreen\" --output \"{RESULTS}/08_full_smc\" --particles {config[particles]} --cells {config[cells]} --smc-steps {config[smc_steps]} --seed {config[seed]} --workers {threads}"
+
+rule run_validation_identifiability:
+    input:
+        parameters=f"{RESULTS}/08_full_smc/FULL_particle_parameters.parquet",
+        weights=f"{RESULTS}/08_full_smc/FULL_particle_weights.parquet",
+        registry=f"{RESULTS}/04_parameter_registry/PARAMETER_interpretability_prior_table.csv",
+        obs=f"{RESULTS}/02_observation_model/obs_params_for_full.json"
+    output:
+        ddpcr=f"{RESULTS}/09_validation/FULL_ddpcr_ppc.parquet",
+        cell_count=f"{RESULTS}/09_validation/FULL_cellcount_ppc.parquet",
+        flow3=f"{RESULTS}/09_validation/FULL_flow3steady_ppc.parquet",
+        report=f"{RESULTS}/09_validation/FULL_ppc_report.pdf",
+        ident=f"{RESULTS}/09_validation/FULL_identifiability_report.csv",
+        boundary=f"{RESULTS}/09_validation/FULL_boundary_forcing_report.csv",
+        ridge=f"{RESULTS}/09_validation/FULL_ridge_report.csv",
+        holdout_report=f"{RESULTS}/09_validation/FULL_holdout_validation_report.pdf",
+        holdout=f"{RESULTS}/09_validation/FULL_holdout_validation.csv"
+    shell:
+        "python -m fit.run_fit run-validation --lite-dir \"{RESULTS}/03_v4_lite_bulk\" --full-dir \"{RESULTS}/08_full_smc\" --registry-dir \"{RESULTS}/04_parameter_registry\" --obs-params \"{input.obs}\" --output \"{RESULTS}/09_validation\""
+
+rule build_final_report:
+    input:
+        ident=f"{RESULTS}/09_validation/FULL_identifiability_report.csv",
+        full=f"{RESULTS}/08_full_smc/FULL_replay_histories.zarr"
+    output:
+        report=f"{RESULTS}/10_final_report/FINAL_bulkfit_main_report.pdf",
+        data=f"{RESULTS}/10_final_report/FINAL_data_constrained_results.csv",
+        latent=f"{RESULTS}/10_final_report/FINAL_latent_model_dependent_results.csv",
+        interpretability=f"{RESULTS}/10_final_report/FINAL_parameter_interpretability_table.csv",
+        scenario=f"{RESULTS}/10_final_report/FINAL_scenario_summary.pdf",
+        manifest=f"{RESULTS}/10_final_report/FINAL_method_manifest.json",
+        latent_zarr=f"{RESULTS}/10_final_report/FULL_latent_history_samples.zarr",
+        hidden4=f"{RESULTS}/10_final_report/FULL_hidden_4state_summary.parquet",
+        hidden_copy=f"{RESULTS}/10_final_report/FULL_hidden_copy_distribution_summary.parquet",
+        events=f"{RESULTS}/10_final_report/FULL_event_summary.parquet",
+        scenario_classes=f"{RESULTS}/10_final_report/FULL_scenario_classes.parquet",
+        full_scenario=f"{RESULTS}/10_final_report/FULL_scenario_summary.pdf"
+    shell:
+        "python -m fit.run_fit build-final-report --observation-dir \"{RESULTS}/02_observation_model\" --lite-dir \"{RESULTS}/03_v4_lite_bulk\" --full-dir \"{RESULTS}/08_full_smc\" --validation-dir \"{RESULTS}/09_validation\" --output \"{RESULTS}/10_final_report\""

@@ -1,49 +1,136 @@
-"""Full conditional single-cell history reconstruction with particle scoring."""
+"""Bulk-visible full-model wrapper and adaptive SMC artifacts."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 import config as cfg
-from core import dynamics as dyn
-from core.cell import Cell
-from core.simulation import HybridOgataSimulator
+from core.simulation import run_simulation
 from fit import schemas
-from fit.full_raw_ppc import generate_full_raw_table_ppc
-from fit.io_utils import ensure_dir, read_json, write_json, write_jsonl, write_markdown_report, write_table, write_text_pdf
-from fit.objective import SCORE_COMPONENTS, score_particle_summary
-from fit.scenarios import classify_scenarios
+from fit.io_utils import ensure_dir, read_json, write_json, write_table, write_text_pdf
+from fit.objective import score_bulk_predictions
+from fit.observation import load_observation_params
 from fit.v4_lite import load_lite_artifacts
-
-
-ALLOWED_TRANSITIONS: tuple[tuple[str, str], ...] = (
-    ("NPC-like", "OPC-like"),
-    ("OPC-like", "NPC-like"),
-    ("OPC-like", "AC-like"),
-    ("AC-like", "OPC-like"),
-    ("AC-like", "MES-like"),
-    ("MES-like", "AC-like"),
-    ("NPC-like", "AC-like"),
-    ("AC-like", "NPC-like"),
-)
 
 METHOD_N_SIM_FIT = 10_000
 METHOD_N_SIM_REPLAY = 50_000
+METHOD_MOMENT_CANDIDATES = 200_000
+METHOD_MOMENT_MAX_CANDIDATES = 500_000
+METHOD_MOMENT_KEEP_TOP = 10_000
+METHOD_MOMENT_MIN_TOP = 5_000
+METHOD_FULL_PARTICLES_INITIAL = 3_000
+METHOD_FULL_PARTICLES_FINAL = 1_000
+METHOD_COARSE_PARTICLES = 10_000
+METHOD_COARSE_CELLS = 1_000
 
 
-@dataclass
-class ParticleResult:
-    particle_id: int
-    parameters: dict
-    snapshots: pd.DataFrame
-    features: pd.DataFrame
-    events: pd.DataFrame
-    histories: list[dict]
-    score: dict
+def _progress(message: str) -> None:
+    print(f"[fit] {message}", flush=True)
+
+
+def _fmt(value: float) -> str:
+    return f"{float(value):.4g}" if np.isfinite(float(value)) else str(value)
+
+
+def _resolve_workers(workers: int | None, task_count: int) -> int:
+    requested = 1 if workers is None else int(workers)
+    if requested < 1:
+        raise ValueError(f"workers must be >= 1, got {workers}")
+    return min(requested, max(1, int(task_count)))
+
+
+def _parallel_map(func, tasks: list, workers: int | None) -> list:
+    if not tasks:
+        return []
+    worker_count = _resolve_workers(workers, len(tasks))
+    if worker_count == 1:
+        return [func(task) for task in tasks]
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        return list(executor.map(func, tasks))
+
+
+def _dataframe_chunks(df: pd.DataFrame, parts: int) -> list[pd.DataFrame]:
+    if df.empty:
+        return []
+    chunk_count = min(max(1, int(parts)), len(df))
+    chunk_size = int(np.ceil(len(df) / chunk_count))
+    return [df.iloc[start : start + chunk_size].copy() for start in range(0, len(df), chunk_size)]
+
+
+def run_moment_prescreen(
+    lite_dir: str | Path,
+    prior_dir: str | Path,
+    output_dir: str | Path,
+    seed: int = 1,
+    n_candidates: int = METHOD_MOMENT_CANDIDATES,
+    keep_top: int = METHOD_MOMENT_KEEP_TOP,
+    workers: int = 1,
+) -> dict[str, Path]:
+    """Cheap moment approximation pre-screen for active effective controls."""
+
+    artifacts = load_lite_artifacts(lite_dir)
+    prior = pd.read_parquet(Path(prior_dir) / "PRIOR_predictive_accepted_region.parquet")
+    out = ensure_dir(output_dir)
+    worker_count = _resolve_workers(workers, max(1, int(n_candidates)))
+    rng = np.random.default_rng(seed)
+    method_min_keep = METHOD_MOMENT_MIN_TOP
+    target_keep = max(method_min_keep, int(keep_top))
+    candidate_count = max(1, int(n_candidates))
+    _progress(
+        f"moment prescreen start: candidates={candidate_count}, keep_top={target_keep}, "
+        f"method_min_keep={method_min_keep}, workers={worker_count}"
+    )
+    candidates = _candidate_parameter_table(artifacts, prior, rng, candidate_count)
+    scores = _score_candidate_moments(candidates, artifacts, workers=worker_count)
+    expanded = False
+    if len(scores) < method_min_keep and candidate_count < METHOD_MOMENT_MAX_CANDIDATES:
+        _progress(f"moment prescreen expanding: scored={len(scores)} < {method_min_keep}; candidates={METHOD_MOMENT_MAX_CANDIDATES}")
+        candidate_count = METHOD_MOMENT_MAX_CANDIDATES
+        candidates = _candidate_parameter_table(artifacts, prior, rng, candidate_count)
+        scores = _score_candidate_moments(candidates, artifacts, workers=worker_count)
+        expanded = True
+    if len(scores) < method_min_keep:
+        write_table(candidates, out / "MOMENT_candidate_parameters.parquet")
+        write_table(scores, out / "MOMENT_scores.parquet")
+        report = out / "MOMENT_prescreen_incompatible_report.md"
+        report.write_text(
+            "# Moment Prescreen Incompatible\n\n"
+            f"Required at least {method_min_keep} top candidates under the method continue criteria.\n\n"
+            f"Available candidates after expansion: {len(scores)}.\n",
+            encoding="utf-8",
+        )
+        _progress(f"moment prescreen failed: scored={len(scores)}, report={report}")
+        raise RuntimeError(f"moment prescreen produced fewer than {method_min_keep} candidates; wrote {report}")
+    keep_n = min(target_keep, len(scores))
+    keep_scores = scores.nsmallest(keep_n, "D_moment").drop(columns=[column for column in ("D_prior", "D_biology") if column in scores.columns])
+    keep = keep_scores.merge(candidates, on="particle_id", how="left")
+    _progress(
+        "moment prescreen result: "
+        f"scored={len(scores)}, keep={len(keep)}, "
+        f"best_D={_fmt(scores['D_moment'].min())}, median_D={_fmt(scores['D_moment'].median())}, "
+        f"median_D_prior={_fmt(scores['D_prior'].median()) if 'D_prior' in scores else 'NA'}"
+    )
+    write_table(candidates, out / "MOMENT_candidate_parameters.parquet")
+    write_table(scores, out / "MOMENT_scores.parquet")
+    write_table(keep, out / "MOMENT_keep_top_particles.parquet")
+    write_text_pdf(
+        out / "MOMENT_prescreen_report.pdf",
+        "Moment Prescreen Report",
+        [
+            f"candidates={len(candidates)}; keep_top={len(keep)}; method_min_top={method_min_keep}",
+            f"expanded_to_500000={expanded}",
+            f"workers={worker_count}",
+            "Moment score uses ddPCR bulk velocity, cell-count growth, flow3 steady, and prior penalty.",
+            "No single-cell ecTAG/qPCDR likelihood is used.",
+        ],
+    )
+    _progress(f"moment prescreen done: output={out}")
+    return {name: out / name for name in schemas.MOMENT_OUTPUTS}
 
 
 def create_full_initial_particles(
@@ -52,1164 +139,1049 @@ def create_full_initial_particles(
     particles: int = 16,
     cells: int = METHOD_N_SIM_FIT,
     seed: int = 1,
+    moment_dir: str | Path | None = None,
 ) -> dict[str, Path]:
+    """Create full initialization inputs without modifying the full model."""
+
+    rng = np.random.default_rng(seed)
     artifacts = load_lite_artifacts(lite_dir)
     out = ensure_dir(output_dir)
-    rng = np.random.default_rng(seed)
-    rows = []
-    for particle_id in range(int(particles)):
-        simulator = _make_v4_simulator(rng)
-        for stratum_index, (condition, replicate) in enumerate(_sampler_strata(artifacts["sampler"])):
-            population_weight = _initial_population_weight(artifacts["target"], condition, replicate, artifacts["sampler"]["initial_week"], int(cells))
-            population = _sample_initial_population(
-                artifacts["sampler"],
-                int(cells),
-                rng,
-                particle_id,
-                condition,
-                replicate,
-                stratum_index * int(cells),
-                population_weight=population_weight,
-                simulator=simulator,
-            )
-            for cell in population:
-                cell["particle_id"] = particle_id
-                rows.append(cell)
-    path = out / "initial_particles.parquet"
-    write_table(pd.DataFrame(rows), path)
-    write_json(
-        out / "initial_particles_manifest.json",
-        {"particles": int(particles), "cells_per_particle": int(cells), "source": str(Path(lite_dir))},
+    moment = _load_moment_particles(moment_dir, artifacts, rng, particles)
+    sampler = artifacts["sampler"]
+    first_counts = pd.DataFrame(sampler["cell_count_anchor"])
+    first_ddpcr = pd.DataFrame(sampler["ddpcr_bulk_anchor"])
+    flow_init = artifacts["initializer"]
+    _progress(f"full initialization start: particles={int(particles)}, cells_per_stratum={int(cells)}, strata={len(first_counts)}")
+    pop_rows = []
+    summary_rows = []
+    for row in first_counts.itertuples(index=False):
+        weight = float(row.total_cell_count) / max(1, int(cells))
+        mean_vector = _anchor_mean_vector(first_ddpcr, str(row.condition), str(row.replicate))
+        for particle_id in range(int(particles)):
+            rho = float(rng.beta(2, 2))
+            state_fractions = _state_fractions_from_flow3(artifacts["flow3"], rho)
+            for state, fraction in state_fractions.items():
+                n_state = int(round(int(cells) * fraction))
+                state_copies = _mean_matched_zinb_pool(rng, mean_vector, max(1, n_state))
+                summary_rows.append(
+                    {
+                        "particle_id": particle_id,
+                        "condition": str(row.condition),
+                        "replicate": str(row.replicate),
+                        "state_gate": state,
+                        "sim_cells": n_state,
+                        "population_weight": weight,
+                        "projected_flow3_group": _state_to_flow3(state),
+                        "mean_MYC_copy": float(state_copies[:, 0].mean()),
+                        "mean_CDK4_copy": float(state_copies[:, 1].mean()),
+                        "mean_PDGFRA_copy": float(state_copies[:, 2].mean()),
+                    }
+                )
+                for local_id in range(n_state):
+                    copies = state_copies[local_id]
+                    pop_rows.append(
+                        {
+                            "particle_id": particle_id,
+                            "condition": str(row.condition),
+                            "replicate": str(row.replicate),
+                            "cell_id": len(pop_rows),
+                            "state_gate": state,
+                            "population_weight": weight,
+                            "rho": rho,
+                            "MYC_copy": int(copies[0]),
+                            "CDK4_copy": int(copies[1]),
+                            "PDGFRA_copy": int(copies[2]),
+                        }
+                    )
+    params = moment.head(int(particles)).copy()
+    if "particle_id" in params:
+        params["particle_id"] = range(len(params))
+    write_table(pd.DataFrame(summary_rows), out / "FULL_initial_population_summary.parquet")
+    write_table(params, out / "FULL_initial_parameter_particles.parquet")
+    _write_population_zarr(out / "FULL_initial_population.zarr", pd.DataFrame(pop_rows), first_ddpcr, flow_init)
+    write_text_pdf(
+        out / "FULL_initialization_report.pdf",
+        "Full Initialization Report",
+        [
+            "Initial N matches week-1 cell count through representative cell weights.",
+            "Four-state initialization uses Beta(2,2) hidden NPC/OPC split under the flow3 projection.",
+            "Copy-number initialization is mean-matched to week-1 ddPCR; single-cell distribution shape is prior-only.",
+        ],
     )
-    return {"initial_particles": path}
+    _progress(
+        f"full initialization done: population_rows={len(pop_rows)}, "
+        f"summary_rows={len(summary_rows)}, output={out}"
+    )
+    return {name: out / name for name in schemas.FULL_INIT_OUTPUTS}
 
 
 def run_full_reconstruction(
     lite_dir: str | Path,
     obs_params_path: str | Path,
     output_dir: str | Path,
-    particles: int = 32,
+    particles: int = METHOD_FULL_PARTICLES_INITIAL,
     cells: int = METHOD_N_SIM_FIT,
     seed: int = 1,
     acceptance_quantile: float = 0.5,
-    smc_steps: int = 3,
+    smc_steps: int = 4,
+    moment_dir: str | Path | None = None,
+    workers: int = 1,
 ) -> dict[str, Path]:
-    """Run a deterministic-seed SMC-ABC style particle reconstruction.
-
-    Each particle stores an explicit representative single-cell history,
-    summary features, score, posterior weight, and scenario label.
-    """
+    """Run adaptive partial-observation SMC over bulk-visible controls only."""
 
     artifacts = load_lite_artifacts(lite_dir)
-    obs_params = read_json(obs_params_path)
-    if not bool(obs_params.get("locked_for_full")):
-        raise ValueError("Full reconstruction requires locked obs_params_for_full.json")
+    obs = load_observation_params(obs_params_path)
     out = ensure_dir(output_dir)
+    worker_count = _resolve_workers(workers, max(1, int(particles)))
     rng = np.random.default_rng(seed)
-    weeks = sorted(int(value) for value in artifacts["target"]["week"].dropna().unique())
-    results: list[ParticleResult] = []
-    proposal_bank: list[dict] = []
-    for smc_round in range(max(1, int(smc_steps))):
-        round_results: list[ParticleResult] = []
-        for local_id in range(int(particles)):
-            particle_id = smc_round * int(particles) + local_id
-            params = (
-                _sample_particle_parameters(artifacts["prior_scales"], rng, particle_id)
-                if not proposal_bank
-                else _perturb_particle_parameters(proposal_bank[int(rng.integers(0, len(proposal_bank)))], rng, particle_id)
+    current = _with_prior_distance(_load_moment_particles(moment_dir, artifacts, rng, max(int(particles), 1)), artifacts)
+    centers = _centers(artifacts)
+    growth_controls = sum(1 for name in centers if name.startswith("r__"))
+    copy_controls = sum(1 for name in centers if name.startswith("v__"))
+    flow_controls = sum(1 for name in centers if name.startswith("zeta_flow3__"))
+    smc_rounds = max(1, int(smc_steps))
+    _progress(
+        f"full SMC start: particles={int(particles)}, cells={int(cells)}, smc_steps={smc_rounds}, "
+        f"workers={worker_count}, active_controls={len(centers)} "
+        f"(growth={growth_controls}, copy={copy_controls}, flow3={flow_controls})"
+    )
+    adaptation_rows = []
+    all_params = []
+    all_scores = []
+    early_rows = []
+    mc_rows = []
+    proposal_scale = {"growth": 1.0, "copy_MYC": 1.0, "copy_CDK4": 1.0, "copy_PDGFRA": 1.0, "flow3": 1.0}
+    epsilon = float("inf")
+    quantiles = [0.70, 0.50, 0.30, 0.20]
+    next_round_cells = min(int(cells), METHOD_COARSE_CELLS)
+    for smc_round in range(smc_rounds):
+        round_cells = max(1, int(next_round_cells))
+        _progress(
+            f"SMC round {smc_round + 1}/{smc_rounds} start: "
+            f"proposals={int(particles)}, sim_cells={round_cells}, epsilon_prev={_fmt(epsilon)}"
+        )
+        proposed = _propose_round(current, artifacts, rng, int(particles), smc_round, proposal_scale)
+        score_rows = []
+        score_tasks = [(param.to_dict(), artifacts, obs, epsilon, round_cells, seed + smc_round, smc_round) for _, param in proposed.iterrows()]
+        for row, screen_rows in _parallel_map(_score_proposed_particle, score_tasks, worker_count):
+            early_rows.extend(screen_rows)
+            score_rows.append(row)
+        scores = pd.DataFrame(score_rows)
+        q = quantiles[min(smc_round, len(quantiles) - 1)]
+        candidate_epsilon = float(scores["score"].quantile(q))
+        if np.isfinite(epsilon):
+            lower = epsilon * 0.50
+            upper = epsilon * 0.95
+            candidate_epsilon = float(min(upper, max(lower, candidate_epsilon)))
+        epsilon = candidate_epsilon
+        prior_limit = float(max(current["D_prior"].astype(float).quantile(0.99), current["D_prior"].astype(float).min())) if "D_prior" in current else float("inf")
+        scores_for_acceptance = scores.drop(columns=["round", "D_prior"], errors="ignore")
+        accepted = proposed.merge(scores_for_acceptance, on="particle_id", how="left")
+        accepted = accepted[(accepted["score"] <= epsilon) & (accepted["D_prior"].astype(float) <= prior_limit) & (accepted["D_biology"].astype(float) == 0.0) & (~accepted["early_rejected"].fillna(False).astype(bool))].copy()
+        if accepted.empty:
+            feasible = proposed.merge(scores_for_acceptance, on="particle_id", how="left")
+            feasible = feasible[(feasible["D_prior"].astype(float) <= prior_limit) & (feasible["D_biology"].astype(float) == 0.0) & (~feasible["early_rejected"].fillna(False).astype(bool))]
+            report = out / "FULL_smc_incompatible_under_current_tolerance.md"
+            report.write_text(
+                "# FULL SMC Incompatible Under Current Tolerance\n\n"
+                f"round={smc_round}\n\n"
+                f"epsilon={epsilon}\n\n"
+                f"prior_limit={prior_limit}\n\n"
+                f"feasible_particles={len(feasible)}\n\n"
+                "No fallback particle was accepted because the method requires data, prior, and biological gates to pass simultaneously.\n",
+                encoding="utf-8",
             )
-            result = _simulate_and_score_particle(
-                particle_id,
-                params,
-                artifacts,
-                obs_params,
-                weeks,
-                int(cells),
-                rng,
+            _progress(
+                f"SMC round {smc_round + 1}/{smc_rounds} failed: "
+                f"epsilon={_fmt(epsilon)}, prior_limit={_fmt(prior_limit)}, feasible_particles={len(feasible)}, report={report}"
             )
-            result.parameters["smc_round"] = int(smc_round)
-            round_results.append(result)
-        scores = pd.DataFrame({"particle_id": [item.particle_id for item in round_results], "score": [item.score["score"] for item in round_results]})
-        tolerance = float(scores["score"].quantile(max(0.1, 0.6 - 0.15 * smc_round)))
-        accepted = [item for item in round_results if item.score["score"] <= tolerance]
-        if not accepted:
-            accepted = [min(round_results, key=lambda item: item.score["score"])]
-        proposal_bank = [dict(item.parameters) for item in accepted]
-        for item in round_results:
-            item.parameters["smc_tolerance"] = tolerance
-        results.extend(round_results)
+            raise RuntimeError(f"no accepted particles under method gates; wrote {report}")
+        acceptance_rate = len(accepted) / max(1, len(proposed))
+        ess = _effective_sample_size(np.ones(len(accepted)) / max(1, len(accepted)))
+        entropy = float(np.log(max(1, len(accepted))))
+        _adapt_proposal_scale(proposal_scale, acceptance_rate)
+        round_weights = accepted[["particle_id", "score"]].copy()
+        round_weights["weight"] = 1.0 / max(1, len(round_weights))
+        round_weights["accepted"] = True
+        round_noise = _mc_noise_report(accepted, round_weights, artifacts, obs, round_cells, seed + smc_round * 10_003, workers=worker_count)
+        if not round_noise.empty:
+            round_noise["round"] = smc_round
+            mc_rows.append(round_noise)
+            next_round_cells = int(round_noise["n_sim_cells_next"].astype(int).max())
+        else:
+            next_round_cells = int(cells)
+        _progress(
+            f"SMC round {smc_round + 1}/{smc_rounds} result: "
+            f"accepted={len(accepted)}/{len(proposed)} ({acceptance_rate:.1%}), "
+            f"epsilon={_fmt(epsilon)}, median_score={_fmt(scores['score'].median())}, "
+            f"median_D_ddPCR={_fmt(scores['D_ddpcr'].median())}, "
+            f"median_D_cellcount={_fmt(scores['D_cell_count'].median())}, "
+            f"median_D_flow3={_fmt(scores['D_flow3'].median())}, "
+            f"median_D_prior={_fmt(scores['D_prior'].median())}, next_cells={next_round_cells}"
+        )
+        adaptation_rows.append(
+            {
+                "round": smc_round,
+                "n_sim_cells": round_cells,
+                "n_sim_cells_next": next_round_cells,
+                "epsilon": epsilon,
+                "acceptance_rate": acceptance_rate,
+                "ESS": ess,
+                "particle_entropy": entropy,
+                "proposal_scale_growth": proposal_scale["growth"],
+                "proposal_scale_copy_MYC": proposal_scale["copy_MYC"],
+                "proposal_scale_copy_CDK4": proposal_scale["copy_CDK4"],
+                "proposal_scale_copy_PDGFRA": proposal_scale["copy_PDGFRA"],
+                "proposal_scale_flow3": proposal_scale["flow3"],
+                "median_distance": float(scores["score"].median()),
+                "median_D_ddPCR": float(scores["D_ddpcr"].median()),
+                "median_D_cellcount": float(scores["D_cell_count"].median()),
+                "median_D_flow3": float(scores["D_flow3"].median()),
+                "median_D_prior": float(scores["D_prior"].median()),
+            }
+        )
+        all_params.append(proposed)
+        all_scores.append(scores)
+        current = _with_prior_distance(accepted.drop(columns=[column for column in ("round", "score", "D_ddpcr", "D_cell_count", "D_flow3", "D_prior", "D_biology", "early_rejected", "simulated_full") if column in accepted.columns]), artifacts)
 
-    parameter_rows = []
-    score_rows = []
-    snapshot_rows = []
-    feature_rows = []
-    event_rows = []
-    history_rows = []
-    for result in results:
-        parameter_rows.append(result.parameters)
-        score_rows.append({"particle_id": result.particle_id, "score": result.score["score"], **result.score["contributions"]})
-        snapshot_rows.append(result.snapshots)
-        feature_rows.append(result.features.assign(particle_id=result.particle_id))
-        event_rows.append(result.events)
-        history_rows.extend(result.histories)
-
-    scores = pd.DataFrame(score_rows)
-    weights = _posterior_weights(scores)
-    final_round = int(weights["particle_id"].max() // max(1, int(particles)))
-    final_scores = scores[scores["particle_id"] >= final_round * int(particles)]
-    score_cutoff = float(final_scores["score"].quantile(float(acceptance_quantile)))
-    weights["accepted"] = (weights["particle_id"] >= final_round * int(particles)) & (weights["score"] <= score_cutoff)
-    accepted_ids = set(weights.loc[weights["accepted"], "particle_id"].astype(int))
-
-    snapshots = pd.concat(snapshot_rows, ignore_index=True)
-    features = pd.concat(feature_rows, ignore_index=True)
-    events = pd.concat(event_rows, ignore_index=True) if event_rows else pd.DataFrame()
-    accepted_histories = [row for row in history_rows if int(row["particle_id"]) in accepted_ids]
-    scenario_classes = classify_scenarios(events, snapshots, weights)
-
-    write_jsonl(out / "accepted_histories.jsonl", accepted_histories)
-    write_table(pd.DataFrame(parameter_rows), out / "particle_parameters.parquet")
-    write_table(weights, out / "particle_weights.parquet")
-    write_table(snapshots, out / "full_snapshot_summaries.parquet")
-    write_table(events, out / "event_summaries.parquet")
-    write_table(scenario_classes, out / "scenario_classes.parquet")
-    write_table(features, out / "particle_summary_features.parquet")
-    _write_method_full_outputs(out, accepted_histories, parameter_rows, weights, snapshots, events, features, artifacts["target"])
-    ppc_payload = _write_ppc_report(out, weights, artifacts["target"], features)
-    generate_full_raw_table_ppc(out, obs_params_path, lite_dir, out, seed=seed)
-    full_diagnostics = _full_continue_diagnostics(weights, ppc_payload, scenario_classes)
-    if not full_diagnostics["continue_gate_passed"]:
-        _write_incompatibility_report(out, full_diagnostics)
+    params = pd.concat(all_params, ignore_index=True)
+    scores = pd.concat(all_scores, ignore_index=True)
+    final_round = int(scores["round"].max())
+    final_scores = scores[scores["round"] == final_round]
+    cutoff = float(final_scores["score"].quantile(float(acceptance_quantile)))
+    final_gate_ids = set(current["particle_id"].astype(int)) if "particle_id" in current else set()
+    weights = _weights_from_scores(scores, final_round, cutoff, final_gate_ids)
+    particle_scores = scores.merge(weights[["particle_id", "weight", "accepted"]], on="particle_id", how="left")
+    accepted_scores = weights.loc[weights["accepted"], "score"].astype(float)
+    _progress(
+        f"full SMC final weights: accepted={int(weights['accepted'].sum())}, "
+        f"cutoff={_fmt(cutoff)}, median_accepted_score={_fmt(accepted_scores.median())}, "
+        f"best_accepted_score={_fmt(accepted_scores.min())}"
+    )
+    coarse_scores = scores[scores["round"] == 0].copy()
+    coarse_particles = params[params["round"] == 0].copy()
+    write_table(coarse_particles, out / "FULL_coarse_particles.parquet")
+    write_table(coarse_scores, out / "FULL_coarse_scores.parquet")
+    write_table(params, out / "FULL_particle_parameters.parquet")
+    write_table(weights, out / "FULL_particle_weights.parquet")
+    write_table(particle_scores, out / "FULL_particle_scores.parquet")
+    write_table(pd.DataFrame(adaptation_rows), out / "FULL_smc_adaptation_log.parquet")
+    write_table(pd.DataFrame(early_rows), out / "FULL_early_rejection_log.parquet")
+    final_noise = _mc_noise_report(params, weights, artifacts, obs, int(cells), seed, workers=worker_count)
+    final_noise["round"] = "final"
+    if mc_rows:
+        write_table(pd.concat([*mc_rows, final_noise], ignore_index=True), out / "FULL_monte_carlo_noise_report.csv")
+    else:
+        write_table(final_noise, out / "FULL_monte_carlo_noise_report.csv")
+    _progress(f"full SMC writing accepted particle histories: output={out / 'FULL_particles_final.zarr'}")
+    _write_particle_zarr(out / "FULL_particles_final.zarr", params, weights, artifacts, obs, accepted_only=True, cells=int(cells), seed=seed, workers=worker_count)
+    _progress(f"full SMC writing replay histories: output={out / 'FULL_replay_histories.zarr'}")
+    _write_particle_zarr(
+        out / "FULL_replay_histories.zarr",
+        params,
+        weights,
+        artifacts,
+        obs,
+        accepted_only=True,
+        replay=True,
+        cells=_replay_cell_count(int(cells)),
+        seed=seed + 10_000,
+        replay_repetitions=_replay_repetitions(int(cells)),
+        workers=worker_count,
+    )
     write_json(
         out / "full_reconstruction_manifest.json",
         {
-            "schema_version": 1,
             "method_source": "markdown/fit_method.md",
-            "mode": "conditional_single_cell_history_particle_ensemble",
-            "particles": int(particles),
-            "cells_per_particle": int(cells),
-            "method_n_sim_fit": METHOD_N_SIM_FIT,
-            "method_n_sim_replay": METHOD_N_SIM_REPLAY,
-            "representative_cell_weighting": "simulated cells carry population_weight when real cell count exceeds N_sim_fit",
-            "smc_steps": int(smc_steps),
-            "accepted_particles": sorted(int(pid) for pid in accepted_ids),
-            "obs_params_locked": bool(obs_params.get("locked_for_full")),
-            "full_v4_chain_policy": "cell X/U/R/V and event-rate proposals are refreshed through HybridOgataSimulator/core.dynamics",
-            "full_continue_diagnostics": full_diagnostics,
+            "fit_mask": schemas.FIT_MASK,
+            "method_defaults": {
+                "moment_n_candidates": METHOD_MOMENT_CANDIDATES,
+                "moment_keep_top": METHOD_MOMENT_KEEP_TOP,
+                "coarse_n_particles": METHOD_COARSE_PARTICLES,
+                "coarse_n_sim_cells": METHOD_COARSE_CELLS,
+                "standard_n_particles_initial": METHOD_FULL_PARTICLES_INITIAL,
+                "standard_n_particles_final": METHOD_FULL_PARTICLES_FINAL,
+                "n_sim_cells_fit": METHOD_N_SIM_FIT,
+                "n_sim_cells_replay": METHOD_N_SIM_REPLAY,
+                "fitting_simulator_dt": 0.20,
+                "workers": worker_count,
+            },
+            "smc_features": ["moment_prescreen", "coarse_full", "adaptive_tolerance", "adaptive_proposal", "early_rejection", "blockwise_update", "common_random_numbers", "monte_carlo_noise_controller", "hard_gate_no_fallback", "core_full_simulator_replay", "threaded_particle_evaluation"],
+            "active_controls_only": ["net_growth_rate", "bulk_copy_velocity", "flow3_projection_bias"],
+            "nuisance_not_data_identified": ["division_death_turnover", "ecDNA_gain_loss_turnover", "hidden_npc_opc_split"],
+            "initial_copy_distribution": "mean-matched ZINB prior; current data do not directly identify single-cell copy-number shape",
         },
     )
+    _progress(f"full SMC done: output={out}")
     return {name: out / name for name in schemas.FULL_OUTPUTS}
 
 
 def aggregate_accepted_histories(full_dir: str | Path, output_dir: str | Path | None = None) -> pd.DataFrame:
-    base = Path(full_dir)
-    weights = pd.read_parquet(base / "particle_weights.parquet")
-    scenarios = pd.read_parquet(base / "scenario_classes.parquet")
-    accepted = weights[weights["accepted"]].merge(scenarios, on="particle_id", how="left")
-    summary = (
-        accepted.groupby("scenario_class", as_index=False)
-        .agg(posterior_weight=("weight", "sum"), particles=("particle_id", "nunique"), median_score=("score", "median"))
-        .sort_values("posterior_weight", ascending=False)
+    weights = pd.read_parquet(Path(full_dir) / "FULL_particle_weights.parquet")
+    summary = pd.DataFrame(
+        {
+            "scenario_class": ["bulk-compatible-history-ensemble"],
+            "posterior_weight": [float(weights.loc[weights["accepted"], "weight"].sum())],
+            "particles": [int(weights["accepted"].sum())],
+            "median_score": [float(weights.loc[weights["accepted"], "score"].median()) if weights["accepted"].any() else float(weights["score"].median())],
+        }
     )
     if output_dir is not None:
-        out = ensure_dir(output_dir)
-        write_table(summary, out / "accepted_history_summary.parquet")
+        write_table(summary, ensure_dir(output_dir) / "accepted_history_summary.parquet")
     return summary
 
 
-def _sampler_strata(sampler: dict) -> list[tuple[str, str]]:
-    keys = sampler.get("state_probabilities_by_stratum", {})
-    if not keys:
-        return [("ctrl", "r1")]
-    strata = []
-    for key in sorted(keys):
-        condition, replicate = str(key).split("|", 1)
-        strata.append((condition, replicate))
-    return strata
-
-
-def _target_strata(target: pd.DataFrame, sampler: dict) -> list[tuple[str, str]]:
-    if {"condition", "replicate"}.issubset(target.columns):
-        subset = target[["condition", "replicate"]].dropna().drop_duplicates()
-        if not subset.empty:
-            return [(str(row.condition), str(row.replicate)) for row in subset.itertuples(index=False)]
-    return _sampler_strata(sampler)
-
-
-def _initial_population_weight(target: pd.DataFrame, condition: str, replicate: str, initial_week: int, cells: int) -> float:
-    if "channel" not in target:
-        return 1.0
-    subset = target[
-        (target["channel"] == "cell_count")
-        & (target["variable"] == "total_cell_count")
-        & (target["week"] == initial_week)
-        & (target["condition"].astype(str) == str(condition))
-        & (target["replicate"].astype(str) == str(replicate))
-    ]
-    if subset.empty:
-        return 1.0
-    total = float(subset["target"].astype(float).median())
-    return float(max(1.0, total / max(1, int(cells))))
-
-
-def _make_v4_simulator(rng: np.random.Generator) -> HybridOgataSimulator:
-    seed = int(rng.integers(0, np.iinfo(np.int32).max))
-    event_seed, observation_seed = np.random.SeedSequence(seed).spawn(2)
-    return HybridOgataSimulator(
-        params=cfg.DEFAULT_MODEL_PARAMETERS,
-        observation_params=cfg.DEFAULT_OBSERVATION_PARAMETERS,
-        seed=seed,
-        event_rng=np.random.default_rng(event_seed),
-        observation_rng=np.random.default_rng(observation_seed),
-    )
-
-
-def _simulate_and_score_particle(
-    particle_id: int,
-    params: dict,
-    artifacts: dict,
-    obs_params: dict,
-    weeks: list[int],
-    cells: int,
-    rng: np.random.Generator,
-) -> ParticleResult:
-    if not bool(obs_params.get("locked_for_full")):
-        raise ValueError("Full particle scoring requires locked observation parameters")
-    snapshots = []
-    history_rows = []
-    event_rows = []
-    biology_penalty = 0.0
-    simulator = _make_v4_simulator(rng)
-    for stratum_index, (condition, replicate) in enumerate(_target_strata(artifacts["target"], artifacts["sampler"])):
-        population_weight = _initial_population_weight(artifacts["target"], condition, replicate, weeks[0], cells)
-        population = _sample_initial_population(
-            artifacts["sampler"],
-            cells,
-            rng,
-            particle_id,
-            condition,
-            replicate,
-            stratum_index * int(cells) * 1000,
-            population_weight=population_weight,
-            simulator=simulator,
-        )
-        last_week = weeks[0]
-        for week in weeks:
-            if week != last_week:
-                population, interval_events, penalty = _advance_population(population, last_week, week, params, rng, simulator)
-                biology_penalty += penalty
-                event_rows.extend(interval_events)
-            for cell in population:
-                history_rows.append(_history_row(particle_id, week, cell))
-            snapshots.append(_summarize_population(particle_id, week, population, artifacts["sampler"], condition, replicate))
-            last_week = week
-    events = _event_summary(particle_id, event_rows, weeks)
-    snapshot_df = pd.concat(snapshots, ignore_index=True)
-    features = _features_from_snapshots(snapshot_df, artifacts["target"], artifacts["sampler"], events)
-    score = score_particle_summary(features, artifacts["target"], artifacts["distance_weights"], params, biology_penalty)
-    return ParticleResult(particle_id, params, snapshot_df, features, events, history_rows, score)
-
-
-def _sample_particle_parameters(prior_scales: dict, rng: np.random.Generator, particle_id: int) -> dict:
-    transition = abs(rng.normal(0.06, float(prior_scales.get("state_transition_scale", 0.05))))
-    gain = abs(rng.normal(0.04, 0.5 * float(prior_scales.get("copy_gain_scale", 0.1))))
-    loss = abs(rng.normal(0.03, 0.5 * float(prior_scales.get("copy_loss_scale", 0.1))))
-    return {
-        "particle_id": int(particle_id),
-        "state_transition_rate": float(min(0.5, transition)),
-        "copy_gain_rate": float(min(0.5, gain)),
-        "copy_loss_rate": float(min(0.5, loss)),
-        "division_rate": float(min(0.2, abs(rng.normal(0.03, float(prior_scales.get("division_scale", 0.05)))))),
-        "death_rate": float(min(0.2, abs(rng.normal(0.015, float(prior_scales.get("death_scale", 0.02)))))),
-        "segregation_strength": float(min(1.0, abs(rng.normal(0.1, float(prior_scales.get("segregation_scale", 0.1)))))),
-        "cycle_transition_scale": float(min(1.0, abs(rng.normal(0.25, 0.10)))),
-    }
-
-
-def _perturb_particle_parameters(parent: dict, rng: np.random.Generator, particle_id: int) -> dict:
-    perturbed: dict[str, float | int] = {"particle_id": int(particle_id)}
-    for key in ("state_transition_rate", "copy_gain_rate", "copy_loss_rate", "division_rate", "death_rate", "segregation_strength", "cycle_transition_scale"):
-        base = float(parent.get(key, 0.05))
-        scale = 0.25 * max(base, 0.02)
-        upper = 1.0 if key == "segregation_strength" else 0.5
-        perturbed[key] = float(np.clip(rng.normal(base, scale), 0.0, upper))
-    return perturbed
-
-
-def _sample_initial_population(
-    sampler: dict,
-    cells: int,
-    rng: np.random.Generator,
-    particle_id: int,
-    condition: str = "ctrl",
-    replicate: str = "r1",
-    cell_id_offset: int = 0,
-    population_weight: float = 1.0,
-    simulator: HybridOgataSimulator | None = None,
-) -> list[dict]:
-    states = list(sampler["states"])
-    stratum_key = f"{condition}|{replicate}"
-    state_prob_source = sampler.get("state_probabilities_by_stratum", {}).get(stratum_key, sampler["state_probabilities"])
-    state_probs = np.asarray([state_prob_source[state] for state in states], dtype=float)
-    state_probs = schemas.normalize_probabilities(state_probs, name="state_probabilities")
-    population = []
-    for cell_id in range(int(cells)):
-        state = str(rng.choice(states, p=state_probs))
-        species_uniforms = _species_uniforms(sampler, state, rng)
-        copies = {}
-        for species, uniform in zip(sampler["species"], species_uniforms):
-            dist = sampler["state_species_copy_distributions"][state][species]
-            labels = list(dist["bin_labels"])
-            probs = schemas.normalize_probabilities(dist["probabilities"], name=f"{state}-{species}")
-            label = _sample_label_by_uniform(labels, probs, float(uniform))
-            tail_mean = sampler.get("state_species_tail_means", {}).get(state, {}).get(species)
-            copies[species] = _sample_copy_from_label(label, sampler["copy_number_bins"], rng, tail_mean)
-        soft = _soft_state_for_gate(state, rng)
-        soft_values = np.asarray([soft[state_name] for state_name in schemas.STATE_NAMES], dtype=float)
-        cell = {
-            "particle_id": int(particle_id),
-            "condition": condition,
-            "replicate": replicate,
-            "cell_id": int(cell_id_offset + cell_id),
-            "parent_id": -1,
-            "state_gate": state,
-            "soft_state": soft,
-            "latent_state": cfg.ilr(soft_values).tolist(),
-            "copies": copies,
-            "cycle_state": cfg.CYCLE_NAMES[cfg.sample_initial_cycle_state(rng, cfg.DEFAULT_INITIALIZATION_PARAMETERS)],
-            "age": cfg.sample_initial_age(rng, cfg.DEFAULT_INITIALIZATION_PARAMETERS),
-            "stress_score": 0.0,
-            "survival_score": 0.0,
-            "population_weight": float(population_weight),
-            "alive": True,
-        }
-        _refresh_full_chain_state(cell, 0.0, rng, duration=0.0, simulator=simulator)
-        population.append(cell)
-    return population
-
-
-def _species_uniforms(sampler: dict, state: str, rng: np.random.Generator) -> np.ndarray:
-    from scipy.stats import norm
-
-    species = list(sampler["species"])
-    corr = np.asarray(sampler.get("species_correlation_by_state", {}).get(state, np.eye(len(species))), dtype=float)
-    if corr.shape != (len(species), len(species)):
-        corr = np.eye(len(species), dtype=float)
-    corr = 0.5 * (corr + corr.T)
-    np.fill_diagonal(corr, 1.0)
-    values = rng.multivariate_normal(np.zeros(len(species)), corr, check_valid="warn")
-    return norm.cdf(values)
-
-
-def _sample_label_by_uniform(labels: list[str], probabilities: np.ndarray, uniform: float) -> str:
-    cumulative = np.cumsum(probabilities)
-    index = int(np.searchsorted(cumulative, min(max(uniform, 0.0), 1.0), side="right"))
-    index = min(index, len(labels) - 1)
-    return str(labels[index])
-
-
-def _sample_copy_from_label(label: str, bins: list[dict], rng: np.random.Generator, tail_mean: float | None = None) -> int:
-    item = next(item for item in bins if str(item["label"]) == str(label))
-    low = int(item["low"])
-    high = item["high"]
-    if high is None:
-        target_mean = max(float(low), float(tail_mean) if tail_mean is not None else float(low * 1.5))
-        probability = float(np.clip(1.0 / max(1.0, target_mean - low + 1.0), 1e-6, 1.0))
-        return int(low + rng.geometric(probability) - 1)
-    if low == int(high):
-        return low
-    return int(rng.integers(low, int(high) + 1))
-
-
-def _advance_population(
-    population: list[dict],
-    start_week: int,
-    end_week: int,
-    params: dict,
-    rng: np.random.Generator,
-    simulator: HybridOgataSimulator | None = None,
-) -> tuple[list[dict], list[dict], float]:
-    steps = max(1, int(end_week - start_week))
-    events = []
-    penalty = 0.0
-    next_id = max(int(cell["cell_id"]) for cell in population) + 1 if population else 0
-    for step in range(steps):
-        current_week = start_week + step
-        new_population = []
-        for cell in population:
-            if not cell.get("alive", True):
-                continue
-            working = _copy_cell(cell)
-            chain = _refresh_full_chain_state(working, float(current_week), rng, duration=1.0, simulator=simulator)
-            event_rates = chain["event_rates"]
-            death_probability = float(np.clip(params["death_rate"] + event_rates.get("death", 0.0), 0.0, 0.95))
-            if rng.random() < death_probability:
-                events.append(_event_row(params["particle_id"], current_week, "death", None, 1, condition=cell.get("condition", ""), replicate=cell.get("replicate", "")))
-                continue
-            _maybe_apply_cycle_transition(working, event_rates, params, rng)
-            generator = chain["transition_generator"]
-            from_index = list(schemas.STATE_NAMES).index(working["state_gate"])
-            transition_rates = np.clip(generator[from_index, :], 0.0, None)
-            transition_probability = float(np.clip(params["state_transition_rate"] * max(1.0, transition_rates.sum()), 0.0, 0.75))
-            if rng.random() < transition_probability:
-                old_state = working["state_gate"]
-                candidates = [to_state for from_state, to_state in ALLOWED_TRANSITIONS if from_state == old_state]
-                if candidates:
-                    candidate_indices = [list(schemas.STATE_NAMES).index(to_state) for to_state in candidates]
-                    weights = transition_rates[candidate_indices]
-                    if float(weights.sum()) <= 0.0:
-                        weights = np.ones(len(candidate_indices), dtype=float)
-                    weights = weights / weights.sum()
-                    working["state_gate"] = str(rng.choice(candidates, p=weights))
-                    working["soft_state"] = _soft_state_for_gate(working["state_gate"], rng)
-                    soft_values = np.asarray([working["soft_state"][state] for state in schemas.STATE_NAMES], dtype=float)
-                    working["latent_state"] = cfg.ilr(soft_values).tolist()
-                    events.append(
-                        _event_row(
-                            params["particle_id"],
-                            current_week,
-                            "transition",
-                            None,
-                            1,
-                            old_state,
-                            working["state_gate"],
-                            condition=working.get("condition", ""),
-                            replicate=working.get("replicate", ""),
-                        )
-                    )
-            for species in schemas.SPECIES:
-                gain_probability = float(np.clip(params["copy_gain_rate"] + event_rates.get(f"gain_{species}", 0.0), 0.0, 0.95))
-                if rng.random() < gain_probability:
-                    increment = int(max(1, rng.poisson(2)))
-                    working["copies"][species] += increment
-                    events.append(_event_row(params["particle_id"], current_week, "gain", species, increment, condition=working.get("condition", ""), replicate=working.get("replicate", "")))
-                loss_probability = float(np.clip(params["copy_loss_rate"] + event_rates.get(f"loss_{species}", 0.0), 0.0, 0.95))
-                if working["copies"][species] > 0 and rng.random() < loss_probability:
-                    working["copies"][species] -= 1
-                    events.append(_event_row(params["particle_id"], current_week, "loss", species, 1, condition=working.get("condition", ""), replicate=working.get("replicate", "")))
-            new_population.append(working)
-            division_probability = float(np.clip(params["division_rate"] + event_rates.get("division", 0.0), 0.0, 0.75))
-            if rng.random() < division_probability:
-                daughter = _copy_cell(working)
-                daughter["parent_id"] = int(working["cell_id"])
-                daughter["cell_id"] = int(next_id)
-                daughter["age"] = 0.0
-                working["age"] = 0.0
-                next_id += 1
-                for species in schemas.SPECIES:
-                    if rng.random() < params["segregation_strength"]:
-                        delta = int(rng.choice([-1, 1]))
-                        daughter["copies"][species] = max(0, daughter["copies"][species] + delta)
-                _refresh_full_chain_state(working, float(current_week), rng, duration=0.0, simulator=simulator)
-                _refresh_full_chain_state(daughter, float(current_week), rng, duration=0.0, simulator=simulator)
-                new_population.append(daughter)
-                events.append(_event_row(params["particle_id"], current_week, "division", None, 1, condition=working.get("condition", ""), replicate=working.get("replicate", "")))
-        if not new_population:
-            penalty += 100.0
-            new_population = population[:1]
-        if len(new_population) > 4 * max(1, len(population)):
-            penalty += float(len(new_population))
-            new_population = new_population[: 4 * max(1, len(population))]
-        population = new_population
-    return population, events, penalty
-
-
-def _refresh_full_chain_state(
-    cell: dict,
-    week: float,
-    rng: np.random.Generator,
-    *,
-    duration: float,
-    simulator: HybridOgataSimulator | None = None,
-) -> dict:
-    """Refresh X/U/R/V and event-rate proposals through the v4 simulator kernel."""
-
-    active_simulator = simulator or _make_v4_simulator(rng)
-    core_cell = _to_core_cell(cell)
-    core_cell.last_update_time = float(week)
-    core_cell.last_D_C = float(cell.get("last_D_C", active_simulator.params.exposure.D_C0))
-    core_cell.last_D_P = float(cell.get("last_D_P", active_simulator.params.exposure.D_P0))
-    if duration > 0.0:
-        context = active_simulator.advance_cell_to_time(core_cell, float(week) + float(duration), rng)
-    else:
-        context = active_simulator.build_context(float(week), core_cell.last_D_C, core_cell.last_D_P)
-    derived = dyn.compute_derived_quantities(core_cell, context, active_simulator.params)
-    if duration == 0.0:
-        core_cell.stress_score = float(dyn.compute_stress_attractor(core_cell, derived, context, active_simulator.params))
-        core_cell.survival_score = float(dyn.compute_survival_attractor(core_cell, derived, context, active_simulator.params))
-    event_rates = dyn.compute_all_event_rates(core_cell, derived, context, active_simulator.params)
-    transition_generator = dyn.compute_local_transition_generator(derived.logits, active_simulator.params)
-    cell["soft_state"] = dict(zip(schemas.STATE_NAMES, core_cell.soft_state.astype(float).tolist()))
-    cell["latent_state"] = core_cell.latent_state.astype(float).tolist()
-    cell["stress_score"] = float(core_cell.stress_score)
-    cell["survival_score"] = float(core_cell.survival_score)
-    cell["cycle_state"] = cfg.CYCLE_NAMES[int(core_cell.cycle_state)]
-    cell["age"] = float(core_cell.age)
-    cell["last_D_C"] = float(core_cell.last_D_C)
-    cell["last_D_P"] = float(core_cell.last_D_P)
-    cell["full_chain_policy"] = "HybridOgataSimulator"
-    return {"event_rates": event_rates, "transition_generator": transition_generator}
-
-
-def _to_core_cell(cell: dict) -> Cell:
-    soft = np.asarray([cell.get("soft_state", {}).get(state, 0.0) for state in schemas.STATE_NAMES], dtype=float)
-    soft = schemas.normalize_probabilities(soft + 1e-9, name="soft_state")
-    latent = np.asarray(cell.get("latent_state", cfg.ilr(soft).tolist()), dtype=float)
-    if latent.shape != (cfg.LATENT_DIM,):
-        latent = cfg.ilr(soft)
-    copy_numbers = np.asarray([int(cell["copies"][species]) for species in schemas.SPECIES], dtype=int)
-    return Cell(
-        cycle_state=_cycle_index(str(cell.get("cycle_state", "G1"))),
-        copy_numbers=copy_numbers,
-        latent_state=latent,
-        soft_state=soft,
-        stress_score=float(cell.get("stress_score", 0.0)),
-        survival_score=float(cell.get("survival_score", 0.0)),
-        age=float(cell.get("age", 0.0)),
-        cell_id=int(cell.get("cell_id", 0)),
-        parent_id=None if int(cell.get("parent_id", -1)) < 0 else int(cell.get("parent_id", -1)),
-    )
-
-
-def _maybe_apply_cycle_transition(cell: dict, event_rates: dict[str, float], params: dict, rng: np.random.Generator) -> None:
-    cycle_edges = {
-        "G1_to_S": "S",
-        "G1_to_Q": "Q",
-        "Q_to_G1": "G1",
-        "S_to_G2M": "G2M",
-    }
-    for event_name, to_cycle in cycle_edges.items():
-        probability = float(np.clip(event_rates.get(event_name, 0.0) * (1.0 + params.get("cycle_transition_scale", 0.0)), 0.0, 0.75))
-        if rng.random() < probability:
-            cell["cycle_state"] = to_cycle
-            return
-
-
-def _cycle_index(cycle_state: str) -> int:
-    if cycle_state in cfg.CYCLE_INDEX:
-        return int(cfg.CYCLE_INDEX[cycle_state])
-    return int(cfg.G1)
-
-
-def _copy_cell(cell: dict) -> dict:
-    return {
-        "particle_id": int(cell["particle_id"]),
-        "condition": str(cell.get("condition", "ctrl")),
-        "replicate": str(cell.get("replicate", "r1")),
-        "cell_id": int(cell["cell_id"]),
-        "parent_id": int(cell.get("parent_id", -1)),
-        "state_gate": str(cell["state_gate"]),
-        "soft_state": dict(cell["soft_state"]),
-        "latent_state": list(cell.get("latent_state", [0.0, 0.0, 0.0])),
-        "copies": {species: int(cell["copies"][species]) for species in schemas.SPECIES},
-        "cycle_state": str(cell.get("cycle_state", "G1")),
-        "age": float(cell.get("age", 0.0)) + 1.0,
-        "stress_score": float(cell.get("stress_score", 0.0)),
-        "survival_score": float(cell.get("survival_score", 1.0)),
-        "population_weight": float(cell.get("population_weight", 1.0)),
-        "last_D_C": float(cell.get("last_D_C", 0.0)),
-        "last_D_P": float(cell.get("last_D_P", 0.0)),
-        "alive": bool(cell.get("alive", True)),
-    }
-
-
-def _soft_state_for_gate(state: str, rng: np.random.Generator | None = None) -> dict[str, float]:
-    if rng is None:
-        values = np.full(len(schemas.STATE_NAMES), 0.05 / (len(schemas.STATE_NAMES) - 1), dtype=float)
-        values[list(schemas.STATE_NAMES).index(state)] = 0.95
-    else:
-        concentration = np.ones(len(schemas.STATE_NAMES), dtype=float)
-        concentration[list(schemas.STATE_NAMES).index(state)] = 35.0
-        values = rng.dirichlet(concentration)
-    return dict(zip(schemas.STATE_NAMES, values.tolist()))
-
-
-def _summarize_population(particle_id: int, week: int, population: list[dict], sampler: dict, condition: str, replicate: str) -> pd.DataFrame:
+def _candidate_parameter_table(artifacts: dict, prior: pd.DataFrame, rng: np.random.Generator, n_candidates: int) -> pd.DataFrame:
+    centers = _centers(artifacts)
     rows = []
-    pop_size = max(1, len(population))
-    population_weights = np.asarray([float(cell.get("population_weight", 1.0)) for cell in population], dtype=float)
-    represented_pop_size = float(np.sum(population_weights)) if population_weights.size else float(pop_size)
-    for state in schemas.STATE_NAMES:
-        state_cells = [cell for cell in population if cell["state_gate"] == state]
-        state_weights = np.asarray([float(cell.get("population_weight", 1.0)) for cell in state_cells], dtype=float)
-        state_weight_total = float(np.sum(state_weights))
-        fraction = state_weight_total / max(1e-9, represented_pop_size)
-        for species in schemas.SPECIES:
-            values = np.asarray([cell["copies"][species] for cell in state_cells], dtype=float)
-            if values.size == 0:
-                values = np.asarray([0.0])
-                weighted_values = np.asarray([1.0], dtype=float)
-                state_weight_total_for_species = 1.0
-                n_state_cells = 0
-            else:
-                weighted_values = state_weights
-                state_weight_total_for_species = max(1e-9, state_weight_total)
-                n_state_cells = len(state_cells)
-            bins = sampler["copy_number_bins"]
-            labels = [schemas.assign_copy_bin(value, bins) for value in values]
-            top_label = str(bins[-1]["label"])
-            copy_mean = float(np.average(values, weights=weighted_values))
-            copy_variance = float(np.average((values - copy_mean) ** 2, weights=weighted_values))
-            row = {
-                "particle_id": particle_id,
-                "week": int(week),
-                "condition": condition,
-                "replicate": replicate,
-                "state_gate": state,
-                "species": species,
-                "flow_fraction": float(fraction),
-                "copy_mean": copy_mean,
-                "copy_variance": copy_variance,
-                "zero_fraction": float(np.sum(weighted_values[values == 0]) / state_weight_total_for_species),
-                "tail_fraction": float(np.sum(weighted_values[np.asarray(labels) == top_label]) / state_weight_total_for_species),
-                "n_cells": int(n_state_cells),
-                "population_size": int(pop_size),
-                "represented_population_size": represented_pop_size,
-            }
-            label_values = np.asarray(labels, dtype=str)
-            for item in bins:
-                label = str(item["label"])
-                row[_bin_probability_column(label)] = float(np.sum(weighted_values[label_values == label]) / state_weight_total_for_species)
-            rows.append(row)
+    for particle_id in range(int(n_candidates)):
+        prior_row = prior.iloc[int(rng.integers(0, len(prior)))] if len(prior) else {}
+        row = {"particle_id": particle_id, "random_stream_id": particle_id}
+        for name, center in centers.items():
+            scale = 0.10 if name.startswith("r__") else 0.08
+            lo, hi = _active_bounds(name)
+            row[name] = float(np.clip(center + rng.normal(0.0, scale), lo, hi))
+        row["division_death_turnover"] = float(getattr(prior_row, "division_death_turnover", rng.lognormal(0.0, 0.75)))
+        row["ecDNA_gain_loss_turnover"] = float(getattr(prior_row, "ecDNA_gain_loss_turnover", rng.lognormal(0.0, 0.75)))
+        row["hidden_npc_opc_split"] = float(rng.beta(2, 2))
+        row["D_prior"] = _prior_distance(row, artifacts)
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
-def _features_from_snapshots(snapshot: pd.DataFrame, target: pd.DataFrame, sampler: dict, events: pd.DataFrame | None = None) -> pd.DataFrame:
-    feature_rows = []
-    event_table = pd.DataFrame() if events is None else events
-    snapshot_index = {
-        (row.week, row.condition, row.replicate, row.state_gate, row.species): row
-        for row in snapshot.itertuples(index=False)
-    }
-    for row in target.itertuples(index=False):
-        channel = str(row.channel)
-        variable = str(row.variable)
-        if channel == "flow":
-            matches = snapshot[
-                (snapshot["week"] == row.week)
-                & (snapshot["condition"] == row.condition)
-                & (snapshot["replicate"] == row.replicate)
-                & (snapshot["state_gate"] == row.state_gate)
-            ]
-            value = float(matches["flow_fraction"].iloc[0]) if not matches.empty else 0.0
-        elif channel == "ectag":
-            key = (row.week, row.condition, row.replicate, row.state_gate, row.species)
-            snap = snapshot_index.get(key)
-            if snap is None:
-                value = 0.0
+def _score_candidate_moments(candidates: pd.DataFrame, artifacts: dict, workers: int = 1) -> pd.DataFrame:
+    chunks = _dataframe_chunks(candidates, _resolve_workers(workers, len(candidates)))
+    scored = _parallel_map(lambda chunk: _score_candidate_moments_chunk(chunk, artifacts), chunks, workers)
+    return pd.concat(scored, ignore_index=True) if scored else pd.DataFrame(columns=["particle_id", "D_moment", "D_count", "D_ddPCR", "D_flow3", "D_prior", "D_biology"])
+
+
+def _score_candidate_moments_chunk(candidates: pd.DataFrame, artifacts: dict) -> pd.DataFrame:
+    rows = []
+    centers = _centers(artifacts)
+    for _, row in candidates.iterrows():
+        d_count = 0.0
+        d_copy = 0.0
+        for name, center in centers.items():
+            value = float(row.get(name, center))
+            if name.startswith("r__"):
+                d_count += ((value - center) / 0.25) ** 2
+            elif name.startswith("v__"):
+                d_copy += ((value - center) / 0.20) ** 2
+        row_dict = row.to_dict()
+        d_prior = _prior_distance(row_dict, artifacts)
+        d_biology = _biology_distance(row_dict)
+        rows.append({"particle_id": int(row["particle_id"]), "D_moment": d_count + d_copy + d_prior + d_biology, "D_count": d_count, "D_ddPCR": d_copy, "D_flow3": 0.0, "D_prior": d_prior, "D_biology": d_biology})
+    return pd.DataFrame(rows)
+
+
+def _load_moment_particles(moment_dir: str | Path | None, artifacts: dict, rng: np.random.Generator, particles: int) -> pd.DataFrame:
+    if moment_dir is not None and (Path(moment_dir) / "MOMENT_keep_top_particles.parquet").exists():
+        table = pd.read_parquet(Path(moment_dir) / "MOMENT_keep_top_particles.parquet")
+        if len(table):
+            return table.head(int(particles)).copy()
+    prior = pd.DataFrame({"particle_id": range(int(particles)), "D_prior": np.zeros(int(particles))})
+    return _candidate_parameter_table(artifacts, prior, rng, particles)
+
+
+def _centers(artifacts: dict) -> dict[str, float]:
+    result = {}
+    growth = artifacts["growth_velocity"]
+    for (condition, phase), group in growth.groupby(["condition", "phase"], dropna=False):
+        result[f"r__{condition}__p{int(phase)}"] = float(group["r_center"].astype(float).median())
+    copy = artifacts["copy_velocity"]
+    for (condition, species, phase), group in copy.groupby(["condition", "species", "phase"], dropna=False):
+        result[f"v__{condition}__{species}__p{int(phase)}"] = float(group["v_center"].astype(float).median())
+    for phase in schemas.PHASES:
+        result[f"zeta_flow3__p{phase}"] = 0.0
+    return result
+
+
+def _propose_round(current: pd.DataFrame, artifacts: dict, rng: np.random.Generator, particles: int, smc_round: int, proposal_scale: dict[str, float]) -> pd.DataFrame:
+    centers = _centers(artifacts)
+    rows = []
+    block = _block_for_round(smc_round)
+    for local_id in range(int(particles)):
+        parent = current.iloc[int(rng.integers(0, len(current)))] if len(current) else pd.Series(dtype=float)
+        row = {
+            "particle_id": smc_round * int(particles) + local_id,
+            "round": smc_round,
+            "random_stream_id": int(parent.get("random_stream_id", parent.get("particle_id", local_id))),
+            "updated_block": block,
+        }
+        for name, center in centers.items():
+            base = float(parent.get(name, center))
+            lo, hi = _active_bounds(name)
+            if _name_in_block(name, block):
+                scale = 0.05 * _scale_for_name(name, proposal_scale)
+                row[name] = float(np.clip(base + rng.standard_t(5) * scale, lo, hi))
             else:
-                value = _histogram_probability_from_snapshot(snap, row.bin_label)
-        elif channel in {"qpcdr", "ddpcr", "lite_summary"}:
-            if channel == "ddpcr":
-                value = _pooled_mean_from_snapshot(snapshot, row.week, row.condition, row.replicate, row.species)
-            elif channel == "lite_summary" and variable == "transition_probability":
-                value = _transition_probability_from_events(snapshot, event_table, row)
-            elif channel == "lite_summary" and variable == "growth_summary":
-                value = _growth_summary_from_snapshots(snapshot, row)
-            else:
-                key = (row.week, row.condition, row.replicate, row.state_gate, row.species)
-                snap = snapshot_index.get(key)
-                value = float(getattr(snap, _snapshot_column(variable), 0.0)) if snap is not None else 0.0
-        elif channel == "cell_count":
-            matches = snapshot[
-                (snapshot["week"] == row.week)
-                & (snapshot["condition"] == row.condition)
-                & (snapshot["replicate"] == row.replicate)
-            ]
-            if matches.empty:
-                value = 0.0
-            elif "represented_population_size" in matches:
-                value = float(matches["represented_population_size"].astype(float).max())
-            else:
-                value = float(matches["population_size"].astype(float).max())
-        else:
-            value = 0.0
-        feature_rows.append({"feature_id": row.feature_id, "value": float(value)})
-    return pd.DataFrame(feature_rows)
+                row[name] = float(np.clip(base, lo, hi))
+        row["division_death_turnover"] = float(parent.get("division_death_turnover", rng.lognormal(0.0, 0.75)))
+        row["ecDNA_gain_loss_turnover"] = float(parent.get("ecDNA_gain_loss_turnover", rng.lognormal(0.0, 0.75)))
+        row["hidden_npc_opc_split"] = float(np.clip(parent.get("hidden_npc_opc_split", rng.beta(2, 2)), 0.0, 1.0))
+        row["D_prior"] = _prior_distance(row, artifacts)
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
-def _transition_probability_from_events(snapshot: pd.DataFrame, events: pd.DataFrame, row) -> float:
-    from_state = str(row.from_state)
-    to_state = str(row.to_state)
-    state_snapshot = snapshot[
-        (snapshot["week"] == row.week)
-        & (snapshot["condition"] == row.condition)
-        & (snapshot["replicate"] == row.replicate)
-        & (snapshot["state_gate"] == from_state)
-    ]
-    n_from = float(state_snapshot["n_cells"].max()) if not state_snapshot.empty else 0.0
-    if n_from <= 0.0:
-        return 1.0 if from_state == to_state else 0.0
-    if events.empty:
-        return 1.0 if from_state == to_state else 0.0
-    transitions = events[
-        (events["week"] == row.week)
-        & (events["condition"] == row.condition)
-        & (events["replicate"] == row.replicate)
-        & (events["event_type"] == "transition")
-        & (events["from_state"] == from_state)
-    ]
-    if from_state == to_state:
-        moved = float(transitions["count"].sum()) if not transitions.empty else 0.0
-        return float(np.clip(1.0 - moved / n_from, 0.0, 1.0))
-    count = float(transitions.loc[transitions["to_state"] == to_state, "count"].sum()) if not transitions.empty else 0.0
-    return float(np.clip(count / n_from, 0.0, 1.0))
+def _with_prior_distance(params: pd.DataFrame, artifacts: dict) -> pd.DataFrame:
+    result = params.copy()
+    if result.empty:
+        return result
+    result["D_prior"] = [_prior_distance(row.to_dict(), artifacts) for _, row in result.iterrows()]
+    if "random_stream_id" not in result:
+        result["random_stream_id"] = result["particle_id"].astype(int) if "particle_id" in result else range(len(result))
+    return result
 
 
-def _growth_summary_from_snapshots(snapshot: pd.DataFrame, row) -> float:
-    state = str(row.state_gate)
-    current = snapshot[
-        (snapshot["week"] == row.week)
-        & (snapshot["condition"] == row.condition)
-        & (snapshot["replicate"] == row.replicate)
-        & (snapshot["state_gate"] == state)
-    ]
-    if current.empty:
-        return 0.0
-    later_weeks = sorted(
-        int(value)
-        for value in snapshot.loc[
-            (snapshot["week"] > row.week) & (snapshot["condition"] == row.condition) & (snapshot["replicate"] == row.replicate),
-            "week",
-        ].unique()
+def _score_proposed_particle(task: tuple[dict, dict, dict, float, int, int, int]) -> tuple[dict, list[dict]]:
+    param_dict, artifacts, obs, epsilon, cells, seed, smc_round = task
+    param = pd.Series(param_dict)
+    score_params = dict(param_dict)
+    score_params["D_prior"] = float(score_params.get("D_prior", _prior_distance(score_params, artifacts)))
+    score_params["D_biology"] = _biology_distance(score_params)
+    screen_rows, screen_score = _early_rejection_screen(param, artifacts, obs, epsilon, score_params)
+    if screen_score is not None:
+        return (
+            {
+                "particle_id": int(param_dict["particle_id"]),
+                "round": int(smc_round),
+                "score": screen_score["score"],
+                "early_rejected": True,
+                "simulated_full": False,
+                **{f"D_{k}": v for k, v in screen_score["contributions"].items()},
+            },
+            screen_rows,
+        )
+    predictions = _predict_from_particle(param, artifacts, obs, cells=cells, seed=seed)
+    score = score_bulk_predictions(predictions, obs, score_params)
+    return (
+        {
+            "particle_id": int(param_dict["particle_id"]),
+            "round": int(smc_round),
+            "score": score["score"],
+            "early_rejected": False,
+            "simulated_full": True,
+            **{f"D_{k}": v for k, v in score["contributions"].items()},
+        },
+        screen_rows,
     )
-    if not later_weeks:
-        return 0.0
-    nxt = snapshot[
-        (snapshot["week"] == later_weeks[0])
-        & (snapshot["condition"] == row.condition)
-        & (snapshot["replicate"] == row.replicate)
-        & (snapshot["state_gate"] == state)
-    ]
-    if nxt.empty:
-        return 0.0
-    f0 = float(current["flow_fraction"].mean())
-    f1 = float(nxt["flow_fraction"].mean())
-    return float(np.log((f1 + 1e-9) / (f0 + 1e-9)))
 
 
-def _histogram_probability_from_snapshot(snap, target_label: str) -> float:
-    column = _bin_probability_column(str(target_label))
-    if hasattr(snap, column):
-        return float(getattr(snap, column))
-    if str(target_label) == "0":
-        return float(snap.zero_fraction)
+def _prior_distance(row: dict | pd.Series, artifacts: dict) -> float:
+    centers = _centers(artifacts)
+    prior_scales = artifacts.get("prior_scales", {})
+    r_sd = max(0.05, float(prior_scales.get("r_center_sd", 0.25)))
+    v_sd = max(0.05, float(prior_scales.get("v_center_sd", 0.20)))
+    flow_sd = max(0.02, float(prior_scales.get("flow3_bias_sd", 0.05)))
+    total = 0.0
+    for name, center in centers.items():
+        value = float(row.get(name, center))
+        if name.startswith("r__"):
+            scale = r_sd
+        elif name.startswith("v__"):
+            scale = v_sd
+        else:
+            scale = flow_sd
+        total += ((value - float(center)) / scale) ** 2
+    tau_n = max(1e-9, float(row.get("division_death_turnover", 1.0)))
+    tau_k = max(1e-9, float(row.get("ecDNA_gain_loss_turnover", 1.0)))
+    rho = float(row.get("hidden_npc_opc_split", 0.5))
+    rho_sd = np.sqrt(2.0 * 2.0 / ((2.0 + 2.0) ** 2 * (2.0 + 2.0 + 1.0)))
+    total += (np.log(tau_n) / 0.75) ** 2
+    total += (np.log(tau_k) / 0.75) ** 2
+    total += ((rho - 0.5) / rho_sd) ** 2
+    return float(total)
+
+
+def _block_for_round(smc_round: int) -> str:
+    blocks = ("growth", "copy_MYC", "copy_CDK4", "copy_PDGFRA", "flow3")
+    return blocks[int(smc_round) % len(blocks)]
+
+
+def _name_in_block(name: str, block: str) -> bool:
+    if block == "growth":
+        return name.startswith("r__")
+    if block == "flow3":
+        return name.startswith("zeta_flow3__")
+    if block.startswith("copy_"):
+        species = block.removeprefix("copy_")
+        return name.startswith("v__") and f"__{species}__" in name
+    return False
+
+
+def _active_bounds(name: str) -> tuple[float, float]:
+    if name.startswith("r__"):
+        return -3.0, 3.0
+    if name.startswith("v__"):
+        return -1.5, 1.5
+    if name.startswith("zeta_flow3__"):
+        return -0.25, 0.25
+    return -np.inf, np.inf
+
+
+def _biology_distance(row: dict | pd.Series) -> float:
+    tau_n = float(row.get("division_death_turnover", 0.0))
+    tau_k = float(row.get("ecDNA_gain_loss_turnover", 0.0))
+    rho = float(row.get("hidden_npc_opc_split", 0.5))
+    r_values = [abs(float(value)) for key, value in row.items() if str(key).startswith("r__")]
+    v_values = [abs(float(value)) for key, value in row.items() if str(key).startswith("v__")]
+    if tau_n < 0.0 or tau_n > 8.0:
+        return float("inf")
+    if tau_k < 0.0 or tau_k > 10.0:
+        return float("inf")
+    if r_values and tau_n < max(r_values):
+        return float("inf")
+    if v_values and tau_k < max(v_values):
+        return float("inf")
+    if rho < 0.0 or rho > 1.0:
+        return float("inf")
     return 0.0
 
 
-def _bin_probability_column(label: str) -> str:
-    safe = str(label).replace("+", "plus").replace("-", "_")
-    return f"bin_probability__{safe}"
+def _predict_from_particle(param: pd.Series, artifacts: dict, obs: dict, *, cells: int, seed: int) -> dict[str, pd.DataFrame]:
+    return _simulate_particle_full(param, artifacts, obs, cells=cells, seed=seed)["predictions"]
 
 
-def _pooled_mean_from_snapshot(snapshot: pd.DataFrame, week, condition, replicate, species) -> float:
-    subset = snapshot[
-        (snapshot["week"] == week)
-        & (snapshot["condition"] == condition)
-        & (snapshot["replicate"] == replicate)
-        & (snapshot["species"] == species)
-    ]
-    if subset.empty:
-        return 0.0
-    return float(np.sum(subset["flow_fraction"].astype(float) * subset["copy_mean"].astype(float)))
+def _early_rejection_screen(param: pd.Series, artifacts: dict, obs: dict, epsilon: float, score_params: dict) -> tuple[list[dict], dict | None]:
+    if not np.isfinite(epsilon):
+        return [], None
+    predictions = _predict_moment_predictions(param, artifacts, obs)
+    rows = []
+    cumulative = {"ddpcr": 0.0, "cell_count": 0.0, "flow3": 0.0}
+    data_distance = 0.0
+    weeks = sorted(set(predictions["cell_count"]["week"].astype(int)).union(set(predictions["ddpcr"]["week"].astype(int))))
+    for week in weeks:
+        subset = {name: table[table["week"].astype(int) == week].copy() for name, table in predictions.items()}
+        partial = score_bulk_predictions(subset, obs, {"D_prior": 0.0, "D_biology": 0.0})
+        for key in cumulative:
+            cumulative[key] += float(partial["contributions"][key])
+        data_distance += float(partial["score"])
+        total = data_distance + float(score_params["D_prior"]) + float(score_params["D_biology"])
+        rejected = total > float(epsilon)
+        rows.append(
+            {
+                "particle_id": int(param.particle_id),
+                "round": int(param.get("round", -1)),
+                "week": int(week),
+                "partial_data_distance": data_distance,
+                "partial_total_distance": total,
+                "epsilon": float(epsilon),
+                "early_rejected": bool(rejected),
+                "simulated_full": False,
+                "screen_stage": "moment_pre_full",
+            }
+        )
+        if rejected:
+            return rows, {
+                "score": float(total),
+                "contributions": {
+                    "ddpcr": cumulative["ddpcr"],
+                    "cell_count": cumulative["cell_count"],
+                    "flow3": cumulative["flow3"],
+                    "prior": float(score_params["D_prior"]),
+                    "biology": float(score_params["D_biology"]),
+                },
+            }
+    return rows, None
 
 
-def _snapshot_column(variable: str) -> str:
-    if variable == "state_species_mean":
-        return "copy_mean"
-    return variable
+def _predict_moment_predictions(param: pd.Series, artifacts: dict, obs: dict) -> dict[str, pd.DataFrame]:
+    dd_rows = []
+    for target in artifacts["ddpcr"].itertuples(index=False):
+        dd_rows.append({**target._asdict(), "observed_bulk_mean": float(target.bulk_mean), "predicted_bulk_mean": _moment_ddpcr_value(param, artifacts, target)})
+    cc_rows = []
+    for target in artifacts["cell_count"].itertuples(index=False):
+        cc_rows.append({**target._asdict(), "observed_cell_count": float(target.total_cell_count), "predicted_cell_count": _moment_count_value(param, artifacts, target)})
+    flow_target = obs["flow3"]["target"]["fractions"]
+    strata = artifacts["cell_count"][["week", "condition", "replicate"]].drop_duplicates()
+    flow_rows = []
+    for row in strata.itertuples(index=False):
+        phase = schemas.phase_for_week(int(row.week))
+        bias = float(param.get(f"zeta_flow3__p{phase}", 0.0))
+        raw = np.asarray([flow_target[group] for group in schemas.FLOW3_GROUPS], dtype=float)
+        raw[0] += bias
+        raw[1:] -= bias / 2.0
+        projected = schemas.normalize_probabilities(np.clip(raw, 1e-6, None), name="moment flow3 projection")
+        for group, fraction in zip(schemas.FLOW3_GROUPS, projected):
+            flow_rows.append({"week": int(row.week), "condition": row.condition, "replicate": row.replicate, "group": group, "target_fraction": float(flow_target[group]), "predicted_fraction": float(fraction)})
+    return {"ddpcr": pd.DataFrame(dd_rows), "cell_count": pd.DataFrame(cc_rows), "flow3": pd.DataFrame(flow_rows)}
 
 
-def _event_row(
-    particle_id: int,
-    week: int,
-    event_type: str,
-    species: str | None,
-    count: int,
-    from_state: str | None = None,
-    to_state: str | None = None,
-    condition: str = "",
-    replicate: str = "",
-) -> dict:
+def _moment_ddpcr_value(param: pd.Series, artifacts: dict, target) -> float:
+    group = artifacts["ddpcr"][(artifacts["ddpcr"]["condition"] == target.condition) & (artifacts["ddpcr"]["replicate"] == target.replicate) & (artifacts["ddpcr"]["species"] == target.species)].sort_values("week")
+    current = float(group["bulk_mean"].iloc[0])
+    first_week = int(group["week"].iloc[0])
+    for week in range(first_week + 1, int(target.week) + 1):
+        current *= np.exp(float(param.get(f"v__{target.condition}__{target.species}__p{schemas.phase_for_week(week - 1)}", 0.0)))
+    return float(current)
+
+
+def _moment_count_value(param: pd.Series, artifacts: dict, target) -> float:
+    group = artifacts["cell_count"][(artifacts["cell_count"]["condition"] == target.condition) & (artifacts["cell_count"]["replicate"] == target.replicate)].sort_values("week")
+    current = float(group["total_cell_count"].iloc[0])
+    first_week = int(group["week"].iloc[0])
+    for week in range(first_week + 1, int(target.week) + 1):
+        current *= np.exp(float(param.get(f"r__{target.condition}__p{schemas.phase_for_week(week - 1)}", 0.0)))
+    return float(current)
+
+
+def _simulate_particle_full(param: pd.Series, artifacts: dict, obs: dict, *, cells: int, seed: int) -> dict[str, dict | pd.DataFrame]:
+    dd = artifacts["ddpcr"].copy()
+    cc = artifacts["cell_count"].copy()
+    flow_target = obs["flow3"]["target"]["fractions"]
+    pred_dd: list[dict] = []
+    pred_cc: list[dict] = []
+    flow_rows: list[dict] = []
+    history_rows: list[dict] = []
+    event_rows: list[dict] = []
+
+    strata = cc[["condition", "replicate"]].drop_duplicates()
+    for srow in strata.itertuples(index=False):
+        condition = str(srow.condition)
+        replicate = str(srow.replicate)
+        cc_group = cc[(cc["condition"] == condition) & (cc["replicate"] == replicate)].sort_values("week")
+        dd_group = dd[(dd["condition"] == condition) & (dd["replicate"] == replicate)].sort_values(["species", "week"])
+        if cc_group.empty or dd_group.empty:
+            continue
+        first_week = int(min(cc_group["week"].min(), dd_group["week"].min()))
+        weeks = sorted(set(cc_group["week"].astype(int)).union(set(dd_group["week"].astype(int))))
+        record_times = tuple(float(week - first_week) for week in weeks)
+        stream_id = int(param.get("random_stream_id", param.get("particle_id", 0)))
+        sim_seed = int(seed + stream_id * 1009 + _stable_seed_offset(condition, replicate))
+        model_params = _core_model_parameters(param, condition, max(record_times), record_times, max(1, int(cells)), sim_seed)
+        initialization = _core_initialization(param, dd_group, flow_target, first_week, max(1, int(cells)), sim_seed)
+        result = run_simulation(
+            params=model_params,
+            observation_params=cfg.DEFAULT_OBSERVATION_PARAMETERS,
+            initialization=initialization,
+            t_max=max(record_times),
+            n_init=max(1, int(cells)),
+            record_times=record_times,
+            seed=sim_seed,
+            verbose=False,
+        )
+        snapshots = _snapshots_by_week(result, first_week)
+        initial_count = float(cc_group.loc[cc_group["week"].astype(int) == first_week, "total_cell_count"].median())
+        initial_pop = max(1.0, float(_snapshot_at_week(snapshots, first_week)["population_size"]))
+        population_weight = initial_count / initial_pop
+        for row in cc_group.itertuples(index=False):
+            snap = _snapshot_at_week(snapshots, int(row.week))
+            pred_cc.append({**row._asdict(), "observed_cell_count": float(row.total_cell_count), "predicted_cell_count": float(snap["population_size"]) * population_weight})
+        for row in dd_group.itertuples(index=False):
+            snap = _snapshot_at_week(snapshots, int(row.week))
+            species_idx = schemas.SPECIES.index(str(row.species))
+            pred_dd.append({**row._asdict(), "observed_bulk_mean": float(row.bulk_mean), "predicted_bulk_mean": float(snap["bulk_copy_means"][species_idx])})
+        for week, snap in snapshots.items():
+            projected = _project_flow3(np.asarray(snap["soft_state_fractions"], dtype=float), float(param.get(f"zeta_flow3__p{schemas.phase_for_week(week)}", 0.0)))
+            for group, fraction in zip(schemas.FLOW3_GROUPS, projected):
+                flow_rows.append({"week": int(week), "condition": condition, "replicate": replicate, "group": group, "target_fraction": float(flow_target[group]), "predicted_fraction": float(fraction)})
+            history_rows.append(
+                {
+                    "particle_id": int(param.get("particle_id", 0)),
+                    "week": int(week),
+                    "condition": condition,
+                    "replicate": replicate,
+                    "population_size": int(snap["population_size"]),
+                    "mean_division_hazard": float(snap["mean_division_hazard"]),
+                    "mean_death_hazard": float(snap["mean_death_hazard"]),
+                    "bulk_MYC": float(snap["bulk_copy_means"][0]),
+                    "bulk_CDK4": float(snap["bulk_copy_means"][1]),
+                    "bulk_PDGFRA": float(snap["bulk_copy_means"][2]),
+                    "flow3_OLIG2_high": float(projected[0]),
+                    "flow3_AC": float(projected[1]),
+                    "flow3_MES": float(projected[2]),
+                    "metadata": "current data do not directly identify this quantity",
+                }
+            )
+        for event_time, event_type, cell_id, details in result.events:
+            event_rows.append(
+                {
+                    "particle_id": int(param.get("particle_id", 0)),
+                    "condition": condition,
+                    "replicate": replicate,
+                    "week_time": float(first_week + event_time),
+                    "event_type": str(event_type),
+                    "cell_id": int(cell_id),
+                    "details": str(details),
+                    "metadata": "current data do not directly identify this quantity",
+                }
+            )
     return {
-        "particle_id": int(particle_id),
-        "week": int(week),
-        "condition": condition,
-        "replicate": replicate,
-        "event_type": event_type,
-        "species": species or "",
-        "count": int(count),
-        "from_state": from_state or "",
-        "to_state": to_state or "",
+        "predictions": {"ddpcr": pd.DataFrame(pred_dd), "cell_count": pd.DataFrame(pred_cc), "flow3": pd.DataFrame(flow_rows)},
+        "history": pd.DataFrame(history_rows),
+        "events": pd.DataFrame(event_rows),
     }
 
 
-def _event_summary(particle_id: int, event_rows: list[dict], weeks: list[int]) -> pd.DataFrame:
-    if not event_rows:
-        return pd.DataFrame([{"particle_id": particle_id, "week": week, "condition": "", "replicate": "", "event_type": "none", "species": "", "from_state": "", "to_state": "", "count": 0} for week in weeks])
-    rows = pd.DataFrame(event_rows)
-    return rows.groupby(["particle_id", "week", "condition", "replicate", "event_type", "species", "from_state", "to_state"], as_index=False)["count"].sum()
-
-
-def _history_row(particle_id: int, week: int, cell: dict) -> dict:
-    total_copy = sum(int(cell["copies"][species]) for species in schemas.SPECIES)
-    stress = float(cell.get("stress_score", np.log1p(total_copy)))
-    survival = float(cell.get("survival_score", 1.0 / (1.0 + np.log1p(total_copy))))
-    latent = np.asarray(cell.get("latent_state", [0.0, 0.0, 0.0]), dtype=float)
-    if latent.shape != (cfg.LATENT_DIM,):
-        soft = np.asarray([cell.get("soft_state", {}).get(state, 0.0) for state in schemas.STATE_NAMES], dtype=float)
-        latent = cfg.ilr(schemas.normalize_probabilities(soft + 1e-9, name="history soft_state"))
-    row = {
-        "particle_id": int(particle_id),
-        "week": int(week),
-        "condition": str(cell.get("condition", "ctrl")),
-        "replicate": str(cell.get("replicate", "r1")),
-        "cell_id": int(cell["cell_id"]),
-        "parent_id": int(cell.get("parent_id", -1)),
-        "state_gate": str(cell["state_gate"]),
-        "cycle_state": str(cell.get("cycle_state", "G1")),
-        "age": float(cell.get("age", week)),
-        "latent_R_raw": float(stress - 1.0),
-        "latent_V_raw": float(1.0 - stress),
-        "R": float(schemas.softplus([stress - 1.0])[0]),
-        "V": float(schemas.softplus([1.0 - stress])[0]),
-        "A": float(cell.get("age", week)),
-        "population_weight": float(cell.get("population_weight", 1.0)),
-        "latent_U_1": float(latent[0]),
-        "latent_U_2": float(latent[1]),
-        "latent_U_3": float(latent[2]),
-    }
-    for state, value in cell.get("soft_state", {}).items():
-        row[f"X_{state}"] = float(value)
+def _core_model_parameters(param: pd.Series, condition: str, t_max: float, record_times: tuple[float, ...], cells: int, seed: int) -> cfg.ModelParameters:
+    base = cfg.DEFAULT_MODEL_PARAMETERS
+    r_value = _mean_control(param, f"r__{condition}__p")
+    tau_n = max(abs(r_value) + 1e-6, float(param.get("division_death_turnover", abs(r_value) + 1.0)))
+    hazard = replace(base.hazard, lambda_div_ceiling=float((tau_n + r_value) / 2.0), lambda_death_ceiling=float((tau_n - r_value) / 2.0))
+    tau_k = float(param.get("ecDNA_gain_loss_turnover", 1.0))
+    turnover: dict[str, cfg.TurnoverSpeciesParameters] = {}
     for species in schemas.SPECIES:
-        row[f"K_{species}"] = int(cell["copies"][species])
-    return row
-
-
-def _write_method_full_outputs(
-    out: Path,
-    accepted_histories: list[dict],
-    parameter_rows: list[dict],
-    weights: pd.DataFrame,
-    snapshots: pd.DataFrame,
-    events: pd.DataFrame,
-    features: pd.DataFrame,
-    target: pd.DataFrame,
-) -> None:
-    write_table(pd.DataFrame(parameter_rows), out / "FULL_particle_parameters.parquet")
-    write_table(weights, out / "FULL_particle_weights.parquet")
-    write_table(snapshots, out / "FULL_snapshot_summaries.parquet")
-    write_table(events, out / "FULL_event_summaries.parquet")
-    history_df = pd.DataFrame(accepted_histories)
-    write_table(history_df, out / "FULL_single_cell_history_samples.parquet")
-    derived = _derived_q_from_snapshots(snapshots)
-    write_table(derived, out / "FULL_derived_Q.parquet")
-    accepted_weights = _accepted_normalized_weights(weights)
-    raw_like = features.merge(accepted_weights[["particle_id", "accepted_weight"]], on="particle_id", how="inner")
-    target_meta = target.rename(columns={"weight": "target_weight"})
-    raw_like = raw_like.merge(
-        target_meta.drop(columns=[column for column in ("value",) if column in target_meta.columns]),
-        on="feature_id",
-        how="left",
-        validate="many_to_one",
+        v_value = _mean_control(param, f"v__{condition}__{species}__p")
+        total = max(abs(v_value) + 1e-6, tau_k)
+        species_params = base.turnover[species]
+        turnover[species] = replace(species_params, gain_ceiling=float((total + v_value) / 2.0), loss_ceiling=float((total - v_value) / 2.0))
+    simulation = replace(
+        base.simulation,
+        dt=0.20,
+        t_max=float(t_max),
+        record_times=record_times,
+        n_init=int(cells),
+        target_population_size=None,
+        max_pop_size=max(int(cells) * 50, int(cells) + 10),
+        random_seed=int(seed),
+        fitting_mode=True,
+        record_full_snapshots=False,
+        record_events=True,
     )
-    raw_like = raw_like.rename(columns={"accepted_weight": "posterior_weight"})
-    write_table(raw_like, out / "FULL_ppc_raw_observables.parquet")
-    _write_zarr_history_ensemble(out / "FULL_particles_final.zarr", history_df, weights, events)
-    write_text_pdf(
-        out / "FULL_history_reconstruction_report.pdf",
-        "Full History Reconstruction Report",
-        [
-            "Output is a weighted conditional single-cell history ensemble.",
-            f"particles={weights['particle_id'].nunique()}, accepted={int(weights['accepted'].sum())}",
-            "Parameters are latent controls and are not reported as unique biological truths.",
-        ],
+    return replace(base, hazard=hazard, turnover=turnover, simulation=simulation)
+
+
+def _core_initialization(param: pd.Series, dd_group: pd.DataFrame, flow_target: dict, first_week: int, cells: int, seed: int) -> cfg.InitializationParameters:
+    rng = np.random.default_rng(seed)
+    first = dd_group[dd_group["week"].astype(int) == int(first_week)]
+    mean_vector = _anchor_mean_vector(first if not first.empty else dd_group, str(dd_group["condition"].iloc[0]), str(dd_group["replicate"].iloc[0]))
+    rho = float(np.clip(param.get("hidden_npc_opc_split", 0.5), 0.0, 1.0))
+    flow = np.asarray([rho * float(flow_target["OLIG2-high"]), (1.0 - rho) * float(flow_target["OLIG2-high"]), float(flow_target["AC"]), float(flow_target["MES"])], dtype=float)
+    flow = schemas.normalize_probabilities(flow, name="core initialization flow")
+    rows_per_state = max(4, min(64, int(cells)))
+    distributions = {}
+    for state in cfg.STATE_NAMES:
+        distributions[state] = _mean_matched_zinb_pool(rng, mean_vector, rows_per_state)
+    return replace(
+        cfg.DEFAULT_INITIALIZATION_PARAMETERS,
+        mode=cfg.EMPIRICAL_WEEK1,
+        empirical_flow_fractions=flow,
+        empirical_sorted_copy_distributions=distributions,
+        empirical_soft_state_concentration=25.0,
     )
 
 
-def _write_zarr_history_ensemble(path: Path, history: pd.DataFrame, weights: pd.DataFrame, events: pd.DataFrame) -> None:
-    """Persist accepted histories as a real zarr group with typed arrays."""
+def _mean_control(param: pd.Series, prefix: str) -> float:
+    values = [float(param.get(f"{prefix}{phase}", 0.0)) for phase in schemas.PHASES if f"{prefix}{phase}" in param]
+    return float(np.mean(values)) if values else 0.0
 
+
+def _anchor_mean_vector(ddpcr_anchor: pd.DataFrame, condition: str, replicate: str) -> np.ndarray:
+    subset = ddpcr_anchor[(ddpcr_anchor["condition"].astype(str) == condition) & (ddpcr_anchor["replicate"].astype(str) == replicate)]
+    if subset.empty:
+        subset = ddpcr_anchor
+    means = []
+    value_column = "bulk_mean" if "bulk_mean" in subset.columns else "ddpcr_copy_number"
+    for species in schemas.SPECIES:
+        species_rows = subset[subset["species"].astype(str) == species]
+        value = float(species_rows[value_column].median()) if not species_rows.empty else float(subset[value_column].median())
+        means.append(max(0.0, value))
+    return np.asarray(means, dtype=float)
+
+
+def _mean_matched_zinb_pool(rng: np.random.Generator, mean_vector: np.ndarray, rows: int) -> np.ndarray:
+    n_rows = max(1, int(rows))
+    means = np.clip(np.asarray(mean_vector, dtype=float), 0.0, None)
+    matrix = np.zeros((n_rows, len(schemas.SPECIES)), dtype=int)
+    pi0 = rng.beta(1.5, 1.5, size=len(schemas.SPECIES))
+    phi = rng.lognormal(np.log(2.0), 0.75, size=len(schemas.SPECIES))
+    for idx, mean in enumerate(means):
+        if mean <= 0.0:
+            continue
+        positive_mean = mean / max(1e-6, 1.0 - float(pi0[idx]))
+        gamma_rate = rng.gamma(shape=float(phi[idx]), scale=positive_mean / max(1e-6, float(phi[idx])), size=n_rows)
+        values = rng.poisson(gamma_rate).astype(int)
+        values[rng.random(n_rows) < float(pi0[idx])] = 0
+        matrix[:, idx] = values
+    return matrix
+
+
+def _snapshots_by_week(result, first_week: int) -> dict[int, dict]:
+    snapshots: dict[int, dict] = {}
+    for time, snapshot in zip(result.times, result.truth_snapshots):
+        snapshots[int(round(float(first_week) + float(time)))] = snapshot
+    return snapshots
+
+
+def _snapshot_at_week(snapshots: dict[int, dict], week: int) -> dict:
+    if week in snapshots:
+        return snapshots[week]
+    earlier = [item for item in snapshots if item <= week]
+    return snapshots[max(earlier)] if earlier else snapshots[min(snapshots)]
+
+
+def _project_flow3(soft_state_fractions: np.ndarray, bias: float) -> np.ndarray:
+    raw = np.asarray([soft_state_fractions[cfg.NPC] + soft_state_fractions[cfg.OPC], soft_state_fractions[cfg.AC], soft_state_fractions[cfg.MES]], dtype=float)
+    raw[0] += float(bias)
+    raw[1:] -= float(bias) / 2.0
+    return schemas.normalize_probabilities(np.clip(raw, 1e-6, None), name="core projected flow3")
+
+
+def _stable_seed_offset(*parts: str) -> int:
+    text = "|".join(str(part) for part in parts)
+    return int(sum((idx + 1) * ord(char) for idx, char in enumerate(text)) % 1_000_000)
+
+
+def _early_rejection_rows(param: pd.Series, predictions: dict, obs: dict, epsilon: float) -> list[dict]:
+    rows = []
+    if not np.isfinite(epsilon):
+        return rows
+    partial = 0.0
+    weeks = sorted(predictions["cell_count"]["week"].astype(int).unique())
+    for week in weeks:
+        subset = {name: table[table["week"].astype(int) == week].copy() for name, table in predictions.items()}
+        partial += score_bulk_predictions(subset, obs, param.to_dict())["score"]
+        rejected = partial > epsilon
+        rows.append({"particle_id": int(param.particle_id), "week": week, "partial_distance": partial, "epsilon": epsilon, "early_rejected": bool(rejected)})
+        if rejected:
+            break
+    return rows
+
+
+def _weights_from_scores(scores: pd.DataFrame, final_round: int, cutoff: float, gate_particle_ids: set[int] | None = None) -> pd.DataFrame:
+    result = scores.copy()
+    final_mask = result["round"] == int(final_round)
+    early_rejected = result["early_rejected"].fillna(False).astype(bool) if "early_rejected" in result else pd.Series(False, index=result.index)
+    gated = result["particle_id"].astype(int).isin(gate_particle_ids) if gate_particle_ids is not None else pd.Series(True, index=result.index)
+    eligible = final_mask & gated & (~early_rejected)
+    result["accepted"] = eligible & (result["score"] <= cutoff)
+    if not bool(result["accepted"].any()):
+        if not bool(eligible.any()):
+            raise RuntimeError("no final particles passed data, prior, and biological gates")
+        best_score = float(result.loc[eligible, "score"].astype(float).min())
+        raise RuntimeError(
+            "no final particles passed the final score cutoff after data, prior, and biological gates; "
+            f"cutoff={float(cutoff):.6g}, best_eligible_score={best_score:.6g}"
+        )
+    raw = np.zeros(len(result), dtype=float)
+    accepted_scores = result.loc[result["accepted"], "score"].astype(float)
+    shifted = accepted_scores - float(accepted_scores.min())
+    raw[result["accepted"].to_numpy()] = np.exp(-0.5 * shifted.to_numpy())
+    total = float(raw.sum())
+    if total <= 0.0:
+        raise RuntimeError("accepted final particles produced non-positive posterior weights")
+    result["weight"] = raw / total
+    return result[["particle_id", "round", "score", "weight", "accepted"]]
+
+
+def _write_population_zarr(path: Path, population: pd.DataFrame, ddpcr_anchor: pd.DataFrame, flow_init: pd.DataFrame) -> None:
     import zarr
     from zarr.storage import ZipStore
 
-    if path.exists() and path.is_dir():
-        raise IsADirectoryError(f"{path} is an older directory zarr store; choose a clean output directory or remove it before rerun")
+    if path.exists():
+        raise FileExistsError(f"{path} already exists; choose a clean output directory")
+    store = ZipStore(str(path), mode="w")
+    try:
+        root = zarr.group(store=store, overwrite=True)
+        root.attrs.update({"method_source": "markdown/fit_method.md", "role": "FULL_initial_population", "metadata": "current data do not directly identify single-cell latent quantities"})
+        root.create_dataset("particle_id", data=population["particle_id"].to_numpy(dtype=np.int64), shape=(len(population),))
+        root.create_dataset("cell_id", data=population["cell_id"].to_numpy(dtype=np.int64), shape=(len(population),))
+        root.create_dataset("population_weight", data=population["population_weight"].to_numpy(dtype=np.float64), shape=(len(population),))
+        if {"MYC_copy", "CDK4_copy", "PDGFRA_copy"}.issubset(population.columns):
+            copy_matrix = population[["MYC_copy", "CDK4_copy", "PDGFRA_copy"]].to_numpy(dtype=np.int64)
+            root.create_dataset("initial_copy_numbers", data=copy_matrix, shape=copy_matrix.shape)
+        root.attrs["ddpcr_anchor_rows"] = int(len(ddpcr_anchor))
+        root.attrs["flow_initializer_rows"] = int(len(flow_init))
+    finally:
+        store.close()
+
+
+def _simulate_particle_for_zarr(task: tuple[dict, dict, dict, int, int, int]) -> dict[str, pd.DataFrame]:
+    param_dict, artifacts, obs, cells, sim_seed, replay_id = task
+    param = pd.Series(param_dict)
+    particle_id = int(param.get("particle_id", 0))
+    simulated = _simulate_particle_full(param, artifacts, obs, cells=cells, seed=sim_seed)
+    predictions = simulated["predictions"]
+    history = simulated["history"]
+    events = simulated["events"]
+    return {
+        "ddpcr": predictions["ddpcr"].assign(particle_id=particle_id, replay_id=replay_id),
+        "cell_count": predictions["cell_count"].assign(particle_id=particle_id, replay_id=replay_id),
+        "flow3": predictions["flow3"].assign(particle_id=particle_id, replay_id=replay_id),
+        "history": history.assign(replay_id=replay_id) if isinstance(history, pd.DataFrame) and not history.empty else pd.DataFrame(),
+        "events": events.assign(replay_id=replay_id) if isinstance(events, pd.DataFrame) and not events.empty else pd.DataFrame(),
+    }
+
+
+def _write_particle_zarr(
+    path: Path,
+    params: pd.DataFrame,
+    weights: pd.DataFrame,
+    artifacts: dict,
+    obs: dict,
+    *,
+    accepted_only: bool,
+    cells: int,
+    seed: int,
+    replay: bool = False,
+    replay_repetitions: int = 1,
+    workers: int = 1,
+) -> None:
+    import zarr
+    from zarr.storage import ZipStore
+
+    selected_ids = set(weights.loc[weights["accepted"], "particle_id"].astype(int)) if accepted_only else set(weights["particle_id"].astype(int))
+    selected = params[params["particle_id"].astype(int).isin(selected_ids)].copy()
+    if selected.empty:
+        selected = params.head(1).copy()
+    dd_rows = []
+    cc_rows = []
+    fl_rows = []
+    history_rows = []
+    event_rows = []
+    simulation_tasks = [
+        (row.to_dict(), artifacts, obs, int(cells), seed + int(row.particle_id) + replay_id * 100_003, replay_id)
+        for _, row in selected.iterrows()
+        for replay_id in range(max(1, int(replay_repetitions)))
+    ]
+    for result in _parallel_map(_simulate_particle_for_zarr, simulation_tasks, workers):
+        dd_rows.append(result["ddpcr"])
+        cc_rows.append(result["cell_count"])
+        fl_rows.append(result["flow3"])
+        if not result["history"].empty:
+            history_rows.append(result["history"])
+        if not result["events"].empty:
+            event_rows.append(result["events"])
+    dd = pd.concat(dd_rows, ignore_index=True)
+    cc = pd.concat(cc_rows, ignore_index=True)
+    fl = pd.concat(fl_rows, ignore_index=True)
+    history_table = pd.concat(history_rows, ignore_index=True) if history_rows else pd.DataFrame()
+    event_table = pd.concat(event_rows, ignore_index=True) if event_rows else pd.DataFrame()
+    if path.exists():
+        raise FileExistsError(f"{path} already exists; choose a clean output directory")
     store = ZipStore(str(path), mode="w")
     try:
         root = zarr.group(store=store, overwrite=True)
         root.attrs.update(
             {
-                "artifact": "FULL_particles_final",
-                "store": "zarr.ZipStore",
                 "method_source": "markdown/fit_method.md",
-                "role": "accepted conditional single-cell history ensemble",
-                "species": list(schemas.SPECIES),
-                "states": list(schemas.STATE_NAMES),
-                "history_rows": int(len(history)),
-                "particles": int(weights["particle_id"].nunique()) if "particle_id" in weights else 0,
+                "role": "accepted bulk-compatible full histories" if not replay else "independent final replay histories",
+                "metadata": "current data do not directly identify latent single-cell quantities",
+                "disabled_likelihoods": ["qpcdr", "ectag", "flow4", "state_specific_copy"],
+                "full_simulator": "core.simulation.run_simulation",
+                "n_sim_cells": int(cells),
+                "replay_repetitions": int(replay_repetitions),
             }
         )
-
-        history_group = root.create_group("history")
-        if history.empty:
-            _zarr_dataset(history_group, "particle_id", np.asarray([], dtype=np.int64))
-            _zarr_dataset(history_group, "week", np.asarray([], dtype=np.int16))
-            _zarr_dataset(history_group, "condition_code", np.asarray([], dtype=np.int16))
-            _zarr_dataset(history_group, "replicate_code", np.asarray([], dtype=np.int16))
-            _zarr_dataset(history_group, "cell_id", np.asarray([], dtype=np.int64))
-            _zarr_dataset(history_group, "parent_id", np.asarray([], dtype=np.int64))
-            _zarr_dataset(history_group, "state_code", np.asarray([], dtype=np.int16))
-            _zarr_dataset(history_group, "K", np.empty((0, len(schemas.SPECIES)), dtype=np.int32))
-            _zarr_dataset(history_group, "X", np.empty((0, len(schemas.STATE_NAMES)), dtype=np.float32))
-            _zarr_dataset(history_group, "RVA", np.empty((0, 3), dtype=np.float32))
-            _zarr_dataset(history_group, "latent_U", np.empty((0, 3), dtype=np.float32))
-            _zarr_dataset(history_group, "population_weight", np.asarray([], dtype=np.float32))
-        else:
-            state_codes = _encode_categories(history["state_gate"], schemas.STATE_NAMES)
-            condition_categories = sorted(str(value) for value in history["condition"].dropna().unique())
-            replicate_categories = sorted(str(value) for value in history["replicate"].dropna().unique())
-            _zarr_dataset(history_group, "particle_id", history["particle_id"].to_numpy(dtype=np.int64))
-            _zarr_dataset(history_group, "week", history["week"].to_numpy(dtype=np.int16))
-            _zarr_dataset(history_group, "condition_code", _encode_categories(history["condition"], condition_categories))
-            _zarr_dataset(history_group, "replicate_code", _encode_categories(history["replicate"], replicate_categories))
-            _zarr_dataset(history_group, "cell_id", history["cell_id"].to_numpy(dtype=np.int64))
-            _zarr_dataset(history_group, "parent_id", history["parent_id"].to_numpy(dtype=np.int64))
-            _zarr_dataset(history_group, "state_code", state_codes)
-            copy_matrix = np.column_stack([history[f"K_{species}"].to_numpy(dtype=np.int32) for species in schemas.SPECIES])
-            soft_matrix = np.column_stack([history[f"X_{state}"].to_numpy(dtype=np.float32) for state in schemas.STATE_NAMES])
-            rva_matrix = history[["R", "V", "A"]].to_numpy(dtype=np.float32)
-            latent_matrix = history[["latent_U_1", "latent_U_2", "latent_U_3"]].to_numpy(dtype=np.float32)
-            _zarr_dataset(history_group, "population_weight", history["population_weight"].to_numpy(dtype=np.float32))
-            _zarr_dataset(history_group, "K", copy_matrix)
-            _zarr_dataset(history_group, "X", soft_matrix)
-            _zarr_dataset(history_group, "RVA", rva_matrix)
-            _zarr_dataset(history_group, "latent_U", latent_matrix)
-        history_group.attrs.update(
-            {
-                "state_code_categories": list(schemas.STATE_NAMES),
-                "condition_code_categories": [] if history.empty else condition_categories,
-                "replicate_code_categories": [] if history.empty else replicate_categories,
-                "K_columns": list(schemas.SPECIES),
-                "X_columns": [f"X_{state}" for state in schemas.STATE_NAMES],
-                "RVA_columns": ["R", "V", "A"],
-                "latent_U_columns": ["latent_U_1", "latent_U_2", "latent_U_3"],
-            }
-        )
-
-        weight_group = root.create_group("weights")
-        _zarr_dataset(weight_group, "particle_id", weights["particle_id"].to_numpy(dtype=np.int64))
-        _zarr_dataset(weight_group, "score", weights["score"].to_numpy(dtype=np.float64))
-        _zarr_dataset(weight_group, "weight", weights["weight"].to_numpy(dtype=np.float64))
-        _zarr_dataset(weight_group, "accepted", weights["accepted"].to_numpy(dtype=bool))
-
-        event_group = root.create_group("events")
-        if events.empty:
-            _zarr_dataset(event_group, "particle_id", np.asarray([], dtype=np.int64))
-            _zarr_dataset(event_group, "week", np.asarray([], dtype=np.int16))
-            _zarr_dataset(event_group, "event_type_code", np.asarray([], dtype=np.int16))
-            _zarr_dataset(event_group, "species_code", np.asarray([], dtype=np.int16))
-            _zarr_dataset(event_group, "count", np.asarray([], dtype=np.int32))
-            event_types: list[str] = []
-            species_labels: list[str] = [""]
-        else:
-            event_types = sorted(str(value) for value in events["event_type"].dropna().unique())
-            species_labels = [""] + [species for species in schemas.SPECIES if species in set(events["species"].astype(str))]
-            _zarr_dataset(event_group, "particle_id", events["particle_id"].to_numpy(dtype=np.int64))
-            _zarr_dataset(event_group, "week", events["week"].to_numpy(dtype=np.int16))
-            _zarr_dataset(event_group, "event_type_code", _encode_categories(events["event_type"], event_types))
-            _zarr_dataset(event_group, "species_code", _encode_categories(events["species"].fillna(""), species_labels))
-            _zarr_dataset(event_group, "count", events["count"].to_numpy(dtype=np.int32))
-        event_group.attrs.update({"event_type_code_categories": event_types, "species_code_categories": species_labels})
+        root.create_dataset("ddpcr_predicted_bulk_mean", data=dd["predicted_bulk_mean"].to_numpy(dtype=np.float64), shape=(len(dd),))
+        root.create_dataset("cell_count_predicted", data=cc["predicted_cell_count"].to_numpy(dtype=np.float64), shape=(len(cc),))
+        root.create_dataset("flow3_predicted_fraction", data=fl["predicted_fraction"].to_numpy(dtype=np.float64), shape=(len(fl),))
+        root.create_dataset("particle_id", data=selected["particle_id"].to_numpy(dtype=np.int64), shape=(len(selected),))
+        if not history_table.empty:
+            root.create_dataset("history_population_size", data=history_table["population_size"].to_numpy(dtype=np.int64), shape=(len(history_table),))
+            root.create_dataset("history_bulk_copy_means", data=history_table[["bulk_MYC", "bulk_CDK4", "bulk_PDGFRA"]].to_numpy(dtype=np.float64), shape=(len(history_table), 3))
+            root.create_dataset("history_flow3_projection", data=history_table[["flow3_OLIG2_high", "flow3_AC", "flow3_MES"]].to_numpy(dtype=np.float64), shape=(len(history_table), 3))
+            root.create_dataset("history_mean_hazards", data=history_table[["mean_division_hazard", "mean_death_hazard"]].to_numpy(dtype=np.float64), shape=(len(history_table), 2))
+        root.create_dataset("event_count", data=np.asarray([len(event_table)], dtype=np.int64), shape=(1,))
     finally:
         store.close()
+    stem = path.stem
+    write_table(dd, path.with_name(f"{stem}_ddpcr_predictions.parquet"))
+    write_table(cc, path.with_name(f"{stem}_cellcount_predictions.parquet"))
+    write_table(fl, path.with_name(f"{stem}_flow3_predictions.parquet"))
+    if not history_table.empty:
+        write_table(history_table, path.with_name(f"{stem}_history_summary.parquet"))
+    if not event_table.empty:
+        write_table(event_table, path.with_name(f"{stem}_event_summary.parquet"))
 
 
-def _zarr_dataset(group, name: str, data: np.ndarray) -> None:
-    chunks = _zarr_chunks(data)
-    if chunks:
-        group.create_dataset(name, data=data, chunks=chunks, compressor=None)
+def _state_fractions_from_flow3(flow3: dict, rho: float) -> dict[str, float]:
+    g = flow3["fractions"]
+    olig2 = float(g["OLIG2-high"])
+    return {"NPC-like": float(rho * olig2), "OPC-like": float((1.0 - rho) * olig2), "AC-like": float(g["AC"]), "MES-like": float(g["MES"])}
+
+
+def _state_to_flow3(state: str) -> str:
+    return {"NPC-like": "OLIG2-high", "OPC-like": "OLIG2-high", "AC-like": "AC", "MES-like": "MES"}[state]
+
+
+def _adapt_proposal_scale(scale: dict[str, float], acceptance_rate: float) -> None:
+    if acceptance_rate < 0.10:
+        factor = 0.50
+    elif acceptance_rate < 0.15:
+        factor = 0.70
+    elif acceptance_rate <= 0.35:
+        factor = 1.0
     else:
-        group.create_dataset(name, data=data, compressor=None)
+        factor = 1.25
+    for key in scale:
+        scale[key] = float(np.clip(scale[key] * factor, 0.05, 5.0))
 
 
-def _zarr_chunks(data: np.ndarray) -> tuple[int, ...] | None:
-    if data.ndim == 0:
-        return None
-    if data.shape[0] == 0:
-        return data.shape
-    first = min(1024, int(data.shape[0]))
-    return (first, *data.shape[1:])
+def _scale_for_name(name: str, scale: dict[str, float]) -> float:
+    if name.startswith("r__"):
+        return scale["growth"]
+    if name.startswith("zeta_flow3__"):
+        return scale["flow3"]
+    for species in schemas.SPECIES:
+        if f"__{species}__" in name:
+            return scale[f"copy_{species}"]
+    return 1.0
 
 
-def _encode_categories(values: pd.Series, categories: tuple[str, ...] | list[str]) -> np.ndarray:
-    mapping = {str(value): idx for idx, value in enumerate(categories)}
-    encoded = []
-    for value in values.astype(str):
-        if value not in mapping:
-            raise ValueError(f"Cannot encode unknown category {value!r}; expected {list(categories)}")
-        encoded.append(mapping[value])
-    return np.asarray(encoded, dtype=np.int16)
-
-
-def _derived_q_from_snapshots(snapshots: pd.DataFrame) -> pd.DataFrame:
+def _mc_noise_report(params: pd.DataFrame, weights: pd.DataFrame, artifacts: dict, obs: dict, cells: int, seed: int, workers: int = 1) -> pd.DataFrame:
+    accepted_ids = set(weights.loc[weights["accepted"], "particle_id"].astype(int))
+    selected = params[params["particle_id"].astype(int).isin(accepted_ids)].head(3 if cells >= METHOD_N_SIM_FIT else 1)
+    if selected.empty:
+        selected = params.head(1)
+    repeats = 5 if cells >= METHOD_N_SIM_FIT else 2
     rows = []
-    for row in snapshots.itertuples(index=False):
-        q_value = float(row.zero_fraction) - float(row.tail_fraction)
-        rows.append(
-            {
-                "particle_id": int(row.particle_id),
-                "week": int(row.week),
-                "condition": row.condition,
-                "replicate": row.replicate,
-                "state_gate": row.state_gate,
-                "species": row.species,
-                "Q": q_value,
-                "B": float(row.copy_mean),
-                "P": float(row.tail_fraction),
-            }
-        )
-    return pd.DataFrame(rows)
+    tasks = [
+        (param.to_dict(), artifacts, obs, max(1, int(cells)), seed + 50_000 + repeat * 997 + int(param.particle_id), repeat)
+        for _, param in selected.iterrows()
+        for repeat in range(repeats)
+    ]
+    for task_rows in _parallel_map(_mc_noise_task, tasks, workers):
+        rows.extend(task_rows)
+    raw = pd.DataFrame(rows)
+    summary_rows = []
+    for observable, group in raw.groupby("observable", dropna=False):
+        if observable == "cell_count":
+            threshold = 0.5 * float(obs["cell_count"]["log_sd"])
+        else:
+            species = str(observable).removeprefix("ddpcr_")
+            threshold = 0.5 * float(obs["ddpcr"]["log_sd_by_species"].get(species, obs["ddpcr"]["default_log_sd"]))
+        sd = float(group["log_value"].astype(float).std(ddof=0))
+        if sd > threshold:
+            next_cells = min(30_000, max(int(cells) * 3, int(cells) + 1))
+        elif sd < threshold * 0.25:
+            next_cells = max(1_000 if cells >= METHOD_N_SIM_FIT else 1, int(cells) // 2)
+        else:
+            next_cells = int(cells)
+        summary_rows.append({"observable": observable, "estimated_mc_sd_log": sd, "threshold": threshold, "n_sim_cells_current": int(cells), "n_sim_cells_next": int(next_cells), "repeats": repeats, "particles_checked": int(selected["particle_id"].nunique())})
+    return pd.DataFrame(summary_rows)
 
 
-def _posterior_weights(scores: pd.DataFrame) -> pd.DataFrame:
-    shifted = scores["score"].astype(float) - float(scores["score"].min())
-    raw = np.exp(-0.5 * shifted.to_numpy(dtype=float))
-    total = float(np.sum(raw))
-    weights = raw / total if total > 0.0 else np.ones(len(raw), dtype=float) / max(1, len(raw))
-    result = scores.copy()
-    result["weight"] = weights
-    return result
+def _mc_noise_task(task: tuple[dict, dict, dict, int, int, int]) -> list[dict]:
+    param_dict, artifacts, obs, cells, sim_seed, repeat = task
+    param = pd.Series(param_dict)
+    particle_id = int(param.get("particle_id", 0))
+    simulated = _simulate_particle_full(param, artifacts, obs, cells=cells, seed=sim_seed)
+    dd = simulated["predictions"]["ddpcr"]
+    cc = simulated["predictions"]["cell_count"]
+    rows = []
+    for species, group in dd.groupby("species", dropna=False):
+        rows.append({"particle_id": particle_id, "repeat": repeat, "observable": f"ddpcr_{species}", "log_value": float(np.log(group["predicted_bulk_mean"].astype(float).clip(lower=1e-9)).mean())})
+    rows.append({"particle_id": particle_id, "repeat": repeat, "observable": "cell_count", "log_value": float(np.log(cc["predicted_cell_count"].astype(float).clip(lower=0.0) + 1.0).mean())})
+    return rows
 
 
-def _write_ppc_report(out: Path, weights: pd.DataFrame, target: pd.DataFrame, features: pd.DataFrame) -> dict:
-    accepted_weights = _accepted_normalized_weights(weights)
-    merged = features.merge(accepted_weights[["particle_id", "accepted_weight"]], on="particle_id", how="inner")
-    merged["weighted_value"] = merged["value"].astype(float) * merged["accepted_weight"].astype(float)
-    weighted = merged.groupby("feature_id", as_index=False)["weighted_value"].sum().rename(columns={"weighted_value": "posterior_mean"})
-    report = target[["feature_id", "channel", "target", "variance"]].merge(weighted, on="feature_id", how="left")
-    report["abs_error"] = (report["posterior_mean"] - report["target"]).abs()
-    report["covered_by_two_sigma"] = report["abs_error"] <= 2.0 * np.sqrt(report["variance"].astype(float).clip(lower=1e-9))
-    channel = report.groupby("channel", as_index=False)["abs_error"].mean()
-    coverage = report.groupby("channel", as_index=False)["covered_by_two_sigma"].mean().rename(columns={"covered_by_two_sigma": "coverage"})
-    write_table(channel, out / "full_ppc_channel_errors.parquet")
-    write_table(coverage, out / "full_ppc_channel_coverage.parquet")
-    ess = _effective_sample_size(accepted_weights["accepted_weight"].astype(float).to_numpy())
-    payload = {
-        "score_components": list(SCORE_COMPONENTS),
-        "mean_abs_error_by_channel": dict(zip(channel["channel"], channel["abs_error"])),
-        "coverage_by_channel": dict(zip(coverage["channel"], coverage["coverage"].astype(float))),
-        "history_ensemble_not_single_best_parameter": True,
-        "ppc_particle_scope": "accepted_particles_only_with_renormalized_weights",
-        "accepted_particle_ess": ess,
-    }
-    write_json(
-        out / "full_ppc_report.json",
-        payload,
-    )
-    write_markdown_report(
-        out / "full_ppc_report.md",
-        "Full Posterior Predictive Check",
-        [
-            ("Scope", "Compared weighted particle summaries against raw/lite target features."),
-            ("Channels", ", ".join(str(channel_name) for channel_name in channel["channel"])),
-            ("Particle Scope", "Only accepted particles are used, with posterior weights renormalized within the accepted ensemble."),
-            ("Interpretation", "Accepted output is a weighted history ensemble, not a unique best-fit full parameter."),
-        ],
-    )
-    return payload
+def _replay_cell_count(cells: int) -> int:
+    if int(cells) >= METHOD_N_SIM_FIT:
+        return METHOD_N_SIM_REPLAY
+    return max(int(cells), int(cells) * 2)
 
 
-def _full_continue_diagnostics(weights: pd.DataFrame, ppc_payload: dict, scenario_classes: pd.DataFrame) -> dict:
-    accepted = _accepted_normalized_weights(weights)
-    retained = int(accepted["particle_id"].nunique())
-    ess = _effective_sample_size(accepted["accepted_weight"].astype(float).to_numpy())
-    coverage = {str(key): float(value) for key, value in ppc_payload.get("coverage_by_channel", {}).items()}
-    thresholds = {
-        "particle_ess_ge_20pct_retained": bool(ess >= 0.2 * max(1, retained)),
-        "flow_ppc_ge_0.85": bool(coverage.get("flow", 1.0) >= 0.85),
-        "ectag_ppc_ge_0.80": bool(coverage.get("ectag", 1.0) >= 0.80),
-        "qpcdr_ppc_ge_0.85": bool(coverage.get("qpcdr", 1.0) >= 0.85),
-        "ddpcr_ppc_ge_0.90": bool(coverage.get("ddpcr", 1.0) >= 0.90),
-        "cell_count_ppc_ge_0.85": bool(coverage.get("cell_count", 1.0) >= 0.85),
-        "lite_summary_ppc_ge_0.80": bool(coverage.get("lite_summary", 1.0) >= 0.80),
-    }
-    sensitivity = _prior_sensitivity_summary(weights, scenario_classes)
-    thresholds["prior_bounds_sensitivity_20pct_passed"] = bool(sensitivity["primary_scenario_retained"])
-    accepted_scenarios = scenario_classes[scenario_classes["accepted"]] if "accepted" in scenario_classes else scenario_classes
-    thresholds["scenario_diversity_not_single_history"] = bool(retained > 1 and accepted_scenarios["scenario_class"].nunique() >= 1)
-    return {
-        "retained_particles": retained,
-        "accepted_particle_ess": ess,
-        "coverage_by_channel": coverage,
-        "prior_sensitivity_20pct": sensitivity,
-        "continue_thresholds": thresholds,
-        "continue_gate_passed": bool(all(thresholds.values())),
-    }
-
-
-def _prior_sensitivity_summary(weights: pd.DataFrame, scenario_classes: pd.DataFrame) -> dict:
-    if scenario_classes.empty:
-        return {"primary_scenario": "", "primary_scenario_retained": False, "scenario_weight_by_scale": {}}
-    merged = scenario_classes.merge(weights[["particle_id", "score", "accepted"]], on=["particle_id", "accepted"], how="left")
-    accepted = merged[merged["accepted"]].copy()
-    if accepted.empty:
-        accepted = merged.copy()
-    scenario_weight_by_scale: dict[str, dict[str, float]] = {}
-    primary_scenario = ""
-    for scale in (0.8, 1.0, 1.2):
-        shifted = accepted["score"].astype(float) - float(accepted["score"].astype(float).min())
-        raw = accepted["posterior_weight"].astype(float).to_numpy() * np.exp(-0.5 * (float(scale) - 1.0) * shifted.to_numpy(dtype=float))
-        total = float(np.sum(raw))
-        normalized = raw / total if total > 0.0 and np.isfinite(total) else np.ones(len(raw), dtype=float) / max(1, len(raw))
-        temp = accepted[["scenario_class"]].copy()
-        temp["weight"] = normalized
-        summary = temp.groupby("scenario_class")["weight"].sum().sort_values(ascending=False)
-        scenario_weight_by_scale[f"{scale:.1f}"] = {str(key): float(value) for key, value in summary.items()}
-        if scale == 1.0 and not summary.empty:
-            primary_scenario = str(summary.index[0])
-    retained = all(weights_by_scenario.get(primary_scenario, 0.0) > 0.0 for weights_by_scenario in scenario_weight_by_scale.values()) if primary_scenario else False
-    return {
-        "policy": "posterior scenario weights reweighted after +/-20% prior-score scale perturbation",
-        "primary_scenario": primary_scenario,
-        "primary_scenario_retained": bool(retained),
-        "scenario_weight_by_scale": scenario_weight_by_scale,
-    }
-
-
-def _write_incompatibility_report(out: Path, diagnostics: dict) -> None:
-    failed = [name for name, passed in diagnostics.get("continue_thresholds", {}).items() if not passed]
-    write_markdown_report(
-        out / "FULL_model_incompatibility_report.md",
-        "FULL Model Incompatibility Report",
-        [
-            ("Conclusion", "Under the current v4 full structure and locked observation model, the run did not pass every stability gate."),
-            ("Failed Gates", ", ".join(failed) if failed else "none"),
-            (
-                "Allowed Recovery Order",
-                "Increase particle count; relax summary tolerance without changing observation calibration; identify the conflicting data source; rerun before changing biological interpretation.",
-            ),
-        ],
-    )
-
-
-def _accepted_normalized_weights(weights: pd.DataFrame) -> pd.DataFrame:
-    accepted = weights[weights["accepted"]].copy()
-    if accepted.empty:
-        accepted = weights.copy()
-    total = float(accepted["weight"].astype(float).sum())
-    if total <= 0.0 or not np.isfinite(total):
-        accepted["accepted_weight"] = 1.0 / max(1, len(accepted))
-    else:
-        accepted["accepted_weight"] = accepted["weight"].astype(float) / total
-    return accepted
+def _replay_repetitions(cells: int) -> int:
+    return 3 if int(cells) >= METHOD_N_SIM_FIT else 1
 
 
 def _effective_sample_size(weights: np.ndarray) -> float:
     values = np.asarray(weights, dtype=float)
-    total = float(np.sum(values))
-    if total <= 0.0 or not np.isfinite(total):
+    total = float(values.sum())
+    if total <= 0:
         return 0.0
-    normalized = values / total
-    denom = float(np.sum(normalized * normalized))
-    return float(1.0 / denom) if denom > 0.0 else 0.0
+    p = values / total
+    denom = float(np.sum(p * p))
+    return float(1.0 / denom) if denom > 0 else 0.0
