@@ -4,7 +4,9 @@ Configuration and shared math utilities for the ecDNA model.
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Dict
 
 import numpy as np
@@ -128,7 +130,7 @@ def validate_probability_vector(values: np.ndarray, *, name: str, expected_shape
 
 
 def _weekly_record_times() -> tuple[float, ...]:
-    return tuple(float(week) for week in range(1, 11))
+    return tuple(float(week) for week in range(1, 6))
 
 
 @dataclass(frozen=True)
@@ -139,13 +141,13 @@ class ExposureParameters:
     eta_P: float = 0.007
     D_C0: float = 0.0
     D_P0: float = 0.0
-    nu_C: float = 0.75
-    nu_P: float = 0.35
+    nu_C: float = 0.22
+    nu_P: float = 0.65
     burden_weights: np.ndarray = field(
-        default_factory=lambda: np.array([0.36, 0.28, 0.36], dtype=float)
+        default_factory=lambda: np.array([0.25, 0.50, 0.25], dtype=float)
     )
     proliferative_weights: np.ndarray = field(
-        default_factory=lambda: np.array([0.70, 0.30], dtype=float)
+        default_factory=lambda: np.array([0.42, 0.58], dtype=float)
     )
 
 
@@ -153,8 +155,8 @@ class ExposureParameters:
 class StateLandscapeParameters:
     alpha: np.ndarray = field(default_factory=lambda: np.array([0.25, 0.22, 0.08, 0.05], dtype=float))
     gamma_M: np.ndarray = field(default_factory=lambda: np.array([0.01, 0.00, 0.00, 0.01], dtype=float))
-    gamma_C: np.ndarray = field(default_factory=lambda: np.array([0.08, 0.02, -0.02, -0.02], dtype=float))
-    gamma_P: np.ndarray = field(default_factory=lambda: np.array([0.02, 0.08, -0.02, -0.02], dtype=float))
+    gamma_C: np.ndarray = field(default_factory=lambda: np.array([0.30, 0.06, -0.06, -0.06], dtype=float))
+    gamma_P: np.ndarray = field(default_factory=lambda: np.array([0.00, 0.12, -0.03, -0.03], dtype=float))
     eta_a: np.ndarray = field(default_factory=lambda: np.array([-0.15, -0.10, 1.15, -0.10], dtype=float))
     eta_m: np.ndarray = field(default_factory=lambda: np.array([-0.20, -0.15, -0.10, 1.10], dtype=float))
     xi_B: np.ndarray = field(default_factory=lambda: np.array([0.05, 0.05, 0.04, 0.05], dtype=float))
@@ -166,10 +168,10 @@ class StateLandscapeParameters:
 @dataclass(frozen=True)
 class StressSurvivalParameters:
     alpha_R: float = 0.05
-    r_B: float = 0.18
+    r_B: float = 0.22
     r_S: float = 0.45
-    r_C: float = 0.12
-    r_P: float = 0.10
+    r_C: float = 1.25
+    r_P: float = 0.60
     r_m: float = 0.20
     b_R: float = 0.90
     sigma_R: float = 0.12
@@ -178,8 +180,8 @@ class StressSurvivalParameters:
     v_A: float = 0.32
     v_Q: float = 0.22
     v_R: float = 0.35
-    v_C: float = 0.06
-    v_P: float = 0.05
+    v_C: float = 0.35
+    v_P: float = 0.23
     v_a: float = 0.24
     b_V: float = 0.85
     sigma_V: float = 0.10
@@ -187,17 +189,17 @@ class StressSurvivalParameters:
 
 @dataclass(frozen=True)
 class CycleTransitionParameters:
-    qbar_G1S: float = 0.70
+    qbar_G1S: float = 1.60
     qbar_G1Q: float = 0.14
-    qbar_QG1: float = 0.42
-    qbar_SG2M: float = 0.65
+    qbar_QG1: float = 1.00
+    qbar_SG2M: float = 4.00
     beta_0: float = -0.90
-    beta_P: float = 1.05
-    beta_NO: float = 0.65
+    beta_P: float = 2.00
+    beta_NO: float = 0.85
     beta_R: float = 0.45
     beta_V: float = 0.55
-    beta_C: float = 1.10
-    beta_Pg: float = 0.45
+    beta_C: float = 5.50
+    beta_Pg: float = 1.70
     gamma_0: float = -1.70
     gamma_M: float = 0.65
     gamma_R: float = 0.65
@@ -240,23 +242,23 @@ class TurnoverSpeciesParameters:
 
 @dataclass(frozen=True)
 class HazardParameters:
-    lambda_div_ceiling: float = 0.62
-    lambda_death_ceiling: float = 0.18
+    lambda_div_ceiling: float = 9.00
+    lambda_death_ceiling: float = 1.40
     theta_0: float = -0.15
-    theta_P: float = 1.00
-    theta_NO: float = 0.70
-    theta_R: float = 0.50
-    theta_V: float = 0.65
-    B_star: float = 3.9
-    chi_B: float = 0.10
-    phi_0: float = -2.10
-    phi_R: float = 0.75
-    phi_V: float = 0.95
+    theta_P: float = 2.30
+    theta_NO: float = 1.30
+    theta_R: float = 0.55
+    theta_V: float = 1.00
+    B_star: float = 3.60
+    chi_B: float = 0.30
+    phi_0: float = -5.15
+    phi_R: float = 1.20
+    phi_V: float = 1.10
     phi_M: float = 0.15
     phi_B: float = 0.10
-    chi_C: float = 0.18
-    chi_P: float = 0.18
-    omega_O_given_C: float = 0.25
+    chi_C: float = 0.85
+    chi_P: float = 0.55
+    omega_O_given_C: float = 0.12
     min_division_age: float = 0.25
     age_gate_slope: float = 6.0
 
@@ -313,17 +315,17 @@ class TransitionGeneratorParameters:
 
 @dataclass(frozen=True)
 class SimulationParameters:
-    dt: float = 0.01
+    dt: float = 0.20
     time_unit: str = "week"
     record_times: tuple[float, ...] = field(default_factory=_weekly_record_times)
-    t_max: float = 10.0
-    n_init: int = 80
-    target_population_size: int | None = None
-    max_pop_size: int = 500000
-    random_seed: int = 42
+    t_max: float = 5.0
+    n_init: int = 1200
+    target_population_size: int | None = 10000
+    max_pop_size: int = 10000
+    random_seed: int = 20260504
     fitting_mode: bool = False
     record_full_snapshots: bool = False
-    record_events: bool = False
+    record_events: bool = True
     record_histograms: bool = True
     max_cells_saved_per_snapshot: int = 1000
 
@@ -365,9 +367,9 @@ class ObservationParameters:
 @dataclass(frozen=True)
 class InitializationParameters:
     mode: str = PARAMETRIC
-    parametric_copy_number_mean: np.ndarray = field(default_factory=lambda: np.array([50.0, 37.5, 46.0], dtype=float))
-    parametric_state_dirichlet_alpha: np.ndarray = field(default_factory=lambda: np.array([3.4, 3.2, 1.7, 1.6], dtype=float))
-    cycle_probabilities: np.ndarray = field(default_factory=lambda: np.array([0.15, 0.55, 0.20, 0.10], dtype=float))
+    parametric_copy_number_mean: np.ndarray = field(default_factory=lambda: np.array([114.0, 101.7, 107.1], dtype=float))
+    parametric_state_dirichlet_alpha: np.ndarray = field(default_factory=lambda: np.array([33.0, 37.0, 14.0, 16.0], dtype=float))
+    cycle_probabilities: np.ndarray = field(default_factory=lambda: np.array([0.12, 0.58, 0.22, 0.08], dtype=float))
     age_scale: float = 1.0
     empirical_flow_fractions: np.ndarray | None = None
     empirical_sorted_copy_distributions: dict[str, np.ndarray] | None = None
@@ -385,6 +387,140 @@ DEFAULT_INPUT_SCHEDULES: Dict[str, Callable[[float], float]] = {
     "a": lambda _t: 0.0,
     "m": lambda _t: 0.0,
 }
+
+
+T87_CONDITION_TREATMENTS: dict[str, tuple[str, float]] = {
+    "ctrl": ("vehicle", 0.0),
+    "P10": ("Palbociclib", 10.0),
+    "P50": ("Palbociclib", 50.0),
+    "P250": ("Palbociclib", 250.0),
+    "R20": ("Ripretinib", 20.0),
+    "R100": ("Ripretinib", 100.0),
+    "R500": ("Ripretinib", 500.0),
+}
+
+T87_INITIAL_STATE_FRACTIONS = np.array([0.33, 0.37, 0.14, 0.16], dtype=float)
+T87_INITIAL_CYCLE_PROBABILITIES = np.array([0.12, 0.58, 0.22, 0.08], dtype=float)
+
+T87_BASE_STATE_COPY_MULTIPLIERS = np.array(
+    [
+        [1.05, 1.15, 0.90],
+        [1.00, 1.05, 1.16],
+        [0.95, 0.80, 0.90],
+        [0.95, 0.75, 0.90],
+    ],
+    dtype=float,
+)
+
+T87_CDK4I_STATE_COPY_MULTIPLIERS = np.array(
+    [
+        [1.05, 1.32, 0.90],
+        [1.00, 1.08, 1.16],
+        [0.95, 0.62, 0.90],
+        [0.95, 0.58, 0.90],
+    ],
+    dtype=float,
+)
+
+T87_CONDITION_COPY_SCALERS: dict[str, np.ndarray] = {
+    "ctrl": np.array([1.00, 1.00, 1.00], dtype=float),
+    "P10": np.array([1.00, 1.24, 1.00], dtype=float),
+    "P50": np.array([1.00, 1.18, 1.00], dtype=float),
+    "P250": np.array([1.00, 1.30, 1.00], dtype=float),
+    "R20": np.array([1.00, 1.00, 1.00], dtype=float),
+    "R100": np.array([1.00, 1.00, 1.00], dtype=float),
+    "R500": np.array([0.85, 1.00, 0.80], dtype=float),
+}
+
+
+def t87_input_schedules_for_condition(condition: str) -> dict[str, Callable[[float], float]]:
+    """Return continuous CDK4i/PDGFRAi schedules for a T87 condition."""
+
+    if condition not in T87_CONDITION_TREATMENTS:
+        raise ValueError(f"Unsupported T87 condition: {condition}")
+    drug, dose = T87_CONDITION_TREATMENTS[condition]
+    return {
+        "u_C": lambda _t, drug=drug, dose=dose: dose if drug == "Palbociclib" else 0.0,
+        "u_P": lambda _t, drug=drug, dose=dose: dose if drug == "Ripretinib" else 0.0,
+        "a": lambda _t: 0.0,
+        "m": lambda _t: 0.0,
+    }
+
+
+def _read_t87_week1_ddpcr_means(ddpcr_path: str | Path, condition: str) -> np.ndarray:
+    means_by_species: dict[str, float] = {}
+    with Path(ddpcr_path).open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if int(float(row["week"])) != 1:
+                continue
+            if str(row["condition"]) != condition:
+                continue
+            species = str(row["species"])
+            if species in SPECIES:
+                means_by_species[species] = float(row["ddpcr_copy_number"])
+    missing = [species for species in SPECIES if species not in means_by_species]
+    require(not missing, f"Missing week-1 ddPCR anchors for {condition}: {missing}.")
+    return np.array([means_by_species[species] for species in SPECIES], dtype=float)
+
+
+def build_t87_initialization_parameters(
+    condition: str,
+    *,
+    ddpcr_path: str | Path = Path("raw") / "t87_drug_bulkfit" / "ddpcr.csv",
+    seed: int = 20260504,
+    rows_per_state: int = 8192,
+    overdispersion_phi: float = 3.5,
+) -> InitializationParameters:
+    """Build the condition-specific T87 initial population.
+
+    The initializer anchors each condition to week-1 ddPCR bulk means, then
+    creates overdispersed state-specific copy pools. CDK4i low/intermediate
+    conditions include a CDK4-high reservoir so the day56 CDK4i enrichment can
+    arise from selection without making turnover the primary explanation.
+    """
+
+    if condition not in T87_CONDITION_TREATMENTS:
+        raise ValueError(f"Unsupported T87 condition: {condition}")
+    require(rows_per_state > 0, "rows_per_state must be strictly positive.")
+    require(overdispersion_phi > 0.0, "overdispersion_phi must be strictly positive.")
+
+    mean_by_species = _read_t87_week1_ddpcr_means(ddpcr_path, condition)
+    mean_by_species = mean_by_species * T87_CONDITION_COPY_SCALERS[condition]
+
+    multipliers = (
+        T87_CDK4I_STATE_COPY_MULTIPLIERS
+        if condition in {"P10", "P50"}
+        else T87_BASE_STATE_COPY_MULTIPLIERS
+    ).copy()
+    weighted_means = T87_INITIAL_STATE_FRACTIONS @ multipliers
+    multipliers = multipliers / weighted_means
+
+    rng = np.random.default_rng(int(seed))
+    distributions: dict[str, np.ndarray] = {}
+    for state_idx, state_name in enumerate(STATE_NAMES):
+        state_means = mean_by_species * multipliers[state_idx]
+        matrix = np.zeros((int(rows_per_state), N_SPECIES), dtype=int)
+        for species_idx, mean in enumerate(state_means):
+            gamma_rates = rng.gamma(
+                shape=float(overdispersion_phi),
+                scale=float(mean) / float(overdispersion_phi),
+                size=int(rows_per_state),
+            )
+            matrix[:, species_idx] = rng.poisson(gamma_rates).astype(int)
+        distributions[state_name] = matrix
+
+    initialization = InitializationParameters(
+        mode=EMPIRICAL_WEEK1,
+        parametric_copy_number_mean=mean_by_species.copy(),
+        parametric_state_dirichlet_alpha=T87_INITIAL_STATE_FRACTIONS * 100.0,
+        cycle_probabilities=T87_INITIAL_CYCLE_PROBABILITIES.copy(),
+        age_scale=1.0,
+        empirical_flow_fractions=T87_INITIAL_STATE_FRACTIONS.copy(),
+        empirical_sorted_copy_distributions=distributions,
+        empirical_soft_state_concentration=25.0,
+    )
+    validate_initialization_parameters(initialization)
+    return initialization
 
 
 def _validate_finite_vector(values: np.ndarray, *, shape: tuple[int, ...], name: str) -> np.ndarray:

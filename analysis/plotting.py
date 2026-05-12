@@ -248,9 +248,17 @@ def plot_ecdna_copy_distributions(
     title: str = "ecDNA copy-number distributions",
     save_path: str | Path | None = None,
 ) -> plt.Figure:
-    snapshot_indices = _representative_snapshot_indices(result, target_count=3)
-    n_rows = max(1, len(snapshot_indices))
-    fig, axes = plt.subplots(n_rows, cfg.N_SPECIES, figsize=(14, 3.2 * n_rows), squeeze=False)
+    snapshot_indices = _nonempty_snapshot_indices(result)
+    if len(snapshot_indices) > 8:
+        sampled_positions = np.rint(np.linspace(0, len(snapshot_indices) - 1, num=8)).astype(int)
+        snapshot_indices = [snapshot_indices[pos] for pos in sorted(set(sampled_positions.tolist()))]
+
+    fig, axes = plt.subplots(
+        cfg.N_SPECIES,
+        1,
+        figsize=(10, 3.2 * cfg.N_SPECIES),
+        squeeze=False,
+    )
 
     if not snapshot_indices:
         for ax in axes.ravel():
@@ -259,33 +267,39 @@ def plot_ecdna_copy_distributions(
         fig.tight_layout()
         return _save(fig, save_path)
 
-    for row_idx, snapshot_idx in enumerate(snapshot_indices):
-        snapshot = result.cell_snapshots[snapshot_idx]
-        time = float(result.times[snapshot_idx])
-        copies = np.asarray([cell["copy_numbers"] for cell in snapshot], dtype=int)
-        states = np.asarray([_dominant_state_from_cell(cell) for cell in snapshot], dtype=int)
+    for species_idx, species_name in enumerate(cfg.SPECIES):
+        ax = axes[species_idx, 0]
+        time_labels: list[str] = []
+        values_by_time: list[np.ndarray] = []
+        for snapshot_idx in snapshot_indices:
+            snapshot = result.cell_snapshots[snapshot_idx]
+            copies = np.asarray([cell["copy_numbers"] for cell in snapshot], dtype=int)
+            if copies.size == 0:
+                continue
+            values_by_time.append(copies[:, species_idx])
+            time_labels.append(f"t={float(result.times[snapshot_idx]):.1f}")
 
-        for species_idx, species_name in enumerate(cfg.SPECIES):
-            ax = axes[row_idx, species_idx]
-            max_copy = int(np.max(copies[:, species_idx])) if copies.size else 0
-            bins = np.arange(0, max_copy + 2, dtype=float) - 0.5
-            for state_idx, state_name in enumerate(cfg.STATE_NAMES):
-                values = copies[states == state_idx, species_idx]
-                if values.size == 0:
-                    continue
-                ax.hist(
-                    values,
-                    bins=bins,
-                    histtype="step",
-                    linewidth=1.8,
-                    color=STATE_COLORS[state_idx],
-                    label=state_name if row_idx == 0 and species_idx == 0 else None,
-                )
-            ax.set_title(f"{species_name}, t={time:.2f}")
-            ax.set_xlabel("Copy number")
-            ax.set_ylabel("Cells")
+        if not values_by_time:
+            _blank_axis(ax, "No cell snapshots recorded")
+            continue
 
-    axes[0, 0].legend(frameon=False, fontsize=8)
+        positions = np.arange(len(values_by_time), dtype=float)
+        parts = ax.violinplot(values_by_time, positions=positions, showmeans=True, showextrema=False, widths=0.8)
+        for body in parts["bodies"]:
+            body.set_facecolor(SPECIES_COLORS[species_idx])
+            body.set_edgecolor(SPECIES_COLORS[species_idx])
+            body.set_alpha(0.35)
+        parts["cmeans"].set_color("#111827")
+        parts["cmeans"].set_linewidth(1.0)
+
+        max_values = [float(np.max(values)) for values in values_by_time]
+        ax.scatter(positions, max_values, s=18, color="#111827", zorder=3)
+        ax.set_title(species_name)
+        ax.set_xticks(positions, labels=time_labels, rotation=45, ha="right")
+        ax.set_xlabel("Time")
+        ax.set_ylabel("ecDNA copy number")
+        ax.grid(axis="y", color="#e5e7eb", linewidth=0.7)
+
     fig.suptitle(title)
     fig.tight_layout()
     return _save(fig, save_path)
