@@ -130,7 +130,7 @@ def validate_probability_vector(values: np.ndarray, *, name: str, expected_shape
 
 
 def _weekly_record_times() -> tuple[float, ...]:
-    return tuple(float(week) for week in range(1, 6))
+    return tuple(float(week) for week in range(1, 31))
 
 
 @dataclass(frozen=True)
@@ -170,8 +170,8 @@ class StressSurvivalParameters:
     alpha_R: float = 0.05
     r_B: float = 0.22
     r_S: float = 0.45
-    r_C: float = 1.25
-    r_P: float = 0.60
+    r_C: float = 0.45
+    r_P: float = 0.10
     r_m: float = 0.20
     b_R: float = 0.90
     sigma_R: float = 0.12
@@ -180,8 +180,8 @@ class StressSurvivalParameters:
     v_A: float = 0.32
     v_Q: float = 0.22
     v_R: float = 0.35
-    v_C: float = 0.35
-    v_P: float = 0.23
+    v_C: float = 0.14
+    v_P: float = 0.035
     v_a: float = 0.24
     b_V: float = 0.85
     sigma_V: float = 0.10
@@ -198,8 +198,8 @@ class CycleTransitionParameters:
     beta_NO: float = 0.85
     beta_R: float = 0.45
     beta_V: float = 0.55
-    beta_C: float = 5.50
-    beta_Pg: float = 1.70
+    beta_C: float = 4.40
+    beta_Pg: float = 0.95
     gamma_0: float = -1.70
     gamma_M: float = 0.65
     gamma_R: float = 0.65
@@ -243,7 +243,7 @@ class TurnoverSpeciesParameters:
 @dataclass(frozen=True)
 class HazardParameters:
     lambda_div_ceiling: float = 9.00
-    lambda_death_ceiling: float = 1.40
+    lambda_death_ceiling: float = 0.40
     theta_0: float = -0.15
     theta_P: float = 2.30
     theta_NO: float = 1.30
@@ -256,8 +256,8 @@ class HazardParameters:
     phi_V: float = 1.10
     phi_M: float = 0.15
     phi_B: float = 0.10
-    chi_C: float = 0.85
-    chi_P: float = 0.55
+    chi_C: float = 0.75
+    chi_P: float = 0.32
     omega_O_given_C: float = 0.12
     min_division_age: float = 0.25
     age_gate_slope: float = 6.0
@@ -318,16 +318,15 @@ class SimulationParameters:
     dt: float = 0.20
     time_unit: str = "week"
     record_times: tuple[float, ...] = field(default_factory=_weekly_record_times)
-    t_max: float = 5.0
+    t_max: float = 30.0
     n_init: int = 1200
-    target_population_size: int | None = 10000
-    max_pop_size: int = 10000
+    target_population_size: int | None = 20000
+    max_pop_size: int = 20000
     random_seed: int = 20260504
     fitting_mode: bool = False
     record_full_snapshots: bool = False
-    record_events: bool = True
+    record_events: bool = False
     record_histograms: bool = True
-    max_cells_saved_per_snapshot: int = 1000
 
 
 @dataclass(frozen=True)
@@ -399,6 +398,16 @@ T87_CONDITION_TREATMENTS: dict[str, tuple[str, float]] = {
     "R500": ("Ripretinib", 500.0),
 }
 
+T87_TREATMENT_END_TIME = 5.0
+T87_CONDITION_EFFECTIVE_DOSES: dict[str, float] = {
+    "ctrl": 0.0,
+    "P10": 10.0,
+    "P50": 160.0,
+    "P250": 280.0,
+    "R20": 20.0,
+    "R100": 300.0,
+    "R500": 540.0,
+}
 T87_INITIAL_STATE_FRACTIONS = np.array([0.33, 0.37, 0.14, 0.16], dtype=float)
 T87_INITIAL_CYCLE_PROBABILITIES = np.array([0.12, 0.58, 0.22, 0.08], dtype=float)
 
@@ -424,9 +433,9 @@ T87_CDK4I_STATE_COPY_MULTIPLIERS = np.array(
 
 T87_CONDITION_COPY_SCALERS: dict[str, np.ndarray] = {
     "ctrl": np.array([1.00, 1.00, 1.00], dtype=float),
-    "P10": np.array([1.00, 1.24, 1.00], dtype=float),
-    "P50": np.array([1.00, 1.18, 1.00], dtype=float),
-    "P250": np.array([1.00, 1.30, 1.00], dtype=float),
+    "P10": np.array([1.00, 1.22, 1.00], dtype=float),
+    "P50": np.array([1.00, 1.15, 1.00], dtype=float),
+    "P250": np.array([1.00, 1.00, 1.00], dtype=float),
     "R20": np.array([1.00, 1.00, 1.00], dtype=float),
     "R100": np.array([1.00, 1.00, 1.00], dtype=float),
     "R500": np.array([0.85, 1.00, 0.80], dtype=float),
@@ -434,14 +443,19 @@ T87_CONDITION_COPY_SCALERS: dict[str, np.ndarray] = {
 
 
 def t87_input_schedules_for_condition(condition: str) -> dict[str, Callable[[float], float]]:
-    """Return continuous CDK4i/PDGFRAi schedules for a T87 condition."""
+    """Return CDK4i/PDGFRAi schedules for the T87 day21-to-day56 window."""
 
     if condition not in T87_CONDITION_TREATMENTS:
         raise ValueError(f"Unsupported T87 condition: {condition}")
     drug, dose = T87_CONDITION_TREATMENTS[condition]
+    effective_dose = T87_CONDITION_EFFECTIVE_DOSES[condition]
     return {
-        "u_C": lambda _t, drug=drug, dose=dose: dose if drug == "Palbociclib" else 0.0,
-        "u_P": lambda _t, drug=drug, dose=dose: dose if drug == "Ripretinib" else 0.0,
+        "u_C": lambda _t, drug=drug, effective_dose=effective_dose: (
+            effective_dose if drug == "Palbociclib" and float(_t) <= T87_TREATMENT_END_TIME else 0.0
+        ),
+        "u_P": lambda _t, drug=drug, effective_dose=effective_dose: (
+            effective_dose if drug == "Ripretinib" and float(_t) <= T87_TREATMENT_END_TIME else 0.0
+        ),
         "a": lambda _t: 0.0,
         "m": lambda _t: 0.0,
     }
@@ -550,7 +564,6 @@ def validate_simulation_parameters(params: SimulationParameters) -> None:
         )
     if params.fitting_mode:
         require(params.target_population_size is None, "target_population_size is forbidden when fitting_mode=True.")
-    require(params.max_cells_saved_per_snapshot > 0, "Simulation max_cells_saved_per_snapshot must be strictly positive.")
 
 
 def validate_model_parameters(params: ModelParameters) -> None:

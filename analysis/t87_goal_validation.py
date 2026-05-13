@@ -5,6 +5,7 @@ Run the T87 goal validation against the current config defaults.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 
@@ -197,6 +198,40 @@ def _day56_summary(timeline: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _growth_summary(timeline: pd.DataFrame) -> pd.DataFrame:
+    window = timeline[timeline["week"].astype(int).between(1, 6)].copy()
+    rows = []
+    for condition, group in window.sort_values(["condition", "week"]).groupby("condition", sort=False):
+        group = group.sort_values("week")
+        first = group.iloc[0]
+        last = group.iloc[-1]
+        week_span = float(last["week"] - first["week"])
+        sim_slope = (float(last["sim_log10_cell_count"]) - float(first["sim_log10_cell_count"])) / week_span
+        exp_slope = (float(last["exp_log10_cell_count"]) - float(first["exp_log10_cell_count"])) / week_span
+        rows.append(
+            {
+                "condition": condition,
+                "condition_label": str(last["condition_label"]),
+                "week_start": int(first["week"]),
+                "week_end": int(last["week"]),
+                "sim_day56_representative_cells": int(last["sim_representative_cells"]),
+                "exp_day56_cell_count": float(last["exp_cell_count"]),
+                "sim_log10_slope": sim_slope,
+                "exp_log10_slope": exp_slope,
+                "sim_monotonic_growth": bool(
+                    (group["sim_representative_cells"].astype(float).diff().dropna() > 0.0).all()
+                ),
+                "exp_monotonic_growth": bool((group["exp_cell_count"].astype(float).diff().dropna() > 0.0).all()),
+            }
+        )
+    summary = pd.DataFrame(rows)
+    ctrl = summary[summary["condition"] == "ctrl"].iloc[0]
+    summary["sim_slope_ratio_vs_ctrl"] = summary["sim_log10_slope"] / float(ctrl["sim_log10_slope"])
+    summary["exp_slope_ratio_vs_ctrl"] = summary["exp_log10_slope"] / float(ctrl["exp_log10_slope"])
+    summary["slope_ratio_error"] = summary["sim_slope_ratio_vs_ctrl"] - summary["exp_slope_ratio_vs_ctrl"]
+    return summary
+
+
 def _initial_state_summary(raw_dir: Path, rows_per_state: int, seed: int) -> pd.DataFrame:
     rows = []
     for condition in CONDITIONS:
@@ -226,7 +261,12 @@ def _initial_state_summary(raw_dir: Path, rows_per_state: int, seed: int) -> pd.
     return pd.DataFrame(rows)
 
 
-def _write_markdown_report(output_dir: Path, day56: pd.DataFrame, stops: pd.DataFrame) -> None:
+def _write_markdown_report(
+    output_dir: Path,
+    day56: pd.DataFrame,
+    growth: pd.DataFrame,
+    stops: pd.DataFrame,
+) -> None:
     special = {
         "P10_CDK4_gt_ctrl": bool(
             day56.loc[day56["condition"] == "P10", "sim_CDK4_ratio_vs_ctrl"].iloc[0] > 1.0
@@ -245,6 +285,7 @@ def _write_markdown_report(output_dir: Path, day56: pd.DataFrame, stops: pd.Data
         "# T87 Goal Validation",
         "",
         "Mechanism priority: selection, drug effective signal, and condition-specific initial heterogeneity. Turnover parameters are not used as the primary fitting lever in this validation.",
+        f"Treatment window: week 1 to week 6, implemented as dosing through simulation time {cfg.T87_TREATMENT_END_TIME:g}. Extended simulation after day56 is used only to test whether each condition can reach the representative population target.",
         "",
         "## Stop Reasons",
         "",
@@ -253,6 +294,10 @@ def _write_markdown_report(output_dir: Path, day56: pd.DataFrame, stops: pd.Data
         "## Day56 Summary",
         "",
         day56.to_markdown(index=False, floatfmt=".4g"),
+        "",
+        "## Growth Summary",
+        "",
+        growth.to_markdown(index=False, floatfmt=".4g"),
         "",
         "## Special Checks",
         "",
@@ -272,30 +317,48 @@ def run(args: argparse.Namespace) -> None:
     cfg.validate_observation_parameters(cfg.DEFAULT_OBSERVATION_PARAMETERS)
 
     ddpcr, cell_count = _load_targets(raw_dir)
-    timeline_parts = []
-    stop_rows = []
-    for condition in CONDITIONS:
-        timeline, stop = _run_condition(
-            condition,
-            params=params,
-            raw_dir=raw_dir,
-            seed=int(args.seed),
-            rows_per_state=int(args.rows_per_state),
-        )
-        timeline_parts.append(timeline)
-        stop_rows.append(stop)
+    max_workers = min(max(1, int(args.workers)), len(CONDITIONS))
+    timeline_by_condition: dict[str, pd.DataFrame] = {}
+    stop_by_condition: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _run_condition,
+                condition,
+                params=params,
+                raw_dir=raw_dir,
+                seed=int(args.seed),
+                rows_per_state=int(args.rows_per_state),
+            ): condition
+            for condition in CONDITIONS
+        }
+        for future in as_completed(futures):
+            condition = futures[future]
+            timeline, stop = future.result()
+            timeline_by_condition[condition] = timeline
+            stop_by_condition[condition] = stop
+            print(
+                f"{condition}: stop={stop['stop_reason']} "
+                f"at t={float(stop['stop_time']):.2f}, "
+                f"final_cells={stop['final_representative_cells']}"
+            )
+
+    timeline_parts = [timeline_by_condition[condition] for condition in CONDITIONS]
+    stop_rows = [stop_by_condition[condition] for condition in CONDITIONS]
 
     timeline = pd.concat(timeline_parts, ignore_index=True)
     timeline = _add_targets_and_errors(timeline, ddpcr, cell_count, n_init=int(args.n_init))
     day56 = _day56_summary(timeline)
+    growth = _growth_summary(timeline)
     stops = pd.DataFrame(stop_rows)
     initial = _initial_state_summary(raw_dir, rows_per_state=int(args.rows_per_state), seed=int(args.seed))
 
     timeline.to_csv(output_dir / "timeline_comparison.csv", index=False)
     day56.to_csv(output_dir / "day56_summary.csv", index=False)
+    growth.to_csv(output_dir / "growth_summary.csv", index=False)
     stops.to_csv(output_dir / "stop_reasons.csv", index=False)
     initial.to_csv(output_dir / "initial_state_summary.csv", index=False)
-    _write_markdown_report(output_dir, day56, stops)
+    _write_markdown_report(output_dir, day56, growth, stops)
 
     print(f"Wrote validation outputs to {output_dir}")
     print(day56[["condition", "sim_CDK4_ratio_vs_ctrl", "exp_CDK4_ratio_vs_ctrl", "sim_PDGFRA_ratio_vs_ctrl", "exp_PDGFRA_ratio_vs_ctrl"]].to_string(index=False))
@@ -308,8 +371,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260504)
     parser.add_argument("--rows-per-state", type=int, default=512)
     parser.add_argument("--n-init", type=int, default=1200)
-    parser.add_argument("--target-population-size", type=int, default=10000)
-    parser.add_argument("--max-pop-size", type=int, default=10000)
+    parser.add_argument("--target-population-size", type=int, default=20000)
+    parser.add_argument("--max-pop-size", type=int, default=20000)
+    parser.add_argument("--workers", type=int, default=4, help="Parallel condition workers, capped at 7.")
     parser.add_argument("--record-events", action="store_true")
     return parser.parse_args()
 

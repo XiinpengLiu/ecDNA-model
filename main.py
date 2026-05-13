@@ -7,10 +7,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 
 import config as cfg
+from analysis.export_tables import write_simulation_tables
 from analysis.treatment import compute_bulk_copy_trends, compute_growth_rate, compute_terminal_event_counts
 from core.simulation import SimulationResult, run_simulation
 
@@ -40,23 +42,22 @@ def _build_model_parameters(args: argparse.Namespace) -> cfg.ModelParameters:
         target_population_size=_optional_population_size(int(args.target_population_size)),
         max_pop_size=int(args.max_pop_size),
         random_seed=int(args.seed),
-        record_full_snapshots=bool(args.record_full_snapshots or args.plots),
+        record_full_snapshots=True,
         record_events=not bool(args.no_record_events),
     )
     return replace(base, simulation=simulation)
 
 
-def _write_run_metadata(
-    output_dir: Path,
+def _build_run_metadata(
     *,
     condition: str,
     seed: int,
     rows_per_state: int,
     params: cfg.ModelParameters,
-) -> None:
+) -> dict[str, object]:
     drug, dose = cfg.T87_CONDITION_TREATMENTS[condition]
     simulation = params.simulation
-    metadata = {
+    return {
         "condition": condition,
         "drug": drug,
         "dose_nM": dose,
@@ -73,6 +74,9 @@ def _write_run_metadata(
             "record_events": simulation.record_events,
         },
     }
+
+
+def _write_run_metadata(output_dir: Path, metadata: dict[str, object]) -> None:
     output_dir.joinpath("run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
@@ -113,7 +117,6 @@ def run_condition(
     verbose: bool,
 ) -> dict[str, object]:
     condition_dir = output_dir / condition
-    data_dir = condition_dir / "simulation_data"
     condition_dir.mkdir(parents=True, exist_ok=True)
 
     initialization = cfg.build_t87_initialization_parameters(
@@ -129,18 +132,18 @@ def run_condition(
         seed=seed,
         verbose=verbose,
     )
-    result.save_as_csv(data_dir)
-    if plots:
-        from analysis.plotting import plot_single_run_diagnostic_suite
-
-        plot_single_run_diagnostic_suite(result, condition_dir)
-    _write_run_metadata(
-        condition_dir,
+    metadata = _build_run_metadata(
         condition=condition,
         seed=seed,
         rows_per_state=rows_per_state,
         params=params,
     )
+    write_simulation_tables(result, condition_dir, condition=condition, seed=seed, metadata=metadata)
+    if plots:
+        from analysis.plotting import plot_single_run_diagnostic_suite
+
+        plot_single_run_diagnostic_suite(result, condition_dir)
+    _write_run_metadata(condition_dir, metadata)
     return _summary_row(condition, result, condition_dir)
 
 
@@ -183,12 +186,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use 0 to disable target-population stopping.",
     )
     parser.add_argument("--max-pop-size", type=int, default=defaults.max_pop_size)
-    parser.add_argument(
-        "--record-full-snapshots",
-        action="store_true",
-        default=defaults.record_full_snapshots,
-        help="Save full cell snapshots. This can make output much larger.",
-    )
     parser.add_argument("--no-record-events", action="store_true", help="Do not save event logs.")
     parser.add_argument(
         "--plots",
@@ -220,25 +217,36 @@ def main() -> None:
     cfg.validate_model_parameters(params)
     cfg.validate_observation_parameters(cfg.DEFAULT_OBSERVATION_PARAMETERS)
 
-    rows = []
-    for condition in conditions:
-        print(f"Running {condition}...")
-        row = run_condition(
-            condition,
-            params=params,
-            raw_dir=raw_dir,
-            output_dir=output_dir,
-            seed=int(args.seed),
-            rows_per_state=int(args.rows_per_state),
-            plots=bool(args.plots),
-            verbose=not bool(args.quiet),
-        )
-        rows.append(row)
-        print(
-            f"{condition}: stop={row['stop_reason']} at t={float(row['stop_time']):.2f}, "
-            f"final_pop={row['final_population_size']}"
-        )
+    rows_by_condition: dict[str, dict[str, object]] = {}
+    max_workers = min(4, len(conditions))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
+        for condition in conditions:
+            print(f"Running {condition}...")
+            futures[
+                executor.submit(
+                    run_condition,
+                    condition,
+                    params=params,
+                    raw_dir=raw_dir,
+                    output_dir=output_dir,
+                    seed=int(args.seed),
+                    rows_per_state=int(args.rows_per_state),
+                    plots=bool(args.plots),
+                    verbose=not bool(args.quiet),
+                )
+            ] = condition
 
+        for future in as_completed(futures):
+            condition = futures[future]
+            row = future.result()
+            rows_by_condition[condition] = row
+            print(
+                f"{condition}: stop={row['stop_reason']} at t={float(row['stop_time']):.2f}, "
+                f"final_pop={row['final_population_size']}"
+            )
+
+    rows = [rows_by_condition[condition] for condition in conditions]
     _write_batch_summary(output_dir, rows)
     print(f"Results written to: {output_dir.resolve()}")
 

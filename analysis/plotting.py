@@ -17,6 +17,7 @@ from core.simulation import SimulationResult
 
 STATE_COLORS = ("#2563eb", "#16a34a", "#f59e0b", "#dc2626")
 SPECIES_COLORS = ("#1d4ed8", "#be123c", "#047857")
+DIAGNOSTIC_TIMEPOINT_COUNT = 8
 EVENT_COLORS = {
     "division": "#2563eb",
     "death": "#111827",
@@ -38,13 +39,17 @@ def _save(fig: plt.Figure, save_path: str | Path | None) -> plt.Figure:
 
 
 def plot_results(result: SimulationResult, title: str = "ecDNA simulation", save_path: str | Path | None = None) -> plt.Figure:
-    times = np.asarray(result.times, dtype=float)
-    state_fractions = np.asarray(result.soft_state_fractions, dtype=float)
-    bulk = np.asarray(result.bulk_copy_means, dtype=float)
+    record_indices = _terminal_aligned_record_indices(result)
+    times = np.asarray([result.times[idx] for idx in record_indices], dtype=float)
+    state_fractions = np.asarray(result.soft_state_fractions, dtype=float)[record_indices]
+    bulk = np.asarray(result.bulk_copy_means, dtype=float)[record_indices]
+    population_sizes = np.asarray(result.population_sizes, dtype=float)[record_indices]
+    mean_stress_scores = np.asarray(result.mean_stress_scores, dtype=float)[record_indices]
+    mean_survival_scores = np.asarray(result.mean_survival_scores, dtype=float)[record_indices]
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
-    axes[0, 0].plot(times, result.population_sizes, color="#1f2937", linewidth=2)
+    axes[0, 0].plot(times, population_sizes, color="#1f2937", linewidth=2)
     axes[0, 0].set_title("Population size")
     axes[0, 0].set_xlabel("Time")
     axes[0, 0].set_ylabel("Cells")
@@ -63,8 +68,8 @@ def plot_results(result: SimulationResult, title: str = "ecDNA simulation", save
     axes[1, 0].set_ylabel("Mean copies")
     axes[1, 0].legend(frameon=False, fontsize=8)
 
-    axes[1, 1].plot(times, result.mean_stress_scores, label="Stress score", linewidth=2)
-    axes[1, 1].plot(times, result.mean_survival_scores, label="Survival score", linewidth=2)
+    axes[1, 1].plot(times, mean_stress_scores, label="Stress score", linewidth=2)
+    axes[1, 1].plot(times, mean_survival_scores, label="Survival score", linewidth=2)
     axes[1, 1].set_title("Latent stress and survival")
     axes[1, 1].set_xlabel("Time")
     axes[1, 1].legend(frameon=False, fontsize=8)
@@ -75,10 +80,12 @@ def plot_results(result: SimulationResult, title: str = "ecDNA simulation", save
 
 
 def plot_observation_proxies(result: SimulationResult, save_path: str | Path | None = None) -> plt.Figure:
-    times = np.asarray(result.times, dtype=float)
-    flow_fractions = np.asarray([snapshot["flow_fractions"] for snapshot in result.observations], dtype=float)
-    qpcdr_means = np.asarray([snapshot["pooled_qpcdr_means"] for snapshot in result.observations], dtype=float)
-    counts = np.asarray([snapshot["observed_count"] for snapshot in result.observations], dtype=float)
+    record_indices = _terminal_aligned_record_indices(result)
+    times = np.asarray([result.times[idx] for idx in record_indices], dtype=float)
+    selected_observations = [result.observations[idx] for idx in record_indices]
+    flow_fractions = np.asarray([snapshot["flow_fractions"] for snapshot in selected_observations], dtype=float)
+    qpcdr_means = np.asarray([snapshot["pooled_qpcdr_means"] for snapshot in selected_observations], dtype=float)
+    counts = np.asarray([snapshot["observed_count"] for snapshot in selected_observations], dtype=float)
 
     fig, axes = plt.subplots(1, 3, figsize=(13, 4))
     axes[0].stackplot(times, flow_fractions.T, labels=cfg.STATE_NAMES)
@@ -158,14 +165,61 @@ def _nonempty_snapshot_indices(result: SimulationResult) -> list[int]:
     return [idx for idx, snapshot in enumerate(result.cell_snapshots) if snapshot]
 
 
-def _representative_snapshot_indices(result: SimulationResult, target_count: int = 3) -> list[int]:
+def _representative_snapshot_indices(result: SimulationResult, target_count: int | None = None) -> list[int]:
     nonempty = _nonempty_snapshot_indices(result)
     if not nonempty:
         return []
-    if len(nonempty) <= target_count:
+    if target_count is None or len(nonempty) <= target_count:
         return nonempty
     raw_positions = np.rint(np.linspace(0, len(nonempty) - 1, num=target_count)).astype(int)
     return [nonempty[pos] for pos in sorted(set(raw_positions.tolist()))]
+
+
+def _terminal_aligned_indices_by_time(
+    result: SimulationResult,
+    candidate_indices: list[int],
+    target_count: int | None = DIAGNOSTIC_TIMEPOINT_COUNT,
+) -> list[int]:
+    """Return all indices by default; optionally select a terminal-aligned subset."""
+    if target_count is None:
+        return list(candidate_indices)
+    if target_count <= 0:
+        return []
+    if len(candidate_indices) <= target_count:
+        return candidate_indices
+
+    times = np.asarray([float(result.times[idx]) for idx in candidate_indices], dtype=float)
+    target_times = np.linspace(float(times[0]), float(times[-1]), num=target_count)
+    selected_positions: list[int] = []
+    previous_position = -1
+
+    for target_idx, target_time in enumerate(target_times):
+        remaining_slots = target_count - target_idx - 1
+        min_position = previous_position + 1
+        max_position = len(candidate_indices) - remaining_slots - 1
+        if target_idx == target_count - 1:
+            position = len(candidate_indices) - 1
+        else:
+            candidate_times = times[min_position : max_position + 1]
+            position = min_position + int(np.argmin(np.abs(candidate_times - target_time)))
+        selected_positions.append(position)
+        previous_position = position
+
+    return [candidate_indices[pos] for pos in selected_positions]
+
+
+def _terminal_aligned_record_indices(
+    result: SimulationResult,
+    target_count: int | None = DIAGNOSTIC_TIMEPOINT_COUNT,
+) -> list[int]:
+    return _terminal_aligned_indices_by_time(result, list(range(len(result.times))), target_count)
+
+
+def _terminal_aligned_snapshot_indices(
+    result: SimulationResult,
+    target_count: int | None = DIAGNOSTIC_TIMEPOINT_COUNT,
+) -> list[int]:
+    return _terminal_aligned_indices_by_time(result, _nonempty_snapshot_indices(result), target_count)
 
 
 def _blank_axis(ax: plt.Axes, message: str) -> None:
@@ -179,11 +233,13 @@ def plot_population_state_counts(
     title: str = "Population and state counts",
     save_path: str | Path | None = None,
 ) -> plt.Figure:
-    times = np.asarray(result.times, dtype=float)
-    state_counts = _state_count_matrix(result)
+    record_indices = _terminal_aligned_record_indices(result)
+    times = np.asarray([result.times[idx] for idx in record_indices], dtype=float)
+    state_counts = _state_count_matrix(result)[record_indices]
+    population_sizes = np.asarray(result.population_sizes, dtype=float)[record_indices]
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(times, result.population_sizes, color="#111827", linewidth=2.5, label="Total")
+    ax.plot(times, population_sizes, color="#111827", linewidth=2.5, label="Total")
     for state_idx, state_name in enumerate(cfg.STATE_NAMES):
         ax.plot(times, state_counts[:, state_idx], color=STATE_COLORS[state_idx], linewidth=2, label=state_name)
     ax.set_title(title)
@@ -199,8 +255,9 @@ def plot_state_fraction_trajectories(
     title: str = "State fraction trajectories",
     save_path: str | Path | None = None,
 ) -> plt.Figure:
-    times = np.asarray(result.times, dtype=float)
-    state_fractions = np.asarray(result.soft_state_fractions, dtype=float)
+    record_indices = _terminal_aligned_record_indices(result)
+    times = np.asarray([result.times[idx] for idx in record_indices], dtype=float)
+    state_fractions = np.asarray(result.soft_state_fractions, dtype=float)[record_indices]
 
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.stackplot(times, state_fractions.T, labels=cfg.STATE_NAMES, colors=STATE_COLORS, alpha=0.85)
@@ -218,9 +275,10 @@ def plot_ecdna_mean_trajectories(
     title: str = "ecDNA copy-number trajectories",
     save_path: str | Path | None = None,
 ) -> plt.Figure:
-    times = np.asarray(result.times, dtype=float)
-    bulk = np.asarray(result.bulk_copy_means, dtype=float)
-    by_state = _state_copy_mean_tensor(result)
+    record_indices = _terminal_aligned_record_indices(result)
+    times = np.asarray([result.times[idx] for idx in record_indices], dtype=float)
+    bulk = np.asarray(result.bulk_copy_means, dtype=float)[record_indices]
+    by_state = _state_copy_mean_tensor(result)[record_indices]
 
     fig, axes = plt.subplots(1, cfg.N_SPECIES, figsize=(14, 4), sharex=True)
     for species_idx, species_name in enumerate(cfg.SPECIES):
@@ -248,10 +306,7 @@ def plot_ecdna_copy_distributions(
     title: str = "ecDNA copy-number distributions",
     save_path: str | Path | None = None,
 ) -> plt.Figure:
-    snapshot_indices = _nonempty_snapshot_indices(result)
-    if len(snapshot_indices) > 8:
-        sampled_positions = np.rint(np.linspace(0, len(snapshot_indices) - 1, num=8)).astype(int)
-        snapshot_indices = [snapshot_indices[pos] for pos in sorted(set(sampled_positions.tolist()))]
+    snapshot_indices = _terminal_aligned_snapshot_indices(result)
 
     fig, axes = plt.subplots(
         cfg.N_SPECIES,
@@ -334,7 +389,8 @@ def plot_event_counts_by_window(
     title: str = "Event counts by time window",
     save_path: str | Path | None = None,
 ) -> plt.Figure:
-    times = np.asarray(result.times, dtype=float)
+    record_indices = _terminal_aligned_record_indices(result)
+    times = np.asarray([result.times[idx] for idx in record_indices], dtype=float)
     if times.size == 0:
         fig, ax = plt.subplots(figsize=(9, 4))
         _blank_axis(ax, "No recorded times")
@@ -377,11 +433,13 @@ def plot_event_counts_by_window(
     return _save(fig, save_path)
 
 
-def _state_transition_counts(result: SimulationResult) -> np.ndarray:
+def _state_transition_counts(result: SimulationResult, snapshot_indices: list[int] | None = None) -> np.ndarray:
     transition_counts = np.zeros((cfg.N_STATES, cfg.N_STATES), dtype=float)
+    indices = list(range(len(result.cell_snapshots))) if snapshot_indices is None else snapshot_indices
 
     previous_states: dict[int, int] | None = None
-    for snapshot in result.cell_snapshots:
+    for snapshot_idx in indices:
+        snapshot = result.cell_snapshots[snapshot_idx]
         current_states = {int(cell["cell_id"]): _dominant_state_from_cell(cell) for cell in snapshot}
         if previous_states is not None:
             for cell_id, previous_state in previous_states.items():
@@ -409,7 +467,8 @@ def plot_state_transition_heatmap(
     title: str = "Dominant-state transition counts",
     save_path: str | Path | None = None,
 ) -> plt.Figure:
-    transition_counts = _state_transition_counts(result)
+    snapshot_indices = _terminal_aligned_snapshot_indices(result)
+    transition_counts = _state_transition_counts(result, snapshot_indices)
 
     fig, ax = plt.subplots(figsize=(6, 5))
     image = ax.imshow(transition_counts, cmap="Blues")
@@ -434,10 +493,10 @@ def plot_state_transition_heatmap(
     return _save(fig, save_path)
 
 
-def _sample_cell_ids_from_latest_snapshot(result: SimulationResult, n_cells: int) -> list[int]:
+def _cell_ids_from_latest_snapshot(result: SimulationResult, n_cells: int | None = None) -> list[int]:
     _latest_time, latest_snapshot = _latest_nonempty_snapshot(result)
     ids = sorted(int(cell["cell_id"]) for cell in latest_snapshot)
-    if len(ids) <= n_cells:
+    if n_cells is None or len(ids) <= n_cells:
         return ids
     indices = np.rint(np.linspace(0, len(ids) - 1, num=n_cells)).astype(int)
     return [ids[idx] for idx in sorted(set(indices.tolist()))]
@@ -445,8 +504,8 @@ def _sample_cell_ids_from_latest_snapshot(result: SimulationResult, n_cells: int
 
 def plot_single_cell_trajectories(
     result: SimulationResult,
-    n_cells: int = 12,
-    title: str = "Representative single-cell trajectories",
+    n_cells: int | None = None,
+    title: str = "Single-cell trajectories",
     save_path: str | Path | None = None,
 ) -> plt.Figure:
     fig = plt.figure(figsize=(13, 8))
@@ -454,7 +513,8 @@ def plot_single_cell_trajectories(
     state_ax = fig.add_subplot(gs[0, :])
     copy_axes = [fig.add_subplot(gs[1, idx]) for idx in range(cfg.N_SPECIES)]
 
-    if not _nonempty_snapshot_indices(result):
+    snapshot_indices = _terminal_aligned_snapshot_indices(result)
+    if not snapshot_indices:
         _blank_axis(state_ax, "No cell snapshots recorded")
         for ax in copy_axes:
             _blank_axis(ax, "No cell snapshots recorded")
@@ -462,13 +522,14 @@ def plot_single_cell_trajectories(
         fig.tight_layout()
         return _save(fig, save_path)
 
-    selected_ids = _sample_cell_ids_from_latest_snapshot(result, n_cells)
-    times = np.asarray(result.times, dtype=float)
+    selected_ids = _cell_ids_from_latest_snapshot(result, n_cells)
+    times = np.asarray([result.times[idx] for idx in snapshot_indices], dtype=float)
     states = np.full((len(selected_ids), len(times)), np.nan, dtype=float)
     copy_values = np.full((len(selected_ids), len(times), cfg.N_SPECIES), np.nan, dtype=float)
     row_by_cell = {cell_id: row_idx for row_idx, cell_id in enumerate(selected_ids)}
 
-    for time_idx, snapshot in enumerate(result.cell_snapshots):
+    for time_idx, snapshot_idx in enumerate(snapshot_indices):
+        snapshot = result.cell_snapshots[snapshot_idx]
         for cell in snapshot:
             row_idx = row_by_cell.get(int(cell["cell_id"]))
             if row_idx is None:
@@ -557,8 +618,9 @@ def plot_state_ecdna_heatmaps(
     title: str = "State-ecDNA mean-copy heatmaps",
     save_path: str | Path | None = None,
 ) -> plt.Figure:
-    times = np.asarray(result.times, dtype=float)
-    by_state = _state_copy_mean_tensor(result)
+    record_indices = _terminal_aligned_record_indices(result)
+    times = np.asarray([result.times[idx] for idx in record_indices], dtype=float)
+    by_state = _state_copy_mean_tensor(result)[record_indices]
 
     fig, axes = plt.subplots(1, cfg.N_SPECIES, figsize=(14, 4), sharey=True)
     for species_idx, species_name in enumerate(cfg.SPECIES):
@@ -579,9 +641,10 @@ def plot_latent_phase_space(
     result: SimulationResult,
     title: str = "Latent burden-stress-survival phase space",
     save_path: str | Path | None = None,
-    max_points: int = 4000,
+    max_points: int | None = None,
 ) -> plt.Figure:
-    rows: list[dict] = [cell for snapshot in result.cell_snapshots for cell in snapshot]
+    snapshot_indices = _terminal_aligned_snapshot_indices(result)
+    rows: list[dict] = [cell for snapshot_idx in snapshot_indices for cell in result.cell_snapshots[snapshot_idx]]
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     if not rows:
         for ax in axes:
@@ -590,7 +653,7 @@ def plot_latent_phase_space(
         fig.tight_layout()
         return _save(fig, save_path)
 
-    if len(rows) > max_points:
+    if max_points is not None and len(rows) > max_points:
         indices = np.rint(np.linspace(0, len(rows) - 1, num=max_points)).astype(int)
         rows = [rows[idx] for idx in sorted(set(indices.tolist()))]
 
@@ -669,11 +732,12 @@ def _latest_nonempty_snapshot(result: SimulationResult) -> tuple[float, list[dic
     raise ValueError("Lineage state plot requires at least one non-empty cell snapshot.")
 
 
-def _sample_terminal_cell_ids(snapshot: list[dict], n_terminal_cells: int) -> list[int]:
-    cfg.require(n_terminal_cells > 0, "n_terminal_cells must be strictly positive.")
+def _terminal_cell_ids(snapshot: list[dict], n_terminal_cells: int | None = None) -> list[int]:
+    if n_terminal_cells is not None:
+        cfg.require(n_terminal_cells > 0, "n_terminal_cells must be strictly positive.")
     terminal_ids = sorted(int(cell["cell_id"]) for cell in snapshot)
     cfg.require(bool(terminal_ids), "Cannot sample lineage paths from an empty snapshot.")
-    if len(terminal_ids) <= n_terminal_cells:
+    if n_terminal_cells is None or len(terminal_ids) <= n_terminal_cells:
         return terminal_ids
 
     sampled_indices: list[int] = []
@@ -686,13 +750,13 @@ def _sample_terminal_cell_ids(snapshot: list[dict], n_terminal_cells: int) -> li
 
 def plot_lineage_state_paths(
     result: SimulationResult,
-    n_terminal_cells: int = 8,
-    title: str = "Sampled lineage state paths",
+    n_terminal_cells: int | None = None,
+    title: str = "Lineage state paths",
     save_path: str | Path | None = None,
 ) -> plt.Figure:
     cfg.require(bool(result.times), "Lineage state plot requires recorded simulation times.")
     latest_time, latest_snapshot = _latest_nonempty_snapshot(result)
-    selected_terminal_ids = _sample_terminal_cell_ids(latest_snapshot, n_terminal_cells)
+    selected_terminal_ids = _terminal_cell_ids(latest_snapshot, n_terminal_cells)
 
     initial_snapshot = result.cell_snapshots[0] if result.cell_snapshots else []
     parent_by_cell: dict[int, int | None] = {int(cell["cell_id"]): None for cell in initial_snapshot}

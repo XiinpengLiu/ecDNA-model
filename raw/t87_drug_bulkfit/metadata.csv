@@ -1,8 +1,0 @@
-condition,drug,dose,dose_unit,start_week,end_week,schedule
-ctrl,vehicle,0.0,nM,1,6,continuous_day21_to_day56_window
-P10,Palbociclib,10.0,nM,1,6,continuous_day21_to_day56_window
-P50,Palbociclib,50.0,nM,1,6,continuous_day21_to_day56_window
-P250,Palbociclib,250.0,nM,1,6,continuous_day21_to_day56_window
-R20,Ripretinib,20.0,nM,1,6,continuous_day21_to_day56_window
-R100,Ripretinib,100.0,nM,1,6,continuous_day21_to_day56_window
-R500,Ripretinib,500.0,nM,1,6,continuous_day21_to_day56_window

@@ -5,11 +5,8 @@ Hybrid continuous-time simulation for the ecDNA model.
 from __future__ import annotations
 
 import copy
-import csv
 from dataclasses import dataclass, field, replace
 import heapq
-import json
-from pathlib import Path
 from typing import Iterable
 
 import numpy as np
@@ -39,72 +36,6 @@ class SimulationResult:
     events: list[tuple[float, str, int, dict]] = field(default_factory=list)
     stop_time: float | None = None
     stop_reason: str = ""
-
-    def save_as_csv(self, base_dir: str | Path) -> None:
-        output_dir = Path(base_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        with open(output_dir / "summary.csv", "w", newline="", encoding="utf-8") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(
-                [
-                    "time",
-                    "population_size",
-                    "npc_fraction",
-                    "opc_fraction",
-                    "ac_fraction",
-                    "mes_fraction",
-                    "mean_myc",
-                    "mean_cdk4",
-                    "mean_pdgfra",
-                    "mean_stress_score",
-                    "mean_survival_score",
-                    "mean_division_hazard",
-                    "mean_death_hazard",
-                    "D_C",
-                    "D_P",
-                    "a",
-                    "m",
-                ]
-            )
-            for idx, time in enumerate(self.times):
-                writer.writerow(
-                    [
-                        time,
-                        self.population_sizes[idx],
-                        *self.soft_state_fractions[idx].tolist(),
-                        *self.bulk_copy_means[idx].tolist(),
-                        self.mean_stress_scores[idx],
-                        self.mean_survival_scores[idx],
-                        self.mean_division_hazard[idx],
-                        self.mean_death_hazard[idx],
-                        self.exposures[idx]["D_C"],
-                        self.exposures[idx]["D_P"],
-                        self.exposures[idx]["a"],
-                        self.exposures[idx]["m"],
-                    ]
-                )
-
-        with open(output_dir / "truth_snapshots.jsonl", "w", encoding="utf-8") as handle:
-            for time, snapshot in zip(self.times, self.truth_snapshots):
-                handle.write(json.dumps({"time": time, "snapshot": snapshot}) + "\n")
-
-        with open(output_dir / "observations.jsonl", "w", encoding="utf-8") as handle:
-            for time, snapshot in zip(self.times, self.observations):
-                handle.write(json.dumps({"time": time, "observation": snapshot}) + "\n")
-
-        with open(output_dir / "snapshots.jsonl", "w", encoding="utf-8") as handle:
-            for time, snapshot in zip(self.times, self.cell_snapshots):
-                handle.write(json.dumps({"time": time, "cells": snapshot}) + "\n")
-
-        with open(output_dir / "events.jsonl", "w", encoding="utf-8") as handle:
-            for time, event_type, cell_id, details in self.events:
-                handle.write(
-                    json.dumps(
-                        {"time": time, "event_type": event_type, "cell_id": cell_id, "details": details}
-                    )
-                    + "\n"
-                )
 
 
 class HybridOgataSimulator:
@@ -289,18 +220,12 @@ class HybridOgataSimulator:
         self.advance_cell_to_time(temp_cell, horizon, self.event_rng)
         return horizon, None, temp_cell, {"no_event": True, "proposals": proposals}
 
-    def _sample_snapshot_cells(self, population: CellPopulation) -> list[Cell]:
+    def _snapshot_cells(self, population: CellPopulation) -> list[Cell]:
         if not self.params.simulation.record_full_snapshots:
             return []
         if not population.cells:
             return []
-        ordered = sorted(population.cells, key=lambda cell: cell.cell_id)
-        max_cells = self.params.simulation.max_cells_saved_per_snapshot
-        if len(ordered) <= max_cells:
-            return ordered
-        indices = np.rint(np.linspace(0, len(ordered) - 1, num=max_cells)).astype(int)
-        unique_indices = sorted(set(int(index) for index in indices.tolist()))
-        return [ordered[index] for index in unique_indices]
+        return sorted(population.cells, key=lambda cell: cell.cell_id)
 
     def summarize_truth_population(self, population: CellPopulation, context: dyn.ReplicateContext) -> dict:
         if not population.cells:
@@ -386,20 +311,15 @@ class HybridOgataSimulator:
             self.observation_rng,
         )
 
-        sampled_cells = self._sample_snapshot_cells(population)
+        snapshot_cells = self._snapshot_cells(population)
         snapshot_rows: list[dict] = []
-        for cell in sampled_cells:
+        for cell in snapshot_cells:
             derived = dyn.compute_derived_quantities(cell, context, self.params)
-            snapshot_rows.append(
+            row = cell.get_state_dict()
+            row.update(
                 {
-                    "cell_id": cell.cell_id,
-                    "cycle_state": cfg.CYCLE_NAMES[cell.cycle_state],
-                    "copy_numbers": cell.copy_numbers.tolist(),
-                    "soft_state": cell.soft_state.tolist(),
-                    "stress_score": float(cell.stress_score),
-                    "survival_score": float(cell.survival_score),
-                    "age": float(cell.age),
-                    "dominant_state": cfg.STATE_NAMES[cell.dominant_state_index()],
+                    "last_D_C": float(cell.last_D_C),
+                    "last_D_P": float(cell.last_D_P),
                     "division_hazard": dyn.compute_division_hazard(cell, derived, context, self.params),
                     "death_hazard": dyn.compute_death_hazard(cell, derived, context, self.params),
                     "derived_report_only": {
@@ -410,6 +330,7 @@ class HybridOgataSimulator:
                     },
                 }
             )
+            snapshot_rows.append(row)
 
         result.times.append(float(time))
         result.population_sizes.append(int(truth_snapshot["population_size"]))

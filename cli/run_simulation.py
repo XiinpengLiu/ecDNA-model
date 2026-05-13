@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import config as cfg
+from analysis.export_tables import write_simulation_tables
 from analysis.plotting import plot_single_run_diagnostic_suite
 from analysis.treatment import compute_bulk_copy_trends, compute_growth_rate, compute_terminal_event_counts
 from core.simulation import run_simulation
@@ -67,7 +68,24 @@ def main() -> None:
         f"death={terminal_counts['death']}"
     )
 
-    result.save_as_csv(output_dir / "simulation_data")
+    write_simulation_tables(
+        result,
+        output_dir,
+        condition="single_run",
+        seed=42,
+        metadata={
+            "condition": "single_run",
+            "seed": 42,
+            "time_unit": params.simulation.time_unit,
+            "t_max": params.simulation.t_max,
+            "record_times": list(params.simulation.record_times),
+            "n_init": params.simulation.n_init,
+            "target_population_size": params.simulation.target_population_size,
+            "max_pop_size": params.simulation.max_pop_size,
+            "record_full_snapshots": params.simulation.record_full_snapshots,
+            "record_events": params.simulation.record_events,
+        },
+    )
     plot_single_run_diagnostic_suite(result, output_dir)
 
     print(f"Results written to: {output_dir.resolve()}")
