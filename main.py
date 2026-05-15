@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 
@@ -200,6 +200,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Skip diagnostic PNGs for faster data-only runs.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=len(T87_CONDITIONS),
+        help="Condition worker processes. Default runs one process per condition.",
+    )
     parser.add_argument("--quiet", action="store_true", help="Suppress simulator progress lines.")
     return parser
 
@@ -218,8 +224,8 @@ def main() -> None:
     cfg.validate_observation_parameters(cfg.DEFAULT_OBSERVATION_PARAMETERS)
 
     rows_by_condition: dict[str, dict[str, object]] = {}
-    max_workers = min(4, len(conditions))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    max_workers = min(max(1, int(args.workers)), len(conditions))
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
         for condition in conditions:
             print(f"Running {condition}...")
@@ -248,6 +254,12 @@ def main() -> None:
 
     rows = [rows_by_condition[condition] for condition in conditions]
     _write_batch_summary(output_dir, rows)
+    if args.plots:
+        from analysis.plotting import plot_t87_treatment_comparison_suite
+
+        comparison_plots = plot_t87_treatment_comparison_suite(output_dir, raw_dir=raw_dir, conditions=conditions)
+        if comparison_plots:
+            print(f"T87 comparison plots written to: {(output_dir / 't87_comparison_plots').resolve()}")
     print(f"Results written to: {output_dir.resolve()}")
 
 

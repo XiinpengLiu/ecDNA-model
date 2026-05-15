@@ -130,7 +130,7 @@ def validate_probability_vector(values: np.ndarray, *, name: str, expected_shape
 
 
 def _weekly_record_times() -> tuple[float, ...]:
-    return tuple(float(week) for week in range(1, 31))
+    return tuple(float(time) for time in range(2, 13, 2))
 
 
 @dataclass(frozen=True)
@@ -153,7 +153,7 @@ class ExposureParameters:
 
 @dataclass(frozen=True)
 class StateLandscapeParameters:
-    alpha: np.ndarray = field(default_factory=lambda: np.array([0.25, 0.22, 0.08, 0.05], dtype=float))
+    alpha: np.ndarray = field(default_factory=lambda: np.array([-0.15, 0.26, 1.16, 1.06], dtype=float))
     gamma_M: np.ndarray = field(default_factory=lambda: np.array([0.01, 0.00, 0.00, 0.01], dtype=float))
     gamma_C: np.ndarray = field(default_factory=lambda: np.array([0.30, 0.06, -0.06, -0.06], dtype=float))
     gamma_P: np.ndarray = field(default_factory=lambda: np.array([0.00, 0.12, -0.03, -0.03], dtype=float))
@@ -265,11 +265,11 @@ class HazardParameters:
 
 @dataclass(frozen=True)
 class DivisionParameters:
-    lambda_amp_ceiling: np.ndarray = field(default_factory=lambda: np.zeros(N_SPECIES, dtype=float))
-    c0: np.ndarray = field(default_factory=lambda: np.zeros(N_SPECIES, dtype=float))
+    lambda_amp_ceiling: np.ndarray = field(default_factory=lambda: np.array([12.0, 14.0, 10.0], dtype=float))
+    c0: np.ndarray = field(default_factory=lambda: np.array([0.20, 0.25, 0.75], dtype=float))
     cR: np.ndarray = field(default_factory=lambda: np.zeros(N_SPECIES, dtype=float))
-    cC: np.ndarray = field(default_factory=lambda: np.zeros(N_SPECIES, dtype=float))
-    cP: np.ndarray = field(default_factory=lambda: np.zeros(N_SPECIES, dtype=float))
+    cC: np.ndarray = field(default_factory=lambda: np.array([-0.20, 0.0, 0.0], dtype=float))
+    cP: np.ndarray = field(default_factory=lambda: np.array([-1.70, -0.25, -0.10], dtype=float))
     tau: float = 1.05
     delta: np.ndarray = field(default_factory=lambda: np.array([1.0, 1.0, 1.0], dtype=float))
     rho_U: float = 0.60
@@ -318,11 +318,11 @@ class SimulationParameters:
     dt: float = 0.20
     time_unit: str = "week"
     record_times: tuple[float, ...] = field(default_factory=_weekly_record_times)
-    t_max: float = 30.0
+    t_max: float = 12.0
     n_init: int = 1200
-    target_population_size: int | None = 20000
-    max_pop_size: int = 20000
-    random_seed: int = 20260504
+    target_population_size: int | None = None
+    max_pop_size: int = 2000000
+    random_seed: int = 24
     fitting_mode: bool = False
     record_full_snapshots: bool = False
     record_events: bool = False
@@ -339,7 +339,7 @@ class ModelParameters:
     turnover: Dict[str, TurnoverSpeciesParameters] = field(
         default_factory=lambda: {
             "MYC": TurnoverSpeciesParameters(0.12, 1.20, -1.10, 0.90, 0.65, 0.00, -0.02, -3.20, 0.45, 0.55, 0.05, 0.35),
-            "CDK4": TurnoverSpeciesParameters(0.18, 1.10, -1.15, 0.85, 0.60, -0.05, -0.02, -3.25, 0.45, 0.52, 1.55, 0.15),
+            "CDK4": TurnoverSpeciesParameters(0.18, 1.10, -1.15, 0.85, 0.60, -0.05, -0.02, 2.00, 0.45, 0.52, -80.00, 0.15),
             "PDGFRA": TurnoverSpeciesParameters(0.18, 1.35, -1.15, 0.85, 0.60, 0.00, -0.05, -3.25, 0.45, 0.52, 0.08, 0.90),
         }
     )
@@ -398,15 +398,15 @@ T87_CONDITION_TREATMENTS: dict[str, tuple[str, float]] = {
     "R500": ("Ripretinib", 500.0),
 }
 
-T87_TREATMENT_END_TIME = 5.0
+T87_TREATMENT_END_TIME = 12.0
 T87_CONDITION_EFFECTIVE_DOSES: dict[str, float] = {
     "ctrl": 0.0,
-    "P10": 10.0,
-    "P50": 160.0,
-    "P250": 280.0,
-    "R20": 20.0,
-    "R100": 300.0,
-    "R500": 540.0,
+    "P10": 8.0,
+    "P50": 35.0,
+    "P250": 500.0,
+    "R20": 12.0,
+    "R100": 260.0,
+    "R500": 500.0,
 }
 T87_INITIAL_STATE_FRACTIONS = np.array([0.33, 0.37, 0.14, 0.16], dtype=float)
 T87_INITIAL_CYCLE_PROBABILITIES = np.array([0.12, 0.58, 0.22, 0.08], dtype=float)
@@ -423,27 +423,16 @@ T87_BASE_STATE_COPY_MULTIPLIERS = np.array(
 
 T87_CDK4I_STATE_COPY_MULTIPLIERS = np.array(
     [
-        [1.05, 1.32, 0.90],
-        [1.00, 1.08, 1.16],
-        [0.95, 0.62, 0.90],
-        [0.95, 0.58, 0.90],
+        [0.70, 1.00, 0.60],
+        [0.80, 1.00, 0.70],
+        [1.70, 1.00, 2.20],
+        [1.60, 1.00, 1.80],
     ],
     dtype=float,
 )
 
-T87_CONDITION_COPY_SCALERS: dict[str, np.ndarray] = {
-    "ctrl": np.array([1.00, 1.00, 1.00], dtype=float),
-    "P10": np.array([1.00, 1.22, 1.00], dtype=float),
-    "P50": np.array([1.00, 1.15, 1.00], dtype=float),
-    "P250": np.array([1.00, 1.00, 1.00], dtype=float),
-    "R20": np.array([1.00, 1.00, 1.00], dtype=float),
-    "R100": np.array([1.00, 1.00, 1.00], dtype=float),
-    "R500": np.array([0.85, 1.00, 0.80], dtype=float),
-}
-
-
 def t87_input_schedules_for_condition(condition: str) -> dict[str, Callable[[float], float]]:
-    """Return CDK4i/PDGFRAi schedules for the T87 day21-to-day56 window."""
+    """Return full-course CDK4i/PDGFRAi schedules for the T87 day14-to-day56 window."""
 
     if condition not in T87_CONDITION_TREATMENTS:
         raise ValueError(f"Unsupported T87 condition: {condition}")
@@ -451,10 +440,14 @@ def t87_input_schedules_for_condition(condition: str) -> dict[str, Callable[[flo
     effective_dose = T87_CONDITION_EFFECTIVE_DOSES[condition]
     return {
         "u_C": lambda _t, drug=drug, effective_dose=effective_dose: (
-            effective_dose if drug == "Palbociclib" and float(_t) <= T87_TREATMENT_END_TIME else 0.0
+            effective_dose
+            if drug == "Palbociclib" and 0.0 <= float(_t) <= T87_TREATMENT_END_TIME
+            else 0.0
         ),
         "u_P": lambda _t, drug=drug, effective_dose=effective_dose: (
-            effective_dose if drug == "Ripretinib" and float(_t) <= T87_TREATMENT_END_TIME else 0.0
+            effective_dose
+            if drug == "Ripretinib" and 0.0 <= float(_t) <= T87_TREATMENT_END_TIME
+            else 0.0
         ),
         "a": lambda _t: 0.0,
         "m": lambda _t: 0.0,
@@ -499,7 +492,6 @@ def build_t87_initialization_parameters(
     require(overdispersion_phi > 0.0, "overdispersion_phi must be strictly positive.")
 
     mean_by_species = _read_t87_week1_ddpcr_means(ddpcr_path, condition)
-    mean_by_species = mean_by_species * T87_CONDITION_COPY_SCALERS[condition]
 
     multipliers = (
         T87_CDK4I_STATE_COPY_MULTIPLIERS

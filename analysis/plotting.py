@@ -4,12 +4,14 @@ Minimal plotting utilities for the ecDNA model.
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from pathlib import Path
 
 from matplotlib.colors import ListedColormap
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 
 import config as cfg
 from core.simulation import SimulationResult
@@ -18,6 +20,22 @@ from core.simulation import SimulationResult
 STATE_COLORS = ("#2563eb", "#16a34a", "#f59e0b", "#dc2626")
 SPECIES_COLORS = ("#1d4ed8", "#be123c", "#047857")
 DIAGNOSTIC_TIMEPOINT_COUNT = 8
+DIAGNOSTIC_TRAJECTORY_CELL_COUNT = 256
+DIAGNOSTIC_DIVISION_INHERITANCE_MAX_POINTS = 50000
+DIAGNOSTIC_PHASE_SPACE_MAX_POINTS = 50000
+T87_TREATMENT_GROUPS = (
+    ("Palbociclib (CDK4i)", ("ctrl", "P10", "P50", "P250")),
+    ("Ripretinib (PDGFRAi)", ("ctrl", "R20", "R100", "R500")),
+)
+T87_CONDITION_COLORS = {
+    "ctrl": "#ff0066",
+    "P10": "#60c2f3",
+    "P50": "#138a88",
+    "P250": "#3f0788",
+    "R20": "#60c2f3",
+    "R100": "#138a88",
+    "R500": "#3f0788",
+}
 EVENT_COLORS = {
     "division": "#2563eb",
     "death": "#111827",
@@ -36,6 +54,18 @@ def _save(fig: plt.Figure, save_path: str | Path | None) -> plt.Figure:
         fig.savefig(output, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return fig
+
+
+def _safe_token(value: str) -> str:
+    token = "".join(ch if ch.isalnum() else "_" for ch in str(value)).strip("_")
+    return token or "value"
+
+
+def _condition_dose_label(condition: str) -> str:
+    if condition == "ctrl":
+        return "Ctrl"
+    _drug, dose = cfg.T87_CONDITION_TREATMENTS[condition]
+    return f"{dose:g} nM"
 
 
 def plot_results(result: SimulationResult, title: str = "ecDNA simulation", save_path: str | Path | None = None) -> plt.Figure:
@@ -569,12 +599,23 @@ def plot_division_inheritance(
     result: SimulationResult,
     title: str = "Mother-daughter ecDNA inheritance",
     save_path: str | Path | None = None,
+    max_points: int | None = None,
 ) -> plt.Figure:
-    mother_values: list[list[int]] = []
-    daughter_values: list[list[int]] = []
+    division_details: list[dict] = []
     for _event_time, event_type, _cell_id, details in result.events:
         if event_type != "division" or not {"state_pre", "daughter_one", "daughter_two"}.issubset(details):
             continue
+        division_details.append(details)
+
+    if max_points is not None and max_points > 0:
+        max_divisions = max(1, int(np.ceil(max_points / 2.0)))
+        if len(division_details) > max_divisions:
+            indices = np.rint(np.linspace(0, len(division_details) - 1, num=max_divisions)).astype(int)
+            division_details = [division_details[idx] for idx in sorted(set(indices.tolist()))]
+
+    mother_values: list[list[int]] = []
+    daughter_values: list[list[int]] = []
+    for details in division_details:
         mother = np.asarray(details["state_pre"]["copy_numbers"], dtype=int)
         mother_values.append(mother.tolist())
         mother_values.append(mother.tolist())
@@ -712,15 +753,326 @@ def plot_single_run_diagnostic_suite(result: SimulationResult, output_dir: str |
         ("04_ecdna_copy_distributions.png", plot_ecdna_copy_distributions),
         ("05_event_counts_by_window.png", plot_event_counts_by_window),
         ("06_state_transition_heatmap.png", plot_state_transition_heatmap),
-        ("07_single_cell_trajectories.png", plot_single_cell_trajectories),
-        ("08_division_inheritance.png", plot_division_inheritance),
+        (
+            "07_single_cell_trajectories.png",
+            lambda run_result, save_path: plot_single_cell_trajectories(
+                run_result,
+                n_cells=DIAGNOSTIC_TRAJECTORY_CELL_COUNT,
+                save_path=save_path,
+            ),
+        ),
+        (
+            "08_division_inheritance.png",
+            lambda run_result, save_path: plot_division_inheritance(
+                run_result,
+                max_points=DIAGNOSTIC_DIVISION_INHERITANCE_MAX_POINTS,
+                save_path=save_path,
+            ),
+        ),
         ("09_state_ecdna_heatmaps.png", plot_state_ecdna_heatmaps),
-        ("10_latent_phase_space.png", plot_latent_phase_space),
+        (
+            "10_latent_phase_space.png",
+            lambda run_result, save_path: plot_latent_phase_space(
+                run_result,
+                max_points=DIAGNOSTIC_PHASE_SPACE_MAX_POINTS,
+                save_path=save_path,
+            ),
+        ),
     )
     written: dict[str, Path] = {}
     for file_name, plot_func in plot_specs:
         path = output / file_name
         plot_func(result, save_path=path)
+        written[file_name] = path
+    return written
+
+
+def _read_t87_metadata(condition_dir: Path) -> dict:
+    for metadata_path in (condition_dir / "tables" / "metadata.json", condition_dir / "run_metadata.json"):
+        if metadata_path.exists():
+            return json.loads(metadata_path.read_text(encoding="utf-8"))
+    return {}
+
+
+def _load_t87_condition_frames(output_dir: Path, conditions: tuple[str, ...]) -> tuple[dict[str, pd.DataFrame], dict[str, dict]]:
+    frames: dict[str, pd.DataFrame] = {}
+    metadata: dict[str, dict] = {}
+    for condition in conditions:
+        condition_dir = output_dir / condition
+        table_path = condition_dir / "tables" / "time_summary.csv"
+        if not table_path.exists():
+            continue
+        frames[condition] = pd.read_csv(table_path).sort_values("time").reset_index(drop=True)
+        metadata[condition] = _read_t87_metadata(condition_dir)
+    return frames, metadata
+
+
+def _load_t87_week1_cell_counts(raw_dir: str | Path | None) -> dict[str, float]:
+    if raw_dir is None:
+        return {}
+    path = Path(raw_dir) / "cell_count.csv"
+    if not path.exists():
+        return {}
+    cell_count = pd.read_csv(path)
+    if not {"week", "condition", "total_cell_count"}.issubset(cell_count.columns):
+        return {}
+    week1 = cell_count[cell_count["week"].astype(int) == 1].copy()
+    if week1.empty:
+        return {}
+    return week1.groupby("condition")["total_cell_count"].median().astype(float).to_dict()
+
+
+def _metadata_n_init(metadata: dict) -> float:
+    simulation = metadata.get("simulation", {}) if isinstance(metadata, dict) else {}
+    if not isinstance(simulation, dict):
+        return float("nan")
+    try:
+        return float(simulation.get("n_init", float("nan")))
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _condition_cell_count_scale(
+    condition: str,
+    frame: pd.DataFrame,
+    metadata: dict,
+    week1_cell_counts: dict[str, float],
+) -> float:
+    raw_count = float(week1_cell_counts.get(condition, float("nan")))
+    if not np.isfinite(raw_count) or raw_count <= 0.0:
+        return 1.0
+
+    denominator = _metadata_n_init(metadata)
+    if not np.isfinite(denominator) or denominator <= 0.0:
+        if frame.empty or "population_size" not in frame:
+            return 1.0
+        denominator = float(frame["population_size"].iloc[0])
+    if not np.isfinite(denominator) or denominator <= 0.0:
+        return 1.0
+    return raw_count / denominator
+
+
+def _complete_t87_treatment_groups(frames: dict[str, pd.DataFrame]) -> list[tuple[str, tuple[str, ...]]]:
+    return [
+        (group_title, group_conditions)
+        for group_title, group_conditions in T87_TREATMENT_GROUPS
+        if all(condition in frames for condition in group_conditions)
+    ]
+
+
+def _plot_t87_log10_state_counts(
+    groups: list[tuple[str, tuple[str, ...]]],
+    frames: dict[str, pd.DataFrame],
+    metadata: dict[str, dict],
+    week1_cell_counts: dict[str, float],
+    save_path: str | Path,
+) -> plt.Figure:
+    fig, axes = plt.subplots(
+        len(groups),
+        4,
+        figsize=(16, max(3.6, 3.4 * len(groups))),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+
+    for row_idx, (group_title, group_conditions) in enumerate(groups):
+        for col_idx, condition in enumerate(group_conditions):
+            ax = axes[row_idx, col_idx]
+            frame = frames[condition]
+            times = frame["time"].to_numpy(dtype=float)
+            scale = _condition_cell_count_scale(condition, frame, metadata.get(condition, {}), week1_cell_counts)
+            for state_idx, state_name in enumerate(cfg.STATE_NAMES):
+                column = f"dominant_count_{_safe_token(state_name)}"
+                counts = frame[column].to_numpy(dtype=float) * scale
+                ax.plot(
+                    times,
+                    np.log10(np.clip(counts, 1.0, None)),
+                    color=STATE_COLORS[state_idx],
+                    linewidth=2,
+                    label=state_name,
+                )
+            ax.set_title(_condition_dose_label(condition))
+            ax.grid(axis="y", color="#e5e7eb", linewidth=0.7)
+            if row_idx == len(groups) - 1:
+                ax.set_xlabel("Time")
+            if col_idx == 0:
+                ax.set_ylabel(f"{group_title}\nlog10(cells)")
+
+    axes[0, -1].legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    fig.suptitle("T87 log10 state cell counts")
+    fig.tight_layout()
+    return _save(fig, save_path)
+
+
+def _plot_t87_ecdna_copy_number_by_treatment(
+    groups: list[tuple[str, tuple[str, ...]]],
+    frames: dict[str, pd.DataFrame],
+    save_path: str | Path,
+) -> plt.Figure:
+    fig, axes = plt.subplots(
+        len(groups),
+        cfg.N_SPECIES,
+        figsize=(14, max(3.8, 3.6 * len(groups))),
+        sharex=True,
+        squeeze=False,
+    )
+
+    for row_idx, (group_title, group_conditions) in enumerate(groups):
+        for species_idx, species_name in enumerate(cfg.SPECIES):
+            ax = axes[row_idx, species_idx]
+            for condition in group_conditions:
+                frame = frames[condition]
+                ax.plot(
+                    frame["time"].to_numpy(dtype=float),
+                    frame[f"mean_copy_{species_name}"].to_numpy(dtype=float),
+                    color=T87_CONDITION_COLORS[condition],
+                    marker="o",
+                    markersize=3,
+                    linewidth=2,
+                    label=_condition_dose_label(condition),
+                )
+            ax.set_title(species_name)
+            ax.grid(axis="y", color="#e5e7eb", linewidth=0.7)
+            if row_idx == len(groups) - 1:
+                ax.set_xlabel("Time")
+            if species_idx == 0:
+                ax.set_ylabel(f"{group_title}\nMean copy number")
+        axes[row_idx, -1].legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+
+    fig.suptitle("T87 ecDNA copy-number trajectories")
+    fig.tight_layout()
+    return _save(fig, save_path)
+
+
+def _pooled_state_group_copy_stats(row: pd.Series, state_names: tuple[str, ...], species_name: str) -> tuple[float, float]:
+    total_count = 0.0
+    weighted_sum = 0.0
+    weighted_second_moment = 0.0
+
+    for state_name in state_names:
+        state_token = _safe_token(state_name)
+        count = float(row.get(f"dominant_count_{state_token}", 0.0))
+        if not np.isfinite(count) or count <= 0.0:
+            continue
+        mean = float(row.get(f"state_mean_copy_{state_token}_{species_name}", float("nan")))
+        variance = float(row.get(f"state_var_copy_{state_token}_{species_name}", float("nan")))
+        if not np.isfinite(mean) or not np.isfinite(variance):
+            continue
+        variance = max(0.0, variance)
+        total_count += count
+        weighted_sum += count * mean
+        weighted_second_moment += count * (variance + mean * mean)
+
+    if total_count <= 0.0:
+        return float("nan"), float("nan")
+
+    mean = weighted_sum / total_count
+    variance = max(0.0, weighted_second_moment / total_count - mean * mean)
+    return float(mean), float(np.sqrt(variance))
+
+
+def _endpoint_row_closest_to_treatment_end(frame: pd.DataFrame) -> pd.Series:
+    times = frame["time"].to_numpy(dtype=float)
+    cfg.require(times.size > 0, "T87 endpoint plot requires at least one recorded time.")
+    endpoint_idx = int(np.argmin(np.abs(times - float(cfg.T87_TREATMENT_END_TIME))))
+    return frame.iloc[endpoint_idx]
+
+
+def _plot_t87_state_group_ecdna_endpoint_points(
+    groups: list[tuple[str, tuple[str, ...]]],
+    frames: dict[str, pd.DataFrame],
+    save_path: str | Path,
+) -> plt.Figure:
+    state_groups = (("OPC+NPC", ("OPC-like", "NPC-like")), ("AC+MES", ("AC-like", "MES-like")))
+    x_positions = np.arange(len(state_groups), dtype=float)
+
+    fig, axes = plt.subplots(
+        len(groups),
+        cfg.N_SPECIES,
+        figsize=(14, max(3.8, 3.6 * len(groups))),
+        sharex=True,
+        squeeze=False,
+    )
+
+    for row_idx, (group_title, group_conditions) in enumerate(groups):
+        offsets = np.linspace(-0.24, 0.24, num=len(group_conditions))
+        for species_idx, species_name in enumerate(cfg.SPECIES):
+            ax = axes[row_idx, species_idx]
+            for condition_idx, condition in enumerate(group_conditions):
+                row = _endpoint_row_closest_to_treatment_end(frames[condition])
+                means: list[float] = []
+                errors: list[float] = []
+                for _label, state_names in state_groups:
+                    mean, sd = _pooled_state_group_copy_stats(row, state_names, species_name)
+                    means.append(mean)
+                    errors.append(0.0 if not np.isfinite(sd) else sd)
+                mean_values = np.asarray(means, dtype=float)
+                error_values = np.asarray(errors, dtype=float)
+                valid = np.isfinite(mean_values)
+                if not np.any(valid):
+                    continue
+                ax.errorbar(
+                    x_positions[valid] + offsets[condition_idx],
+                    mean_values[valid],
+                    yerr=error_values[valid],
+                    color=T87_CONDITION_COLORS[condition],
+                    marker="o",
+                    linestyle="none",
+                    capsize=4,
+                    markersize=5,
+                    linewidth=1.4,
+                    label=_condition_dose_label(condition),
+                )
+            ax.set_title(species_name)
+            ax.set_xticks(x_positions, labels=[label for label, _state_names in state_groups])
+            ax.grid(axis="y", color="#e5e7eb", linewidth=0.7)
+            if species_idx == 0:
+                ax.set_ylabel(f"{group_title}\nMean copy number")
+        axes[row_idx, -1].legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+
+    fig.suptitle("T87 endpoint ecDNA copy number by state group")
+    fig.tight_layout()
+    return _save(fig, save_path)
+
+
+def plot_t87_treatment_comparison_suite(
+    output_dir: str | Path,
+    *,
+    raw_dir: str | Path | None = None,
+    conditions: tuple[str, ...] | None = None,
+) -> dict[str, Path]:
+    output = Path(output_dir)
+    requested_conditions = conditions or tuple(
+        dict.fromkeys(condition for _group_title, group_conditions in T87_TREATMENT_GROUPS for condition in group_conditions)
+    )
+    frames, metadata = _load_t87_condition_frames(output, tuple(requested_conditions))
+    groups = _complete_t87_treatment_groups(frames)
+    if not groups:
+        return {}
+
+    plot_dir = output / "t87_comparison_plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    week1_cell_counts = _load_t87_week1_cell_counts(raw_dir)
+    plot_specs = (
+        (
+            "01_log10_state_counts_by_condition.png",
+            lambda path: _plot_t87_log10_state_counts(groups, frames, metadata, week1_cell_counts, path),
+        ),
+        (
+            "02_ecdna_copy_number_by_treatment.png",
+            lambda path: _plot_t87_ecdna_copy_number_by_treatment(groups, frames, path),
+        ),
+        (
+            "03_state_group_ecdna_endpoint_points.png",
+            lambda path: _plot_t87_state_group_ecdna_endpoint_points(groups, frames, path),
+        ),
+    )
+
+    written: dict[str, Path] = {}
+    for file_name, plot_func in plot_specs:
+        path = plot_dir / file_name
+        plot_func(path)
         written[file_name] = path
     return written
 

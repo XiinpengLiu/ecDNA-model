@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import uuid
 from dataclasses import replace
@@ -10,6 +11,7 @@ import pytest
 
 import config as cfg
 from analysis.export_tables import write_simulation_tables
+from analysis.plotting import _pooled_state_group_copy_stats, plot_t87_treatment_comparison_suite
 from core.simulation import SimulationResult
 from main import build_parser, run_condition
 
@@ -91,6 +93,11 @@ def _observation_snapshot() -> dict:
         "sorted_qpcdr": {"means": state_values},
         "sorted_ecTAG": {"means": state_values},
     }
+
+
+def _test_safe_token(value: str) -> str:
+    token = "".join(ch if ch.isalnum() else "_" for ch in str(value)).strip("_")
+    return token or "value"
 
 
 def _result_with_division_event() -> SimulationResult:
@@ -218,3 +225,70 @@ def test_record_full_snapshots_cli_flag_was_removed() -> None:
     parser = build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["--record-full-snapshots"])
+
+
+def test_t87_treatment_comparison_suite_writes_batch_plots(workdir: Path) -> None:
+    output_dir = workdir / "t87"
+    raw_dir = workdir / "raw"
+    raw_dir.mkdir()
+    conditions = ("ctrl", "P10", "P50", "P250", "R20", "R100", "R500")
+    pd.DataFrame(
+        [
+            {"week": 1, "condition": condition, "total_cell_count": 1000.0 + idx * 100.0}
+            for idx, condition in enumerate(conditions)
+        ]
+    ).to_csv(raw_dir / "cell_count.csv", index=False)
+
+    for condition_idx, condition in enumerate(conditions):
+        table_dir = output_dir / condition / "tables"
+        table_dir.mkdir(parents=True)
+        rows = []
+        for time_idx, time in enumerate((1.0, 3.0, 5.0)):
+            row = {
+                "time": time,
+                "population_size": 100 + 10 * time_idx,
+            }
+            counts = [40 + time_idx, 30 + time_idx, 20 + time_idx, 10 + time_idx]
+            for state_name, count in zip(cfg.STATE_NAMES, counts):
+                row[f"dominant_count_{_test_safe_token(state_name)}"] = count
+            for species_idx, species_name in enumerate(cfg.SPECIES):
+                row[f"mean_copy_{species_name}"] = 90.0 + condition_idx + species_idx + time
+                for state_idx, state_name in enumerate(cfg.STATE_NAMES):
+                    token = _test_safe_token(state_name)
+                    row[f"state_mean_copy_{token}_{species_name}"] = 80.0 + 4.0 * state_idx + species_idx + condition_idx
+                    row[f"state_var_copy_{token}_{species_name}"] = 4.0 + state_idx + species_idx
+            rows.append(row)
+        pd.DataFrame(rows).to_csv(table_dir / "time_summary.csv", index=False)
+        (table_dir / "metadata.json").write_text(
+            json.dumps({"condition": condition, "simulation": {"n_init": 100}}),
+            encoding="utf-8",
+        )
+
+    outputs = plot_t87_treatment_comparison_suite(output_dir, raw_dir=raw_dir, conditions=conditions)
+
+    assert set(outputs) == {
+        "01_log10_state_counts_by_condition.png",
+        "02_ecdna_copy_number_by_treatment.png",
+        "03_state_group_ecdna_endpoint_points.png",
+    }
+    for path in outputs.values():
+        assert path.exists()
+        assert path.stat().st_size > 0
+
+
+def test_pooled_state_group_copy_stats_uses_counts_means_and_variances() -> None:
+    row = pd.Series(
+        {
+            "dominant_count_NPC_like": 2,
+            "dominant_count_OPC_like": 4,
+            "state_mean_copy_NPC_like_MYC": 10.0,
+            "state_mean_copy_OPC_like_MYC": 20.0,
+            "state_var_copy_NPC_like_MYC": 1.0,
+            "state_var_copy_OPC_like_MYC": 4.0,
+        }
+    )
+
+    mean, sd = _pooled_state_group_copy_stats(row, ("NPC-like", "OPC-like"), "MYC")
+
+    assert mean == pytest.approx((2 * 10.0 + 4 * 20.0) / 6)
+    assert sd == pytest.approx(((2 * (1.0 + 10.0**2) + 4 * (4.0 + 20.0**2)) / 6 - mean**2) ** 0.5)
