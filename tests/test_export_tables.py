@@ -6,13 +6,14 @@ import uuid
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
 import config as cfg
 from analysis.export_tables import write_simulation_tables
 from analysis.plotting import _pooled_state_group_copy_stats, plot_t87_treatment_comparison_suite
-from core.simulation import SimulationResult
+from core.simulation import SimulationResult, run_simulation
 from main import build_parser, run_condition
 
 
@@ -131,51 +132,165 @@ def _result_with_division_event() -> SimulationResult:
     return result
 
 
-def test_write_simulation_tables_exports_complete_r_tables(workdir: Path) -> None:
-    result = _result_with_division_event()
-    outputs = write_simulation_tables(result, workdir, condition="Control", seed=7, metadata={"source": "test"})
+def _ensemble_dir(base: Path) -> Path:
+    return base / "ensemble_id=ENS_000001"
 
-    expected = {
-        "time_summary",
-        "cell_snapshots",
-        "events",
-        "lineage_edges",
-        "observations",
-        "selected_plot_timepoints",
-        "metadata",
-        "manifest",
-    }
-    assert expected <= set(outputs)
+
+def _run_dir(base: Path, condition: str) -> Path:
+    return _ensemble_dir(base) / "runs" / f"sim_id=SIM_FULL_{condition.upper()}_REP001"
+
+
+def _required_package_files(run_dir: Path) -> list[Path]:
+    return [
+        run_dir / "manifest.json",
+        run_dir / "parameters" / "parameter_table.parquet",
+        run_dir / "parameters" / "parameter_blocks.parquet",
+        run_dir / "root" / "observables_long.parquet",
+        run_dir / "root" / "copy_vector.parquet",
+        run_dir / "root" / "cell_registry.parquet",
+        run_dir / "root" / "cell_snapshot",
+        run_dir / "root" / "cell_terminal_state.parquet",
+        run_dir / "root" / "event_log.parquet",
+        run_dir / "root" / "lineage_edges.parquet",
+        run_dir / "root" / "division_inheritance.parquet",
+        run_dir / "root" / "virtual_assay_draws.parquet",
+        run_dir / "cache" / "population_summary.parquet",
+        run_dir / "cache" / "state_copy_summary.parquet",
+        run_dir / "cache" / "founder_t_summary.parquet",
+        run_dir / "cache" / "copy_distribution_summary.parquet",
+        run_dir / "cache" / "event_summary.parquet",
+        run_dir / "cache" / "lineage_family_summary.parquet",
+        run_dir / "qc" / "output_integrity_report.json",
+        run_dir / "qc" / "id_consistency_report.parquet",
+    ]
+
+
+def _assert_no_forbidden_columns(frame: pd.DataFrame) -> None:
+    forbidden = {"week", "day", "time_day", "tau", "simulation_time"}
+    for column in frame.columns:
+        parts = set(str(column).lower().split("_"))
+        assert not (parts & forbidden), column
+        assert str(column).lower() not in forbidden
+
+
+def test_write_simulation_tables_exports_complete_ensemble_package(workdir: Path) -> None:
+    result = _result_with_division_event()
+    outputs = write_simulation_tables(result, workdir, condition="P10", seed=7, metadata={"source": "test"})
+
+    ensemble_dir = _ensemble_dir(workdir)
+    run_dir = _run_dir(workdir, "P10")
+    assert outputs["ensemble_manifest"] == ensemble_dir / "ensemble_manifest.json"
+    assert outputs["cell_snapshot"] == run_dir / "root" / "cell_snapshot"
+
+    ensemble_expected = [
+        ensemble_dir / "ensemble_manifest.json",
+        ensemble_dir / "run_index.parquet",
+        ensemble_dir / "metadata" / "conditions.parquet",
+        ensemble_dir / "metadata" / "model_variants.parquet",
+        ensemble_dir / "metadata" / "initial_conditions.parquet",
+        ensemble_dir / "metadata" / "t_grid.parquet",
+        ensemble_dir / "metadata" / "species.parquet",
+        ensemble_dir / "metadata" / "state_definitions.parquet",
+        ensemble_dir / "metadata" / "assay_definitions.parquet",
+        ensemble_dir / "metadata" / "copy_bins.parquet",
+        ensemble_dir / "metadata" / "event_type_definitions.parquet",
+    ]
+    for path in [*ensemble_expected, *_required_package_files(run_dir)]:
+        assert path.exists(), path
+    assert not (workdir / "tables").exists()
     assert not (workdir / "simulation_data").exists()
 
-    cells = pd.read_parquet(outputs["cell_snapshots"])
-    assert cells.shape[0] == sum(len(snapshot) for snapshot in result.cell_snapshots)
-    for column in (
+    ensemble_manifest = json.loads((ensemble_dir / "ensemble_manifest.json").read_text(encoding="utf-8"))
+    assert ensemble_manifest["time_variable"] == "t"
+    assert ensemble_manifest["uses_real_time"] is False
+    assert ensemble_manifest["uses_week_labels"] is False
+
+    run_manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert run_manifest["condition_id"] == "CDK4i_10nM"
+    assert run_manifest["time_variable"] == "t"
+    assert run_manifest["records_all_cells_ever_born"] is True
+
+    conditions = pd.read_parquet(ensemble_dir / "metadata" / "conditions.parquet")
+    assert "CDK4i_10nM" in set(conditions["condition_id"])
+    assert {"treatment_start_t", "treatment_end_t", "dose_value", "dose_unit"} <= set(conditions.columns)
+    _assert_no_forbidden_columns(conditions)
+
+    t_grid = pd.read_parquet(ensemble_dir / "metadata" / "t_grid.parquet")
+    assert {"t", "t_index", "t_grid_id"} <= set(t_grid.columns)
+    _assert_no_forbidden_columns(t_grid)
+
+    registry = pd.read_parquet(run_dir / "root" / "cell_registry.parquet")
+    required_cell_columns = {
+        "cell_id",
+        "cell_uid",
+        "founder_id",
+        "founder_uid",
         "parent_id",
-        "latent_1",
-        "latent_2",
-        "latent_3",
-        "copy_MYC",
-        "copy_CDK4",
-        "copy_PDGFRA",
-        "soft_NPC_like",
-        "division_hazard",
-        "death_hazard",
-        "transition_NPC_like_to_OPC_like",
-    ):
-        assert column in cells.columns
+        "parent_uid",
+        "birth_t",
+        "death_t",
+        "final_status",
+    }
+    assert required_cell_columns <= set(registry.columns)
+    assert registry["cell_uid"].is_unique
+    _assert_no_forbidden_columns(registry)
 
-    lineage = pd.read_parquet(outputs["lineage_edges"])
+    root_cells = pd.read_parquet(run_dir / "root" / "cell_snapshot")
+    assert root_cells["alive"].all()
+    assert {"t", "t_index", "cell_uid", "founder_uid", "coarse_state", "k_myc", "k_cdk4", "k_pdgfra"} <= set(root_cells.columns)
+    assert (
+        run_dir
+        / "root"
+        / "cell_snapshot"
+        / "condition_id=CDK4i_10nM"
+        / "replicate_id=REP001"
+        / "t_index=0"
+        / "part-000.parquet"
+    ).exists()
+    assert not (run_dir / "root" / "cell_snapshot" / "t_index=0").exists()
+    assert set(root_cells["condition_id"]) == {"CDK4i_10nM"}
+    assert set(root_cells["replicate_id"]) == {"REP001"}
+    _assert_no_forbidden_columns(root_cells)
+
+    event_log = pd.read_parquet(run_dir / "root" / "event_log.parquet")
+    assert {"k_myc_before", "k_myc_after", "daughter1_uid", "daughter2_uid"} <= set(event_log.columns)
+    assert set(event_log["event_type"]) == {"division"}
+
+    lineage = pd.read_parquet(run_dir / "root" / "lineage_edges.parquet")
+    assert {"division_event_id", "parent_uid", "child_uid", "t_birth"} <= set(lineage.columns)
     assert lineage.shape[0] == 2
-    assert set(lineage["parent_id"]) == {10}
-    assert set(lineage["child_id"]) == {11, 12}
 
-    selected = pd.read_csv(outputs["selected_plot_timepoints"])
-    assert selected.shape[0] == 8
-    assert selected["time"].iloc[-1] == result.times[-1]
+    inheritance = pd.read_parquet(run_dir / "root" / "division_inheritance.parquet")
+    assert {"segregation_pool_myc", "imbalance_cdk4", "daughter1_k_pdgfra"} <= set(inheritance.columns)
+    assert inheritance.shape[0] == 1
 
-    for legacy_name in ("summary.csv", "snapshots.jsonl", "events.jsonl"):
-        assert not (workdir / "tables" / legacy_name).exists()
+    observables = pd.read_parquet(run_dir / "root" / "observables_long.parquet")
+    assert {"cell_count", "ddpcr", "flow"} <= set(observables["assay"])
+    _assert_no_forbidden_columns(observables)
+
+    qc = json.loads((run_dir / "qc" / "output_integrity_report.json").read_text(encoding="utf-8"))
+    assert qc["all_checks_passed"] is True
+
+
+def test_package_uses_t_for_r500_without_day_or_week_mapping(workdir: Path) -> None:
+    result = _result_with_division_event()
+    write_simulation_tables(result, workdir, condition="R500", seed=11, metadata={"source": "test"})
+
+    ensemble_dir = _ensemble_dir(workdir)
+    run_dir = _run_dir(workdir, "R500")
+    ensemble_manifest = json.loads((ensemble_dir / "ensemble_manifest.json").read_text(encoding="utf-8"))
+    run_manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert ensemble_manifest["time_variable"] == "t"
+    assert run_manifest["condition_id"] == "PDGFRAi_500nM"
+    assert "time_mapping" not in run_manifest
+
+    for path in [
+        ensemble_dir / "metadata" / "t_grid.parquet",
+        run_dir / "root" / "cell_snapshot",
+        run_dir / "root" / "event_log.parquet",
+        run_dir / "cache" / "population_summary.parquet",
+    ]:
+        _assert_no_forbidden_columns(pd.read_parquet(path))
 
 
 def test_recorded_simulation_snapshots_include_full_cell_state(workdir: Path) -> None:
@@ -213,12 +328,77 @@ def test_recorded_simulation_snapshots_include_full_cell_state(workdir: Path) ->
     )
 
     condition_dir = Path(row["result_dir"])
-    assert (condition_dir / "tables" / "cell_snapshots.parquet").exists()
+    run_dir = condition_dir / "ensemble_id=ENS_000001" / "runs" / "sim_id=SIM_FULL_CTRL_REP001"
+    assert (run_dir / "root" / "cell_snapshot").exists()
+    assert not (condition_dir / "tables").exists()
     assert not (condition_dir / "simulation_data").exists()
     assert not list(condition_dir.glob("*.png"))
 
-    cells = pd.read_parquet(condition_dir / "tables" / "cell_snapshots.parquet")
-    assert {"parent_id", "latent_1", "cycle_index", "dominant_state_index", "last_update_time"} <= set(cells.columns)
+    cells = pd.read_parquet(run_dir / "root" / "cell_snapshot")
+    assert {"parent_id", "parent_uid", "cell_cycle_state", "hard_state", "birth_t"} <= set(cells.columns)
+
+
+def test_small_simulation_exports_t0_to_t12_and_passes_qc(workdir: Path) -> None:
+    simulation = replace(
+        cfg.DEFAULT_MODEL_PARAMETERS.simulation,
+        time_unit="t",
+        t_max=12.0,
+        record_times=tuple(float(t) for t in range(13)),
+        n_init=5,
+        target_population_size=None,
+        max_pop_size=1000,
+        random_seed=20260515,
+        record_full_snapshots=True,
+        record_events=True,
+    )
+    hazard = replace(
+        cfg.DEFAULT_MODEL_PARAMETERS.hazard,
+        lambda_div_ceiling=0.05,
+        lambda_death_ceiling=0.02,
+    )
+    params = replace(cfg.DEFAULT_MODEL_PARAMETERS, simulation=simulation, hazard=hazard)
+    result = run_simulation(
+        params=params,
+        input_schedules=cfg.t87_input_schedules_for_condition("P10"),
+        seed=20260515,
+        verbose=False,
+    )
+    assert result.times == [float(t) for t in range(13)]
+
+    write_simulation_tables(
+        result,
+        workdir / "sim_outputs",
+        condition="P10",
+        seed=20260515,
+        metadata={"simulation": {"t_max": 12.0, "record_times": list(result.times)}},
+    )
+    ensemble_dir = workdir / "sim_outputs" / "ensemble_id=ENS_000001"
+    run_dir = ensemble_dir / "runs" / "sim_id=SIM_FULL_P10_REP001"
+
+    for path in _required_package_files(run_dir):
+        assert path.exists(), path
+
+    snapshot = pd.read_parquet(run_dir / "root" / "cell_snapshot")
+    assert sorted(snapshot["t"].astype(float).unique().tolist()) == [float(t) for t in range(13)]
+    assert snapshot["alive"].all()
+    for column in ("k_myc", "k_cdk4", "k_pdgfra"):
+        assert (pd.to_numeric(snapshot[column]) >= 0).all()
+    assert np.allclose(snapshot[["x_npc", "x_opc", "x_ac", "x_mes"]].sum(axis=1), 1.0)
+
+    registry = pd.read_parquet(run_dir / "root" / "cell_registry.parquet")
+    assert registry["cell_uid"].is_unique
+    assert set(registry["founder_id"].dropna().astype(int)) <= set(registry["cell_id"].astype(int))
+    assert set(registry["parent_id"].dropna().astype(int)) <= set(registry["cell_id"].astype(int))
+
+    population = pd.read_parquet(run_dir / "cache" / "population_summary.parquet")
+    snapshot_counts = snapshot.groupby("t").size().reset_index(name="snapshot_n")
+    merged = population.merge(snapshot_counts, on="t")
+    assert (merged["n_alive_cells"].astype(int) == merged["snapshot_n"].astype(int)).all()
+
+    qc = json.loads((run_dir / "qc" / "output_integrity_report.json").read_text(encoding="utf-8"))
+    assert qc["all_checks_passed"] is True
+    id_report = pd.read_parquet(run_dir / "qc" / "id_consistency_report.parquet")
+    assert id_report["passed"].all()
 
 
 def test_record_full_snapshots_cli_flag_was_removed() -> None:

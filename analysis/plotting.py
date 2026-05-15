@@ -19,10 +19,18 @@ from core.simulation import SimulationResult
 
 STATE_COLORS = ("#2563eb", "#16a34a", "#f59e0b", "#dc2626")
 SPECIES_COLORS = ("#1d4ed8", "#be123c", "#047857")
-DIAGNOSTIC_TIMEPOINT_COUNT = 8
+DIAGNOSTIC_TIMEPOINT_COUNT = 7
 DIAGNOSTIC_TRAJECTORY_CELL_COUNT = 256
 DIAGNOSTIC_DIVISION_INHERITANCE_MAX_POINTS = 50000
 DIAGNOSTIC_PHASE_SPACE_MAX_POINTS = 50000
+T87_COPY_NUMBER_TIMEPOINT_COUNT = 7
+T87_EXPERIMENT_START_DAY = 14.0
+T87_EXPERIMENT_END_DAY = 56.0
+T87_FILTERED_DDPCR_SOURCE = (
+    Path(__file__).resolve().parents[1] / "data" / "2026-05-04-ddPCR-T87-drug-treatment-days-28-35-42-filtered.csv"
+)
+T87_DDPCR_TARGET_TO_SPECIES = {"ecMyc": "MYC", "ecCDK4": "CDK4", "ecPDGFRA": "PDGFRA"}
+T87_COPY_TARGET_START_DAYS = {"R500": 21.0}
 T87_TREATMENT_GROUPS = (
     ("Palbociclib (CDK4i)", ("ctrl", "P10", "P50", "P250")),
     ("Ripretinib (PDGFRAi)", ("ctrl", "R20", "R100", "R500")),
@@ -852,6 +860,128 @@ def _condition_cell_count_scale(
     return raw_count / denominator
 
 
+def _t87_copy_target_start_day(condition: str) -> float:
+    return float(T87_COPY_TARGET_START_DAYS.get(condition, T87_EXPERIMENT_START_DAY))
+
+
+def _t87_sim_time_to_aligned_day(time: float) -> float:
+    span = T87_EXPERIMENT_END_DAY - T87_EXPERIMENT_START_DAY
+    return T87_EXPERIMENT_START_DAY + span * float(time) / float(cfg.T87_TREATMENT_END_TIME)
+
+
+def _t87_experimental_day_to_aligned_day(condition: str, day: float) -> float:
+    start_day = _t87_copy_target_start_day(condition)
+    source_span = T87_EXPERIMENT_END_DAY - start_day
+    if source_span <= 0.0:
+        return T87_EXPERIMENT_START_DAY
+    target_span = T87_EXPERIMENT_END_DAY - T87_EXPERIMENT_START_DAY
+    return T87_EXPERIMENT_START_DAY + target_span * (float(day) - start_day) / source_span
+
+
+def _empty_t87_copy_targets() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "condition",
+            "day",
+            "aligned_day",
+            "species",
+            "ddpcr_copy_number",
+            "ddpcr_sd_or_ci",
+        ]
+    )
+
+
+def _load_t87_filtered_copy_targets(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return _empty_t87_copy_targets()
+
+    raw = pd.read_csv(path)
+    required = {"Sample", "Target", "CNV"}
+    if not required.issubset(raw.columns):
+        return _empty_t87_copy_targets()
+
+    parsed = raw["Sample"].astype(str).str.extract(r"^d(?P<day>\d+)\s+(?P<condition>\S+)$")
+    rows = raw.join(parsed)
+    rows = rows[rows["condition"].isin(cfg.T87_CONDITION_TREATMENTS) & rows["Target"].isin(T87_DDPCR_TARGET_TO_SPECIES)].copy()
+    if rows.empty:
+        return _empty_t87_copy_targets()
+
+    rows["day"] = rows["day"].astype(float)
+    rows["species"] = rows["Target"].map(T87_DDPCR_TARGET_TO_SPECIES)
+    rows["ddpcr_copy_number"] = rows["CNV"].astype(float)
+    if {"PoissonCNVMin", "PoissonCNVMax"}.issubset(rows.columns):
+        rows["ddpcr_sd_or_ci"] = (
+            rows["PoissonCNVMax"].astype(float) - rows["PoissonCNVMin"].astype(float)
+        ) / 2.0
+    else:
+        rows["ddpcr_sd_or_ci"] = float("nan")
+
+    start_days = rows["condition"].map(_t87_copy_target_start_day).astype(float)
+    rows = rows[(rows["day"] >= start_days) & (rows["day"] <= T87_EXPERIMENT_END_DAY)].copy()
+    if rows.empty:
+        return _empty_t87_copy_targets()
+
+    grouped = (
+        rows.groupby(["condition", "day", "species"], as_index=False)
+        .agg(ddpcr_copy_number=("ddpcr_copy_number", "median"), ddpcr_sd_or_ci=("ddpcr_sd_or_ci", "median"))
+        .sort_values(["condition", "species", "day"])
+    )
+    grouped["aligned_day"] = [
+        _t87_experimental_day_to_aligned_day(str(row.condition), float(row.day))
+        for row in grouped.itertuples(index=False)
+    ]
+    return grouped[["condition", "day", "aligned_day", "species", "ddpcr_copy_number", "ddpcr_sd_or_ci"]].reset_index(
+        drop=True
+    )
+
+
+def _load_t87_raw_anchor_copy_targets(raw_dir: str | Path | None) -> pd.DataFrame:
+    if raw_dir is None:
+        return _empty_t87_copy_targets()
+    path = Path(raw_dir) / "ddpcr.csv"
+    if not path.exists():
+        return _empty_t87_copy_targets()
+
+    raw = pd.read_csv(path)
+    required = {"condition", "species", "ddpcr_copy_number"}
+    if not required.issubset(raw.columns):
+        return _empty_t87_copy_targets()
+
+    rows = raw[raw["condition"].isin(cfg.T87_CONDITION_TREATMENTS) & raw["species"].isin(cfg.SPECIES)].copy()
+    if rows.empty:
+        return _empty_t87_copy_targets()
+
+    rows["day"] = rows["condition"].map(_t87_copy_target_start_day).astype(float)
+    rows["aligned_day"] = T87_EXPERIMENT_START_DAY
+    if "ddpcr_sd_or_ci" not in rows.columns:
+        rows["ddpcr_sd_or_ci"] = float("nan")
+
+    grouped = (
+        rows.groupby(["condition", "day", "aligned_day", "species"], as_index=False)
+        .agg(ddpcr_copy_number=("ddpcr_copy_number", "median"), ddpcr_sd_or_ci=("ddpcr_sd_or_ci", "median"))
+        .sort_values(["condition", "species", "day"])
+    )
+    return grouped[["condition", "day", "aligned_day", "species", "ddpcr_copy_number", "ddpcr_sd_or_ci"]].reset_index(
+        drop=True
+    )
+
+
+def _load_t87_copy_targets(raw_dir: str | Path | None) -> pd.DataFrame:
+    filtered = _load_t87_filtered_copy_targets(T87_FILTERED_DDPCR_SOURCE)
+    anchors = _load_t87_raw_anchor_copy_targets(raw_dir)
+    if filtered.empty:
+        return anchors
+    if anchors.empty:
+        return filtered
+
+    combined = pd.concat(
+        [filtered.assign(_priority=0), anchors.assign(_priority=1)],
+        ignore_index=True,
+    )
+    combined = combined.sort_values("_priority").drop_duplicates(["condition", "day", "species"], keep="first")
+    return combined.drop(columns="_priority").sort_values(["condition", "species", "day"]).reset_index(drop=True)
+
+
 def _complete_t87_treatment_groups(frames: dict[str, pd.DataFrame]) -> list[tuple[str, tuple[str, ...]]]:
     return [
         (group_title, group_conditions)
@@ -905,9 +1035,123 @@ def _plot_t87_log10_state_counts(
     return _save(fig, save_path)
 
 
+def _terminal_aligned_frame_indices(frame: pd.DataFrame, target_count: int) -> list[int]:
+    if frame.empty:
+        return []
+    if len(frame) <= target_count:
+        return list(range(len(frame)))
+
+    times = frame["time"].to_numpy(dtype=float)
+    target_times = np.linspace(float(times[0]), float(times[-1]), num=target_count)
+    selected_positions: list[int] = []
+    previous_position = -1
+
+    for target_idx, target_time in enumerate(target_times):
+        remaining_slots = target_count - target_idx - 1
+        min_position = previous_position + 1
+        max_position = len(frame) - remaining_slots - 1
+        if target_idx == target_count - 1:
+            position = len(frame) - 1
+        else:
+            candidate_times = times[min_position : max_position + 1]
+            position = min_position + int(np.argmin(np.abs(candidate_times - target_time)))
+        selected_positions.append(position)
+        previous_position = position
+
+    return selected_positions
+
+
+def _initial_t87_copy_target(copy_targets: pd.DataFrame, condition: str, species_name: str) -> float:
+    if copy_targets.empty:
+        return float("nan")
+    start_day = _t87_copy_target_start_day(condition)
+    rows = copy_targets[
+        (copy_targets["condition"] == condition)
+        & (copy_targets["species"] == species_name)
+        & np.isclose(copy_targets["day"].astype(float), start_day)
+    ]
+    if rows.empty:
+        return float("nan")
+    return float(rows["ddpcr_copy_number"].median())
+
+
+def _t87_copy_plot_points(
+    frame: pd.DataFrame,
+    copy_targets: pd.DataFrame,
+    condition: str,
+    species_name: str,
+) -> pd.DataFrame:
+    column = f"mean_copy_{species_name}"
+    points = frame.loc[
+        (frame["time"].astype(float) >= 0.0)
+        & (frame["time"].astype(float) <= float(cfg.T87_TREATMENT_END_TIME))
+        & frame[column].notna(),
+        ["time", column],
+    ].rename(columns={column: "mean_copy"})
+
+    initial_copy = _initial_t87_copy_target(copy_targets, condition, species_name)
+    if np.isfinite(initial_copy):
+        points = pd.concat(
+            [pd.DataFrame([{"time": 0.0, "mean_copy": initial_copy}]), points],
+            ignore_index=True,
+        )
+
+    if points.empty:
+        return pd.DataFrame(columns=["time", "aligned_day", "mean_copy"])
+
+    points = points.astype({"time": float, "mean_copy": float})
+    points = points.groupby("time", as_index=False)["mean_copy"].mean().sort_values("time").reset_index(drop=True)
+    selected = points.iloc[_terminal_aligned_frame_indices(points, T87_COPY_NUMBER_TIMEPOINT_COUNT)].copy()
+    selected["aligned_day"] = selected["time"].map(_t87_sim_time_to_aligned_day)
+    return selected
+
+
+def _plot_t87_copy_targets(
+    ax: plt.Axes,
+    copy_targets: pd.DataFrame,
+    condition: str,
+    species_name: str,
+) -> None:
+    if copy_targets.empty:
+        return
+    rows = copy_targets[(copy_targets["condition"] == condition) & (copy_targets["species"] == species_name)].copy()
+    if rows.empty:
+        return
+    rows = rows.sort_values("aligned_day")
+    ax.plot(
+        rows["aligned_day"].to_numpy(dtype=float),
+        rows["ddpcr_copy_number"].to_numpy(dtype=float),
+        color=T87_CONDITION_COLORS[condition],
+        linestyle=(0, (5, 3)),
+        linewidth=1.35,
+        alpha=0.68,
+        zorder=2,
+        label="_nolegend_",
+    )
+    yerr_values = rows["ddpcr_sd_or_ci"].to_numpy(dtype=float)
+    yerr = np.where(np.isfinite(yerr_values), yerr_values, 0.0)
+    ax.errorbar(
+        rows["aligned_day"].to_numpy(dtype=float),
+        rows["ddpcr_copy_number"].to_numpy(dtype=float),
+        yerr=yerr,
+        color=T87_CONDITION_COLORS[condition],
+        marker="s",
+        markerfacecolor="white",
+        markeredgewidth=1.2,
+        linestyle="none",
+        capsize=2.5,
+        markersize=4,
+        linewidth=1.0,
+        alpha=0.72,
+        zorder=2.2,
+        label="_nolegend_",
+    )
+
+
 def _plot_t87_ecdna_copy_number_by_treatment(
     groups: list[tuple[str, tuple[str, ...]]],
     frames: dict[str, pd.DataFrame],
+    copy_targets: pd.DataFrame,
     save_path: str | Path,
 ) -> plt.Figure:
     fig, axes = plt.subplots(
@@ -922,23 +1166,60 @@ def _plot_t87_ecdna_copy_number_by_treatment(
         for species_idx, species_name in enumerate(cfg.SPECIES):
             ax = axes[row_idx, species_idx]
             for condition in group_conditions:
-                frame = frames[condition]
+                plot_points = _t87_copy_plot_points(frames[condition], copy_targets, condition, species_name)
+                if plot_points.empty:
+                    continue
                 ax.plot(
-                    frame["time"].to_numpy(dtype=float),
-                    frame[f"mean_copy_{species_name}"].to_numpy(dtype=float),
+                    plot_points["aligned_day"].to_numpy(dtype=float),
+                    plot_points["mean_copy"].to_numpy(dtype=float),
                     color=T87_CONDITION_COLORS[condition],
                     marker="o",
-                    markersize=3,
-                    linewidth=2,
+                    markersize=4,
+                    linewidth=2.6,
+                    alpha=0.95,
+                    zorder=3,
                     label=_condition_dose_label(condition),
                 )
+                _plot_t87_copy_targets(ax, copy_targets, condition, species_name)
             ax.set_title(species_name)
             ax.grid(axis="y", color="#e5e7eb", linewidth=0.7)
+            ax.set_xlim(T87_EXPERIMENT_START_DAY - 1.0, T87_EXPERIMENT_END_DAY + 1.0)
+            ax.set_xticks(np.linspace(T87_EXPERIMENT_START_DAY, T87_EXPERIMENT_END_DAY, T87_COPY_NUMBER_TIMEPOINT_COUNT))
             if row_idx == len(groups) - 1:
-                ax.set_xlabel("Time")
+                ax.set_xlabel("Aligned experimental day")
             if species_idx == 0:
                 ax.set_ylabel(f"{group_title}\nMean copy number")
-        axes[row_idx, -1].legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+        condition_handles, condition_labels = axes[row_idx, -1].get_legend_handles_labels()
+        condition_legend = axes[row_idx, -1].legend(
+            condition_handles,
+            condition_labels,
+            frameon=False,
+            fontsize=8,
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+        )
+        axes[row_idx, -1].add_artist(condition_legend)
+        style_handles = [
+            plt.Line2D([0], [0], color="#111827", marker="o", linewidth=2.6, markersize=4, label="Simulation"),
+            plt.Line2D(
+                [0],
+                [0],
+                color="#111827",
+                marker="s",
+                markerfacecolor="white",
+                linestyle=(0, (5, 3)),
+                linewidth=1.35,
+                markersize=4,
+                label="ddPCR",
+            ),
+        ]
+        axes[row_idx, -1].legend(
+            handles=style_handles,
+            frameon=False,
+            fontsize=8,
+            loc="upper left",
+            bbox_to_anchor=(1.02, 0.48),
+        )
 
     fig.suptitle("T87 ecDNA copy-number trajectories")
     fig.tight_layout()
@@ -1054,6 +1335,7 @@ def plot_t87_treatment_comparison_suite(
     plot_dir = output / "t87_comparison_plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     week1_cell_counts = _load_t87_week1_cell_counts(raw_dir)
+    copy_targets = _load_t87_copy_targets(raw_dir)
     plot_specs = (
         (
             "01_log10_state_counts_by_condition.png",
@@ -1061,7 +1343,7 @@ def plot_t87_treatment_comparison_suite(
         ),
         (
             "02_ecdna_copy_number_by_treatment.png",
-            lambda path: _plot_t87_ecdna_copy_number_by_treatment(groups, frames, path),
+            lambda path: _plot_t87_ecdna_copy_number_by_treatment(groups, frames, copy_targets, path),
         ),
         (
             "03_state_group_ecdna_endpoint_points.png",

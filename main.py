@@ -38,6 +38,9 @@ def _build_model_parameters(args: argparse.Namespace) -> cfg.ModelParameters:
     base = cfg.DEFAULT_MODEL_PARAMETERS
     simulation = replace(
         base.simulation,
+        time_unit="t",
+        t_max=12.0,
+        record_times=tuple(float(t) for t in range(13)),
         n_init=int(args.n_init),
         target_population_size=_optional_population_size(int(args.target_population_size)),
         max_pop_size=int(args.max_pop_size),
