@@ -802,10 +802,142 @@ def _read_t87_metadata(condition_dir: Path) -> dict:
     return {}
 
 
-def _load_t87_condition_frames(output_dir: Path, conditions: tuple[str, ...]) -> tuple[dict[str, pd.DataFrame], dict[str, dict]]:
+def _t87_condition_id(condition: str) -> str:
+    if condition == "ctrl":
+        return "CTRL"
+    drug, dose = cfg.T87_CONDITION_TREATMENTS[condition]
+    dose_token = int(dose) if float(dose).is_integer() else dose
+    if drug == "Palbociclib":
+        return f"CDK4i_{dose_token}nM"
+    if drug == "Ripretinib":
+        return f"PDGFRAi_{dose_token}nM"
+    return condition
+
+
+def _t87_state_id(state_name: str) -> str:
+    return {
+        "NPC-like": "NPC",
+        "OPC-like": "OPC",
+        "AC-like": "AC",
+        "MES-like": "MES",
+    }[state_name]
+
+
+def _ensemble_dirs(output_dir: Path) -> list[Path]:
+    if output_dir.name.startswith("ensemble_id="):
+        return [output_dir]
+    return sorted(path for path in output_dir.glob("ensemble_id=*") if path.is_dir())
+
+
+def _read_t87_export_metadata(output_dir: Path, condition: str, run_dir: Path) -> dict:
+    metadata = _read_t87_metadata(output_dir / condition)
+    if metadata:
+        return metadata
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.exists():
+        return {}
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return manifest.get("metadata", {}) if isinstance(manifest.get("metadata"), dict) else manifest
+
+
+def _load_t87_export_run_frame(run_dir: Path) -> pd.DataFrame:
+    population_path = run_dir / "cache" / "population_summary.parquet"
+    if not population_path.exists():
+        return pd.DataFrame()
+
+    population = pd.read_parquet(population_path).sort_values("t").reset_index(drop=True)
+    rows: list[dict[str, float]] = []
+    for pop_row in population.to_dict(orient="records"):
+        n_alive = float(pop_row.get("n_alive_cells", float("nan")))
+        row = {
+            "time": float(pop_row.get("t", float("nan"))),
+            "population_size": n_alive,
+            "mean_copy_MYC": float(pop_row.get("mean_myc", float("nan"))),
+            "mean_copy_CDK4": float(pop_row.get("mean_cdk4", float("nan"))),
+            "mean_copy_PDGFRA": float(pop_row.get("mean_pdgfra", float("nan"))),
+        }
+        for state_name in cfg.STATE_NAMES:
+            state_id = _t87_state_id(state_name)
+            fraction = float(pop_row.get(f"{state_id.lower()}_fraction", float("nan")))
+            row[f"dominant_count_{_safe_token(state_name)}"] = n_alive * fraction if np.isfinite(fraction) else float("nan")
+        rows.append(row)
+
+    frame = pd.DataFrame(rows)
+    state_summary_path = run_dir / "cache" / "state_copy_summary.parquet"
+    if not state_summary_path.exists() or frame.empty:
+        return frame
+
+    state_summary = pd.read_parquet(state_summary_path)
+    if state_summary.empty:
+        return frame
+
+    frame["_t_key"] = frame["time"].map(lambda value: round(float(value), 9))
+    row_by_t = {float(row["_t_key"]): idx for idx, row in frame.iterrows()}
+    state_summary = state_summary[
+        (state_summary["state_level"] == "latent_four_state")
+        & state_summary["state_compartment"].isin([_t87_state_id(state_name) for state_name in cfg.STATE_NAMES])
+        & state_summary["species"].isin(cfg.SPECIES)
+    ]
+    state_name_by_id = {_t87_state_id(state_name): state_name for state_name in cfg.STATE_NAMES}
+    for item in state_summary.to_dict(orient="records"):
+        index = row_by_t.get(round(float(item["t"]), 9))
+        if index is None:
+            continue
+        state_name = state_name_by_id[str(item["state_compartment"])]
+        token = _safe_token(state_name)
+        species = str(item["species"])
+        frame.loc[index, f"dominant_count_{token}"] = float(item.get("weighted_cell_count", frame.loc[index, f"dominant_count_{token}"]))
+        frame.loc[index, f"state_mean_copy_{token}_{species}"] = float(item.get("mean_copy", float("nan")))
+        frame.loc[index, f"state_var_copy_{token}_{species}"] = 0.0
+    return frame.drop(columns="_t_key").sort_values("time").reset_index(drop=True)
+
+
+def _load_t87_export_condition_frames(
+    output_dir: Path,
+    conditions: tuple[str, ...],
+) -> tuple[dict[str, pd.DataFrame], dict[str, dict]]:
+    run_index_frames = []
+    for ensemble_dir in _ensemble_dirs(output_dir):
+        run_index_path = ensemble_dir / "run_index.parquet"
+        if not run_index_path.exists():
+            continue
+        run_index = pd.read_parquet(run_index_path)
+        if not run_index.empty:
+            run_index["_ensemble_dir"] = str(ensemble_dir)
+            run_index_frames.append(run_index)
+    if not run_index_frames:
+        return {}, {}
+
+    runs = pd.concat(run_index_frames, ignore_index=True)
     frames: dict[str, pd.DataFrame] = {}
     metadata: dict[str, dict] = {}
     for condition in conditions:
+        condition_id = _t87_condition_id(condition)
+        candidates = runs[runs["condition_id"] == condition_id].copy()
+        if candidates.empty:
+            continue
+        candidates["_rank"] = (
+            (candidates["model_variant"] != "full").astype(int)
+            + (candidates["initial_condition_id"] != "parental").astype(int)
+            + (candidates["replicate_id"] != "REP001").astype(int)
+        )
+        selected = candidates.sort_values(["_rank", "sim_id"]).iloc[0]
+        ensemble_dir = Path(str(selected["_ensemble_dir"]))
+        output_path = selected.get("output_path")
+        run_dir = ensemble_dir / str(output_path) if pd.notna(output_path) else ensemble_dir / "runs" / f"sim_id={selected['sim_id']}"
+        frame = _load_t87_export_run_frame(run_dir)
+        if frame.empty:
+            continue
+        frames[condition] = frame
+        metadata[condition] = _read_t87_export_metadata(output_dir, condition, run_dir)
+    return frames, metadata
+
+
+def _load_t87_condition_frames(output_dir: Path, conditions: tuple[str, ...]) -> tuple[dict[str, pd.DataFrame], dict[str, dict]]:
+    frames, metadata = _load_t87_export_condition_frames(output_dir, conditions)
+    for condition in conditions:
+        if condition in frames:
+            continue
         condition_dir = output_dir / condition
         table_path = condition_dir / "tables" / "time_summary.csv"
         if not table_path.exists():
@@ -975,7 +1107,7 @@ def _load_t87_copy_targets(raw_dir: str | Path | None) -> pd.DataFrame:
         return filtered
 
     combined = pd.concat(
-        [filtered.assign(_priority=0), anchors.assign(_priority=1)],
+        [anchors.assign(_priority=0), filtered.assign(_priority=1)],
         ignore_index=True,
     )
     combined = combined.sort_values("_priority").drop_duplicates(["condition", "day", "species"], keep="first")
@@ -1089,17 +1221,20 @@ def _t87_copy_plot_points(
         ["time", column],
     ].rename(columns={column: "mean_copy"})
 
+    if points.empty:
+        points = pd.DataFrame(columns=["time", "mean_copy"])
+
+    points = points.astype({"time": float, "mean_copy": float})
     initial_copy = _initial_t87_copy_target(copy_targets, condition, species_name)
     if np.isfinite(initial_copy):
+        non_initial_points = points.loc[~np.isclose(points["time"].to_numpy(dtype=float), 0.0)]
         points = pd.concat(
-            [pd.DataFrame([{"time": 0.0, "mean_copy": initial_copy}]), points],
+            [pd.DataFrame([{"time": 0.0, "mean_copy": initial_copy}]), non_initial_points],
             ignore_index=True,
         )
-
     if points.empty:
         return pd.DataFrame(columns=["time", "aligned_day", "mean_copy"])
 
-    points = points.astype({"time": float, "mean_copy": float})
     points = points.groupby("time", as_index=False)["mean_copy"].mean().sort_values("time").reset_index(drop=True)
     selected = points.iloc[_terminal_aligned_frame_indices(points, T87_COPY_NUMBER_TIMEPOINT_COUNT)].copy()
     selected["aligned_day"] = selected["time"].map(_t87_sim_time_to_aligned_day)

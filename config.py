@@ -370,6 +370,7 @@ class InitializationParameters:
     parametric_state_dirichlet_alpha: np.ndarray = field(default_factory=lambda: np.array([33.0, 37.0, 14.0, 16.0], dtype=float))
     cycle_probabilities: np.ndarray = field(default_factory=lambda: np.array([0.12, 0.58, 0.22, 0.08], dtype=float))
     age_scale: float = 1.0
+    exact_bulk_copy_number_mean: np.ndarray | None = None
     empirical_flow_fractions: np.ndarray | None = None
     empirical_sorted_copy_distributions: dict[str, np.ndarray] | None = None
     empirical_soft_state_concentration: float = 25.0
@@ -521,6 +522,7 @@ def build_t87_initialization_parameters(
         parametric_state_dirichlet_alpha=T87_INITIAL_STATE_FRACTIONS * 100.0,
         cycle_probabilities=T87_INITIAL_CYCLE_PROBABILITIES.copy(),
         age_scale=1.0,
+        exact_bulk_copy_number_mean=mean_by_species.copy(),
         empirical_flow_fractions=T87_INITIAL_STATE_FRACTIONS.copy(),
         empirical_sorted_copy_distributions=distributions,
         empirical_soft_state_concentration=25.0,
@@ -773,6 +775,13 @@ def validate_initialization_parameters(params: InitializationParameters) -> None
         params.empirical_soft_state_concentration > 0.0,
         "initialization.empirical_soft_state_concentration must be strictly positive.",
     )
+    if params.exact_bulk_copy_number_mean is not None:
+        exact_mean = _validate_finite_vector(
+            params.exact_bulk_copy_number_mean,
+            shape=(N_SPECIES,),
+            name="initialization.exact_bulk_copy_number_mean",
+        )
+        require(np.all(exact_mean >= 0.0), "exact_bulk_copy_number_mean must be non-negative.")
 
     if params.mode != EMPIRICAL_WEEK1:
         return

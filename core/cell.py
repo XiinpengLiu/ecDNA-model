@@ -170,6 +170,65 @@ class CellPopulation:
     def size(self) -> int:
         return len(self.cells)
 
+    def _match_initial_bulk_copy_anchor(self) -> bool:
+        target_means = self.initialization.exact_bulk_copy_number_mean
+        if target_means is None:
+            return False
+
+        target_means = np.asarray(target_means, dtype=float)
+        target_n = self.size()
+        cfg.require(target_n > 0, "Exact initial copy anchors require at least one initial cell.")
+        target_totals_float = target_means * float(target_n)
+        target_totals = np.rint(target_totals_float).astype(int)
+        cfg.require(
+            np.all(np.isclose(target_totals_float, target_totals, rtol=0.0, atol=1e-8)),
+            "Exact initial copy anchors require n_init * anchor to be integer-valued for every species.",
+        )
+
+        adjusted = False
+        for species_idx, target_total in enumerate(target_totals):
+            current_total = int(sum(int(cell.copy_numbers[species_idx]) for cell in self.cells))
+            delta = int(target_total) - current_total
+            if delta > 0:
+                self._add_initial_copy_delta(species_idx, delta)
+                adjusted = True
+            elif delta < 0:
+                self._remove_initial_copy_delta(species_idx, -delta)
+                adjusted = True
+        return adjusted
+
+    def _add_initial_copy_delta(self, species_idx: int, delta: int) -> None:
+        indices = self.rng.integers(0, self.size(), size=int(delta))
+        increments = np.bincount(indices, minlength=self.size())
+        for index, increment in enumerate(increments):
+            if increment <= 0:
+                continue
+            self.cells[index].copy_numbers[species_idx] += int(increment)
+            self.cells[index].invalidate_derived_cache()
+
+    def _remove_initial_copy_delta(self, species_idx: int, delta: int) -> None:
+        remaining = int(delta)
+        while remaining > 0:
+            candidates = [idx for idx, cell in enumerate(self.cells) if int(cell.copy_numbers[species_idx]) > 0]
+            cfg.require(bool(candidates), "Cannot reduce initial copy numbers to the requested exact anchor.")
+            for index in self.rng.permutation(candidates):
+                cell = self.cells[int(index)]
+                cell.copy_numbers[species_idx] -= 1
+                cell.invalidate_derived_cache()
+                remaining -= 1
+                if remaining == 0:
+                    break
+
+    def _refresh_initial_scores(self, context: "dyn.ReplicateContext") -> None:
+        from core import dynamics as dyn
+
+        for cell in self.cells:
+            cell.invalidate_derived_cache()
+            derived = dyn.compute_derived_quantities(cell, context, self.params)
+            cell.stress_score = float(dyn.compute_stress_attractor(cell, derived, context, self.params))
+            cell.survival_score = float(dyn.compute_survival_attractor(cell, derived, context, self.params))
+            cell.validate()
+
     def initialize(self, n: int | None = None) -> None:
         from core import dynamics as dyn
 
@@ -207,6 +266,8 @@ class CellPopulation:
                 dyn.compute_survival_attractor(initial_cell, derived, base_context, self.params)
             )
             self.add_cell(initial_cell)
+        if self._match_initial_bulk_copy_anchor():
+            self._refresh_initial_scores(base_context)
 
     def log_event(self, time: float, event_type: str, cell_id: int, details: dict | None = None) -> None:
         self.events.append((time, event_type, cell_id, details or {}))

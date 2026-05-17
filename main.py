@@ -5,8 +5,11 @@ One-command runner for the T87 drug-condition simulations.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import csv
 import json
+import os
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
@@ -36,11 +39,13 @@ def _optional_population_size(value: int) -> int | None:
 
 def _build_model_parameters(args: argparse.Namespace) -> cfg.ModelParameters:
     base = cfg.DEFAULT_MODEL_PARAMETERS
+    t_max = 12.0
+    record_step = 0.5
     simulation = replace(
         base.simulation,
         time_unit="t",
-        t_max=12.0,
-        record_times=tuple(float(t) for t in range(13)),
+        t_max=t_max,
+        record_times=tuple(index * record_step for index in range(int(t_max / record_step) + 1)),
         n_init=int(args.n_init),
         target_population_size=_optional_population_size(int(args.target_population_size)),
         max_pop_size=int(args.max_pop_size),
@@ -83,6 +88,27 @@ def _write_run_metadata(output_dir: Path, metadata: dict[str, object]) -> None:
     output_dir.joinpath("run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
+@contextmanager
+def _directory_lock(path: Path, *, timeout_s: float = 3600.0, poll_s: float = 0.1):
+    deadline = time.monotonic() + timeout_s
+    acquired = False
+    while not acquired:
+        try:
+            path.mkdir()
+            acquired = True
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting for export lock: {path}")
+            time.sleep(poll_s)
+    try:
+        yield
+    finally:
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+
+
 def _summary_row(condition: str, result: SimulationResult, condition_dir: Path) -> dict[str, object]:
     drug, dose = cfg.T87_CONDITION_TREATMENTS[condition]
     trends = compute_bulk_copy_trends(result)
@@ -118,6 +144,8 @@ def run_condition(
     rows_per_state: int,
     plots: bool,
     verbose: bool,
+    export_base_dir: Path | None = None,
+    export_lock_path: Path | None = None,
 ) -> dict[str, object]:
     condition_dir = output_dir / condition
     condition_dir.mkdir(parents=True, exist_ok=True)
@@ -141,7 +169,12 @@ def run_condition(
         rows_per_state=rows_per_state,
         params=params,
     )
-    write_simulation_tables(result, condition_dir, condition=condition, seed=seed, metadata=metadata)
+    package_base_dir = condition_dir if export_base_dir is None else Path(export_base_dir)
+    if export_lock_path is None:
+        write_simulation_tables(result, package_base_dir, condition=condition, seed=seed, metadata=metadata)
+    else:
+        with _directory_lock(Path(export_lock_path)):
+            write_simulation_tables(result, package_base_dir, condition=condition, seed=seed, metadata=metadata)
     if plots:
         from analysis.plotting import plot_single_run_diagnostic_suite
 
@@ -213,6 +246,43 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _print_condition_summary(condition: str, row: dict[str, object]) -> None:
+    print(
+        f"{condition}: stop={row['stop_reason']} at t={float(row['stop_time']):.2f}, "
+        f"final_pop={row['final_population_size']}"
+    )
+
+
+def _run_conditions_sequential(
+    conditions: tuple[str, ...],
+    *,
+    params: cfg.ModelParameters,
+    raw_dir: Path,
+    output_dir: Path,
+    seed: int,
+    rows_per_state: int,
+    plots: bool,
+    verbose: bool,
+) -> dict[str, dict[str, object]]:
+    rows_by_condition: dict[str, dict[str, object]] = {}
+    for condition in conditions:
+        print(f"Running {condition}...")
+        row = run_condition(
+            condition,
+            params=params,
+            raw_dir=raw_dir,
+            output_dir=output_dir,
+            seed=seed,
+            rows_per_state=rows_per_state,
+            plots=plots,
+            verbose=verbose,
+            export_base_dir=output_dir,
+        )
+        rows_by_condition[condition] = row
+        _print_condition_summary(condition, row)
+    return rows_by_condition
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -228,32 +298,59 @@ def main() -> None:
 
     rows_by_condition: dict[str, dict[str, object]] = {}
     max_workers = min(max(1, int(args.workers)), len(conditions))
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {}
-        for condition in conditions:
-            print(f"Running {condition}...")
-            futures[
-                executor.submit(
-                    run_condition,
-                    condition,
-                    params=params,
-                    raw_dir=raw_dir,
-                    output_dir=output_dir,
-                    seed=int(args.seed),
-                    rows_per_state=int(args.rows_per_state),
-                    plots=bool(args.plots),
-                    verbose=not bool(args.quiet),
-                )
-            ] = condition
-
-        for future in as_completed(futures):
-            condition = futures[future]
-            row = future.result()
-            rows_by_condition[condition] = row
-            print(
-                f"{condition}: stop={row['stop_reason']} at t={float(row['stop_time']):.2f}, "
-                f"final_pop={row['final_population_size']}"
+    if max_workers == 1:
+        rows_by_condition = _run_conditions_sequential(
+            conditions,
+            params=params,
+            raw_dir=raw_dir,
+            output_dir=output_dir,
+            seed=int(args.seed),
+            rows_per_state=int(args.rows_per_state),
+            plots=bool(args.plots),
+            verbose=not bool(args.quiet),
+        )
+    else:
+        export_lock_path = output_dir / f".export_lock_{os.getpid()}"
+        try:
+            executor = ProcessPoolExecutor(max_workers=max_workers)
+        except PermissionError:
+            print("Process pool unavailable; falling back to sequential condition runs.")
+            rows_by_condition = _run_conditions_sequential(
+                conditions,
+                params=params,
+                raw_dir=raw_dir,
+                output_dir=output_dir,
+                seed=int(args.seed),
+                rows_per_state=int(args.rows_per_state),
+                plots=bool(args.plots),
+                verbose=not bool(args.quiet),
             )
+        else:
+            with executor:
+                futures = {}
+                for condition in conditions:
+                    print(f"Running {condition}...")
+                    futures[
+                        executor.submit(
+                            run_condition,
+                            condition,
+                            params=params,
+                            raw_dir=raw_dir,
+                            output_dir=output_dir,
+                            seed=int(args.seed),
+                            rows_per_state=int(args.rows_per_state),
+                            plots=bool(args.plots),
+                            verbose=not bool(args.quiet),
+                            export_base_dir=output_dir,
+                            export_lock_path=export_lock_path,
+                        )
+                    ] = condition
+
+                for future in as_completed(futures):
+                    condition = futures[future]
+                    row = future.result()
+                    rows_by_condition[condition] = row
+                    _print_condition_summary(condition, row)
 
     rows = [rows_by_condition[condition] for condition in conditions]
     _write_batch_summary(output_dir, rows)

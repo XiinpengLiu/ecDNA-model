@@ -12,7 +12,12 @@ import pytest
 
 import config as cfg
 from analysis.export_tables import write_simulation_tables
-from analysis.plotting import _pooled_state_group_copy_stats, plot_t87_treatment_comparison_suite
+from analysis.plotting import (
+    _load_t87_copy_targets,
+    _pooled_state_group_copy_stats,
+    _t87_copy_plot_points,
+    plot_t87_treatment_comparison_suite,
+)
 from core.simulation import SimulationResult, run_simulation
 from main import build_parser, run_condition
 
@@ -454,6 +459,142 @@ def test_t87_treatment_comparison_suite_writes_batch_plots(workdir: Path) -> Non
     for path in outputs.values():
         assert path.exists()
         assert path.stat().st_size > 0
+
+
+def test_t87_treatment_comparison_suite_reads_shared_export_package(workdir: Path) -> None:
+    output_dir = workdir / "t87_export"
+    ensemble_dir = output_dir / "ensemble_id=ENS_000001"
+    conditions = ("ctrl", "P10", "P50", "P250", "R20", "R100", "R500")
+    condition_ids = {
+        "ctrl": "CTRL",
+        "P10": "CDK4i_10nM",
+        "P50": "CDK4i_50nM",
+        "P250": "CDK4i_250nM",
+        "R20": "PDGFRAi_20nM",
+        "R100": "PDGFRAi_100nM",
+        "R500": "PDGFRAi_500nM",
+    }
+    run_rows = []
+    for condition_idx, condition in enumerate(conditions):
+        sim_id = f"SIM_FULL_{condition.upper()}_REP001"
+        run_dir = ensemble_dir / "runs" / f"sim_id={sim_id}"
+        cache_dir = run_dir / "cache"
+        cache_dir.mkdir(parents=True)
+        run_rows.append(
+            {
+                "ensemble_id": "ENS_000001",
+                "sim_id": sim_id,
+                "model_variant": "full",
+                "condition_id": condition_ids[condition],
+                "initial_condition_id": "parental",
+                "replicate_id": "REP001",
+                "seed": 7,
+                "parameter_set_id": "PARAM_000001",
+                "t_min": 0.0,
+                "t_max": 12.0,
+                "snapshot_grid_id": "main_0_12_by1",
+                "dense_output": False,
+                "output_path": f"runs/sim_id={sim_id}",
+                "status": "completed",
+            }
+        )
+        population_rows = []
+        state_rows = []
+        for time_idx, time in enumerate((0.0, 6.0, 12.0)):
+            n_alive = 100 + 10 * time_idx
+            fractions = {"NPC": 0.4, "OPC": 0.3, "AC": 0.2, "MES": 0.1}
+            population_rows.append(
+                {
+                    "t": time,
+                    "n_alive_cells": n_alive,
+                    "mean_myc": 80.0 + condition_idx + time,
+                    "mean_cdk4": 90.0 + condition_idx + time,
+                    "mean_pdgfra": 100.0 + condition_idx + time,
+                    "npc_fraction": fractions["NPC"],
+                    "opc_fraction": fractions["OPC"],
+                    "ac_fraction": fractions["AC"],
+                    "mes_fraction": fractions["MES"],
+                }
+            )
+            for state_idx, (state_id, fraction) in enumerate(fractions.items()):
+                for species_idx, species in enumerate(cfg.SPECIES):
+                    state_rows.append(
+                        {
+                            "t": time,
+                            "state_level": "latent_four_state",
+                            "state_compartment": state_id,
+                            "species": species,
+                            "weighted_cell_count": n_alive * fraction,
+                            "mean_copy": 50.0 + 3.0 * state_idx + species_idx + condition_idx,
+                        }
+                    )
+        pd.DataFrame(population_rows).to_parquet(cache_dir / "population_summary.parquet", index=False)
+        pd.DataFrame(state_rows).to_parquet(cache_dir / "state_copy_summary.parquet", index=False)
+        (run_dir / "manifest.json").write_text(
+            json.dumps({"metadata": {"condition": condition, "simulation": {"n_init": 100}}}),
+            encoding="utf-8",
+        )
+    pd.DataFrame(run_rows).to_parquet(ensemble_dir / "run_index.parquet", index=False)
+
+    outputs = plot_t87_treatment_comparison_suite(output_dir, conditions=conditions)
+
+    assert set(outputs) == {
+        "01_log10_state_counts_by_condition.png",
+        "02_ecdna_copy_number_by_treatment.png",
+        "03_state_group_ecdna_endpoint_points.png",
+    }
+    for path in outputs.values():
+        assert path.exists()
+        assert path.stat().st_size > 0
+
+
+def test_exact_initial_copy_anchor_matches_t0_bulk_mean() -> None:
+    anchor = np.array([1.5, 2.5, 3.5], dtype=float)
+    initialization = replace(
+        cfg.DEFAULT_INITIALIZATION_PARAMETERS,
+        mode=cfg.EMPIRICAL_WEEK1,
+        parametric_copy_number_mean=np.array([1.0, 2.0, 3.0], dtype=float),
+        exact_bulk_copy_number_mean=anchor,
+        empirical_flow_fractions=np.full(cfg.N_STATES, 1.0 / cfg.N_STATES, dtype=float),
+        empirical_sorted_copy_distributions={
+            state_name: np.zeros((2, cfg.N_SPECIES), dtype=int) for state_name in cfg.STATE_NAMES
+        },
+    )
+    simulation = replace(
+        cfg.DEFAULT_MODEL_PARAMETERS.simulation,
+        t_max=1.0,
+        record_times=(0.0, 1.0),
+        n_init=10,
+        target_population_size=10,
+        max_pop_size=10,
+        record_full_snapshots=True,
+        record_events=False,
+    )
+    params = replace(cfg.DEFAULT_MODEL_PARAMETERS, simulation=simulation)
+
+    result = run_simulation(params=params, initialization=initialization, seed=11, verbose=False)
+
+    assert result.times == [0.0]
+    np.testing.assert_array_equal(result.bulk_copy_means[0], anchor)
+
+
+def test_t87_copy_plot_points_use_raw_anchor_at_t0(workdir: Path) -> None:
+    raw_dir = workdir / "raw"
+    raw_dir.mkdir()
+    pd.DataFrame(
+        [
+            {"condition": "R500", "species": "MYC", "ddpcr_copy_number": 102.6, "ddpcr_sd_or_ci": 1.0},
+            {"condition": "R500", "species": "CDK4", "ddpcr_copy_number": 92.4, "ddpcr_sd_or_ci": 1.0},
+            {"condition": "R500", "species": "PDGFRA", "ddpcr_copy_number": 95.7, "ddpcr_sd_or_ci": 1.0},
+        ]
+    ).to_csv(raw_dir / "ddpcr.csv", index=False)
+    copy_targets = _load_t87_copy_targets(raw_dir)
+    frame = pd.DataFrame({"time": [0.0, 12.0], "mean_copy_MYC": [999.0, 80.0]})
+
+    points = _t87_copy_plot_points(frame, copy_targets, "R500", "MYC")
+
+    assert points.iloc[0]["time"] == pytest.approx(0.0)
+    assert points.iloc[0]["mean_copy"] == pytest.approx(102.6)
 
 
 def test_pooled_state_group_copy_stats_uses_counts_means_and_variances() -> None:
