@@ -688,8 +688,10 @@ def _metadata_t_max(metadata: Mapping[str, Any], result: SimulationResult) -> fl
 
 
 def _snapshot_grid_id(t_values: Sequence[float]) -> str:
-    if tuple(t_values) == tuple(float(t) for t in range(13)):
+    if _matches_t_grid(t_values, t_max=12.0, step=1.0):
         return "main_0_12_by1"
+    if _matches_t_grid(t_values, t_max=12.0, step=0.5):
+        return "main_0_12_by05"
     if not t_values:
         return "empty_grid"
     start = _format_t(t_values[0])
@@ -698,6 +700,12 @@ def _snapshot_grid_id(t_values: Sequence[float]) -> str:
         step = _format_t(float(np.nanmedian(np.diff(np.asarray(t_values, dtype=float)))))
         return f"custom_{start}_{end}_by{step}"
     return f"custom_{start}"
+
+
+def _matches_t_grid(t_values: Sequence[float], *, t_max: float, step: float) -> bool:
+    expected = np.arange(0.0, float(t_max) + float(step) / 2.0, float(step), dtype=float)
+    observed = np.asarray(t_values, dtype=float)
+    return observed.shape == expected.shape and bool(np.allclose(observed, expected, rtol=0.0, atol=1e-9))
 
 
 def _ensemble_dir(base_dir: Path, ensemble_id: str) -> Path:
