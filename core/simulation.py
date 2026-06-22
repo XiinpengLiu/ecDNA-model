@@ -212,6 +212,7 @@ class HybridOgataSimulator:
                         "proposals": proposals,
                         "accept_prob": accept_prob,
                         "total_rate": total_rate,
+                        "event_propensities": rates,
                     },
                 )
 
@@ -430,8 +431,26 @@ class HybridOgataSimulator:
             for live_cell in population.cells:
                 schedule_cell_event(live_cell, time)
 
+            def event_sampling_details(thinning_stats: dict, event_context: dyn.ReplicateContext) -> dict:
+                details: dict = {"accepted_by_thinning": True}
+                if "total_rate" in thinning_stats:
+                    details["event_rate"] = float(thinning_stats["total_rate"])
+                if "accept_prob" in thinning_stats:
+                    details["accept_prob"] = float(thinning_stats["accept_prob"])
+                if "proposals" in thinning_stats:
+                    details["proposals"] = int(thinning_stats["proposals"])
+                if "event_propensities" in thinning_stats:
+                    details["event_propensities"] = {
+                        str(name): float(rate) for name, rate in thinning_stats["event_propensities"].items()
+                    }
+                details["D_C"] = float(event_context.D_C)
+                details["D_P"] = float(event_context.D_P)
+                details["a"] = float(event_context.astrocytic_cue)
+                details["m"] = float(event_context.mesenchymal_cue)
+                return details
+
             while event_heap:
-                event_time, cell_id, version, no_event_flag, event_name, flow_cell, _stats = heapq.heappop(event_heap)
+                event_time, cell_id, version, no_event_flag, event_name, flow_cell, thinning_stats = heapq.heappop(event_heap)
                 if cell_versions.get(cell_id) != version:
                     continue
                 live_cell = cell_lookup.get(cell_id)
@@ -451,7 +470,15 @@ class HybridOgataSimulator:
                     population.remove_cell(live_cell)
                     event_counts["death"] = event_counts.get("death", 0) + 1
                     if self.params.simulation.record_events:
-                        population.log_event(time, "death", live_cell.cell_id, {"state_pre": state_pre})
+                        population.log_event(
+                            time,
+                            "death",
+                            live_cell.cell_id,
+                            {
+                                "state_pre": state_pre,
+                                **event_sampling_details(thinning_stats, event_context),
+                            },
+                        )
                     cell_lookup.pop(live_cell.cell_id, None)
                     cell_versions.pop(live_cell.cell_id, None)
                     if population.size() == 0:
@@ -492,6 +519,7 @@ class HybridOgataSimulator:
                                 "state_pre": state_pre,
                                 "daughter_one": daughter_one.get_state_dict(),
                                 "daughter_two": daughter_two.get_state_dict(),
+                                **event_sampling_details(thinning_stats, event_context),
                             },
                         )
                     cell_lookup.pop(live_cell.cell_id, None)
@@ -531,6 +559,7 @@ class HybridOgataSimulator:
                         {
                             "state_pre": state_pre,
                             "state_post": live_cell.get_state_dict(),
+                            **event_sampling_details(thinning_stats, event_context),
                         },
                     )
                 schedule_cell_event(live_cell, time)

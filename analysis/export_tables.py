@@ -51,6 +51,58 @@ COPY_BINS: tuple[tuple[str, float, float | None, str], ...] = (
     ("bin_gt120", 121.0, None, ">120"),
 )
 
+STATE_LOGIT_COLUMNS = ("h_NPC", "h_OPC", "h_AC", "h_MES")
+
+SNAPSHOT_DERIVED_COLUMNS = (
+    "S_M",
+    "S_C",
+    "S_P",
+    "P_i",
+    *STATE_LOGIT_COLUMNS,
+    "D_C",
+    "D_P",
+    "a",
+    "m",
+    "hazard_div_baseline",
+    "hazard_div_proliferative",
+    "hazard_div_state",
+    "hazard_div_stress",
+    "hazard_div_burden",
+    "hazard_div_survival",
+    "hazard_div_logit",
+    "hazard_div_age_gate",
+    "hazard_death_baseline",
+    "hazard_death_stress",
+    "hazard_death_survival",
+    "hazard_death_mes",
+    "hazard_death_burden",
+    "hazard_death_drug_cdk4",
+    "hazard_death_drug_pdgfra",
+    "hazard_death_logit",
+    "mu_gain_myc",
+    "mu_gain_cdk4",
+    "mu_gain_pdgfra",
+    "mu_loss_myc",
+    "mu_loss_cdk4",
+    "mu_loss_pdgfra",
+)
+
+EVENT_PROPENSITY_COLUMNS = (
+    "event_propensity_g1_to_s",
+    "event_propensity_g1_to_q",
+    "event_propensity_q_to_g1",
+    "event_propensity_s_to_g2m",
+    "event_propensity_gain_myc",
+    "event_propensity_gain_cdk4",
+    "event_propensity_gain_pdgfra",
+    "event_propensity_loss_myc",
+    "event_propensity_loss_cdk4",
+    "event_propensity_loss_pdgfra",
+    "event_propensity_division",
+    "event_propensity_death",
+    "event_propensity_selected",
+)
+
 OBSERVABLES_LONG_COLUMNS = (
     "sim_id",
     "ensemble_id",
@@ -183,6 +235,7 @@ CELL_SNAPSHOT_COLUMNS = (
     "cell_cycle_state",
     "division_hazard",
     "death_hazard",
+    *SNAPSHOT_DERIVED_COLUMNS,
     "copy_selection_score",
     "state_growth_score",
     "drug_effect_score",
@@ -249,11 +302,15 @@ EVENT_LOG_COLUMNS = (
     "r_stress_after",
     "v_survival_before",
     "v_survival_after",
+    "cell_cycle_state_before",
+    "cell_cycle_state_after",
+    "age_t",
     "daughter1_id",
     "daughter2_id",
     "daughter1_uid",
     "daughter2_uid",
     "event_rate",
+    *EVENT_PROPENSITY_COLUMNS,
     "accepted_by_thinning",
     "notes",
 )
@@ -295,6 +352,15 @@ DIVISION_INHERITANCE_COLUMNS = (
     "daughter1_id",
     "daughter2_id",
     "founder_id",
+    "parent_u1_at_division",
+    "parent_u2_at_division",
+    "parent_u3_at_division",
+    "daughter1_u1_birth",
+    "daughter1_u2_birth",
+    "daughter1_u3_birth",
+    "daughter2_u1_birth",
+    "daughter2_u2_birth",
+    "daughter2_u3_birth",
     "parent_k_myc",
     "parent_k_cdk4",
     "parent_k_pdgfra",
@@ -1011,6 +1077,7 @@ def _cell_snapshot_frame(
             birth = birth_records.get(cell_id, {})
             birth_t = float(birth.get("birth_t", max(0.0, t - float(cell.get("age", 0.0)))))
             state = _cell_state_columns(cell)
+            model_terms = _model_primitive_columns(ctx, cell, t)
             rows.append(
                 {
                     **_run_keys(ctx),
@@ -1028,9 +1095,8 @@ def _cell_snapshot_frame(
                     "age_t": max(0.0, t - birth_t),
                     "alive": True,
                     **state,
-                    "copy_selection_score": np.nan,
-                    "state_growth_score": np.nan,
-                    "drug_effect_score": np.nan,
+                    **model_terms,
+                    **_cell_score_columns(cell),
                 }
             )
     frame = pd.DataFrame(rows)
@@ -1081,6 +1147,19 @@ def _event_log_frame(
         daughter_two = details.get("daughter_two", {}) if isinstance(details, Mapping) else {}
         event_type, species = _normalise_event_type(str(event["raw_event_type"]))
         founder_id = founder_map.get(cell_id, cell_id)
+        event_rate = np.nan
+        accepted_by_thinning = True
+        if isinstance(details, Mapping):
+            event_rate = _safe_float(details.get("event_rate", details.get("total_rate")))
+            accepted_by_thinning = bool(details.get("accepted_by_thinning", True))
+        propensity_row = _event_propensity_columns(details, pre, ctx, float(event["t"]), str(event["raw_event_type"]))
+        if pd.isna(event_rate):
+            finite_propensities = [
+                value
+                for key, value in propensity_row.items()
+                if key != "event_propensity_selected" and pd.notna(value)
+            ]
+            event_rate = float(sum(finite_propensities)) if finite_propensities else np.nan
         row = {
             **_run_keys(ctx),
             "event_id": event["event_id"],
@@ -1097,11 +1176,17 @@ def _event_log_frame(
             "daughter2_id": _optional_int(daughter_two.get("cell_id")) if isinstance(daughter_two, Mapping) else None,
             "daughter1_uid": _cell_uid(ctx, _optional_int(daughter_one.get("cell_id"))) if isinstance(daughter_one, Mapping) else None,
             "daughter2_uid": _cell_uid(ctx, _optional_int(daughter_two.get("cell_id"))) if isinstance(daughter_two, Mapping) else None,
-            "event_rate": np.nan,
-            "accepted_by_thinning": True,
+            "event_rate": event_rate,
+            **propensity_row,
+            "accepted_by_thinning": accepted_by_thinning,
             "notes": None,
         }
         row.update(_before_after_columns(pre, post))
+        if pd.isna(row.get("cell_cycle_state_after")):
+            if event["raw_event_type"] == "death":
+                row["cell_cycle_state_after"] = "dead"
+            elif event["raw_event_type"] == "division":
+                row["cell_cycle_state_after"] = "divided"
         rows.append(row)
     frame = pd.DataFrame(rows)
     if frame.empty:
@@ -1136,6 +1221,9 @@ def _before_after_columns(pre: Mapping[str, Any], post: Mapping[str, Any]) -> di
     row["r_stress_after"] = after.get("r_stress")
     row["v_survival_before"] = before.get("v_survival")
     row["v_survival_after"] = after.get("v_survival")
+    row["cell_cycle_state_before"] = before.get("cell_cycle_state")
+    row["cell_cycle_state_after"] = after.get("cell_cycle_state")
+    row["age_t"] = _safe_float(pre.get("age")) if isinstance(pre, Mapping) else np.nan
     return row
 
 
@@ -1222,6 +1310,15 @@ def _division_inheritance_frame(
             "daughter1_id": _optional_int(d1.get("cell_id")),
             "daughter2_id": _optional_int(d2.get("cell_id")),
             "founder_id": founder_map.get(parent_id, parent_id),
+            "parent_u1_at_division": parent.get("u1"),
+            "parent_u2_at_division": parent.get("u2"),
+            "parent_u3_at_division": parent.get("u3"),
+            "daughter1_u1_birth": daughter1.get("u1"),
+            "daughter1_u2_birth": daughter1.get("u2"),
+            "daughter1_u3_birth": daughter1.get("u3"),
+            "daughter2_u1_birth": daughter2.get("u1"),
+            "daughter2_u2_birth": daughter2.get("u2"),
+            "daughter2_u3_birth": daughter2.get("u3"),
             "parent_state": parent.get("hard_state"),
             "daughter1_state": daughter1.get("hard_state"),
             "daughter2_state": daughter2.get("hard_state"),
@@ -2383,6 +2480,363 @@ def _cell_state_columns(cell: Mapping[str, Any]) -> dict[str, Any]:
     row["log1p_cdk4"] = float(np.log1p(row["k_cdk4"])) if pd.notna(row["k_cdk4"]) else np.nan
     row["log1p_pdgfra"] = float(np.log1p(row["k_pdgfra"])) if pd.notna(row["k_pdgfra"]) else np.nan
     return row
+
+
+def _cell_score_columns(cell: Mapping[str, Any]) -> dict[str, Any]:
+    report = cell.get("derived_report_only", {}) if isinstance(cell, Mapping) else {}
+    if not isinstance(report, Mapping):
+        report = {}
+    return {
+        name: _safe_float(cell.get(name, report.get(name, np.nan))) if isinstance(cell, Mapping) else np.nan
+        for name in ("copy_selection_score", "state_growth_score", "drug_effect_score")
+    }
+
+
+def _model_primitive_columns(
+    ctx: ExportContext,
+    cell: Mapping[str, Any],
+    t: float,
+    details: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    row = {column: np.nan for column in SNAPSHOT_DERIVED_COLUMNS}
+    if not isinstance(cell, Mapping):
+        return row
+
+    D_C, D_P, astrocytic_cue, mesenchymal_cue = _context_values(ctx, cell, t, details)
+    row.update({"D_C": D_C, "D_P": D_P, "a": astrocytic_cue, "m": mesenchymal_cue})
+
+    copies = _numeric_vector(cell.get("copy_numbers"), cfg.N_SPECIES)
+    soft = _numeric_vector(cell.get("soft_state"), cfg.N_STATES)
+    if copies is None or soft is None or not all(np.isfinite(value) for value in (D_C, D_P, astrocytic_cue, mesenchymal_cue)):
+        return _apply_primitive_overrides(row, cell)
+
+    params = cfg.DEFAULT_MODEL_PARAMETERS
+    log_copies = np.log1p(copies.astype(float))
+    S_M = float(log_copies[cfg.MYC])
+    S_C = float(log_copies[cfg.CDK4] / (1.0 + params.exposure.nu_C * D_C))
+    S_P = float(log_copies[cfg.PDGFRA] / (1.0 + params.exposure.nu_P * D_P))
+    signaling = np.array([S_M, S_C, S_P], dtype=float)
+    burden = float(np.dot(params.exposure.burden_weights, log_copies))
+    proliferative = float(
+        params.exposure.proliferative_weights[0] * signaling[cfg.MYC]
+        + params.exposure.proliferative_weights[1] * signaling[cfg.CDK4]
+    )
+    logits = (
+        params.landscape.alpha
+        + params.landscape.gamma_M * signaling[cfg.MYC]
+        + params.landscape.gamma_C * signaling[cfg.CDK4]
+        + params.landscape.gamma_P * signaling[cfg.PDGFRA]
+        + params.landscape.eta_a * astrocytic_cue
+        + params.landscape.eta_m * mesenchymal_cue
+        - params.landscape.xi_B * burden
+    )
+
+    row.update(
+        {
+            "S_M": S_M,
+            "S_C": S_C,
+            "S_P": S_P,
+            "P_i": proliferative,
+            "h_NPC": float(logits[cfg.NPC]),
+            "h_OPC": float(logits[cfg.OPC]),
+            "h_AC": float(logits[cfg.AC]),
+            "h_MES": float(logits[cfg.MES]),
+        }
+    )
+    row.update(_hazard_contribution_columns(cell, soft, log_copies, burden, proliferative, D_C, D_P))
+    row.update(_turnover_rate_columns(cell, proliferative, D_C, D_P))
+    return _apply_primitive_overrides(row, cell)
+
+
+def _hazard_contribution_columns(
+    cell: Mapping[str, Any],
+    soft: np.ndarray,
+    log_copies: np.ndarray,
+    burden: float,
+    proliferative: float,
+    D_C: float,
+    D_P: float,
+) -> dict[str, float]:
+    params = cfg.DEFAULT_MODEL_PARAMETERS
+    hazard = params.hazard
+    stress = _safe_float(cell.get("stress_score"))
+    survival = _safe_float(cell.get("survival_score"))
+    age = _safe_float(cell.get("age"))
+    x_no = float(soft[cfg.NPC] + soft[cfg.OPC])
+    burden_term = -float(hazard.chi_B * (burden - hazard.B_star) ** 2)
+    div_terms = {
+        "hazard_div_baseline": float(hazard.theta_0),
+        "hazard_div_proliferative": float(hazard.theta_P * proliferative),
+        "hazard_div_state": float(hazard.theta_NO * x_no),
+        "hazard_div_stress": float(-hazard.theta_R * stress),
+        "hazard_div_burden": burden_term,
+        "hazard_div_survival": float(hazard.theta_V * survival),
+        "hazard_div_age_gate": float(cfg.sigmoid(hazard.age_gate_slope * (age - hazard.min_division_age))),
+    }
+    div_terms["hazard_div_logit"] = float(
+        div_terms["hazard_div_baseline"]
+        + div_terms["hazard_div_proliferative"]
+        + div_terms["hazard_div_state"]
+        + div_terms["hazard_div_stress"]
+        + div_terms["hazard_div_burden"]
+        + div_terms["hazard_div_survival"]
+    )
+
+    W_C = float(soft[cfg.NPC] + hazard.omega_O_given_C * soft[cfg.OPC])
+    W_P = float(soft[cfg.OPC])
+    death_terms = {
+        "hazard_death_baseline": float(hazard.phi_0),
+        "hazard_death_stress": float(hazard.phi_R * stress),
+        "hazard_death_survival": float(-hazard.phi_V * survival),
+        "hazard_death_mes": float(hazard.phi_M * soft[cfg.MES]),
+        "hazard_death_burden": float(hazard.phi_B * burden),
+        "hazard_death_drug_cdk4": float(hazard.chi_C * D_C * log_copies[cfg.CDK4] * W_C),
+        "hazard_death_drug_pdgfra": float(hazard.chi_P * D_P * log_copies[cfg.PDGFRA] * W_P),
+    }
+    death_terms["hazard_death_logit"] = float(sum(death_terms.values()))
+    return {**div_terms, **death_terms}
+
+
+def _turnover_rate_columns(
+    cell: Mapping[str, Any],
+    proliferative: float,
+    D_C: float,
+    D_P: float,
+) -> dict[str, float]:
+    params = cfg.DEFAULT_MODEL_PARAMETERS
+    copies = _numeric_vector(cell.get("copy_numbers"), cfg.N_SPECIES)
+    cycle_idx = _cycle_index(cell)
+    stress = _safe_float(cell.get("stress_score"))
+    survival = _safe_float(cell.get("survival_score"))
+    row = {
+        **{f"mu_gain_{species.lower()}": np.nan for species in cfg.SPECIES},
+        **{f"mu_loss_{species.lower()}": np.nan for species in cfg.SPECIES},
+    }
+    if copies is None or cycle_idx is None or not all(np.isfinite(value) for value in (stress, survival, proliferative, D_C, D_P)):
+        return row
+
+    window = float(
+        cfg.sigmoid(params.turnover_window.eta_1 * (stress - params.turnover_window.r_L))
+        - cfg.sigmoid(params.turnover_window.eta_2 * (stress - params.turnover_window.r_U))
+    )
+    for species_name in cfg.SPECIES:
+        species_idx = cfg.SPECIES_INDEX[species_name]
+        species_params = params.turnover[species_name]
+        key = species_name.lower()
+        row[f"mu_gain_{key}"] = 0.0
+        if cycle_idx in (cfg.S, cfg.G2M):
+            gain_eta = (
+                species_params.a0
+                + species_params.a_R * window
+                + species_params.a_prol * proliferative
+                + species_params.a_C * D_C
+                + species_params.a_P * D_P
+            )
+            row[f"mu_gain_{key}"] = float(species_params.gain_ceiling * cfg.sigmoid(gain_eta))
+        row[f"mu_loss_{key}"] = 0.0
+        if copies[species_idx] > 0:
+            loss_eta = (
+                species_params.b0
+                + species_params.b_R * stress
+                - species_params.b_V * survival
+                + species_params.b_C * D_C
+                + species_params.b_P * D_P
+            )
+            row[f"mu_loss_{key}"] = float(species_params.loss_ceiling * cfg.sigmoid(loss_eta))
+    return row
+
+
+def _event_propensity_columns(
+    details: Mapping[str, Any],
+    pre: Mapping[str, Any],
+    ctx: ExportContext,
+    t: float,
+    raw_event_type: str,
+) -> dict[str, Any]:
+    rates = details.get("event_propensities", details.get("rates", {})) if isinstance(details, Mapping) else {}
+    if not isinstance(rates, Mapping):
+        rates = {}
+    if not rates:
+        rates = _event_propensities_from_state(ctx, pre, t, details if isinstance(details, Mapping) else None)
+
+    row = {column: np.nan for column in EVENT_PROPENSITY_COLUMNS}
+    if rates:
+        for column in EVENT_PROPENSITY_COLUMNS:
+            if column != "event_propensity_selected":
+                row[column] = 0.0
+        for name, value in rates.items():
+            column = _event_propensity_column(str(name))
+            if column in row:
+                row[column] = _safe_float(value)
+        selected_column = _event_propensity_column(raw_event_type)
+        row["event_propensity_selected"] = row.get(selected_column, np.nan)
+    return row
+
+
+def _event_propensities_from_state(
+    ctx: ExportContext,
+    cell: Mapping[str, Any],
+    t: float,
+    details: Mapping[str, Any] | None,
+) -> dict[str, float]:
+    if not isinstance(cell, Mapping):
+        return {}
+    primitives = _model_primitive_columns(ctx, cell, t, details)
+    cycle_idx = _cycle_index(cell)
+    soft = _numeric_vector(cell.get("soft_state"), cfg.N_STATES)
+    if cycle_idx is None or soft is None:
+        return {}
+    params = cfg.DEFAULT_MODEL_PARAMETERS
+    P_i = _safe_float(primitives.get("P_i"))
+    D_C = _safe_float(primitives.get("D_C"))
+    D_P = _safe_float(primitives.get("D_P"))
+    stress = _safe_float(cell.get("stress_score"))
+    survival = _safe_float(cell.get("survival_score"))
+    if not all(np.isfinite(value) for value in (P_i, D_C, D_P, stress, survival)):
+        return {}
+
+    cycle = params.cycle
+    x_no = float(soft[cfg.NPC] + soft[cfg.OPC])
+    rates: dict[str, float] = {}
+    if cycle_idx == cfg.G1:
+        eta_g1s = (
+            cycle.beta_0
+            + cycle.beta_P * P_i
+            + cycle.beta_NO * x_no
+            - cycle.beta_R * stress
+            + cycle.beta_V * survival
+            - cycle.beta_C * D_C
+            - cycle.beta_Pg * D_P
+        )
+        eta_g1q = (
+            cycle.gamma_0
+            + cycle.gamma_M * soft[cfg.MES]
+            + cycle.gamma_R * stress
+            + cycle.gamma_m * _safe_float(primitives.get("m"))
+            - cycle.gamma_V * survival
+        )
+        rates["G1_to_S"] = float(cycle.qbar_G1S * cfg.sigmoid(eta_g1s))
+        rates["G1_to_Q"] = float(cycle.qbar_G1Q * cfg.sigmoid(eta_g1q))
+    elif cycle_idx == cfg.Q:
+        eta_qg1 = (
+            cycle.delta_0
+            + cycle.delta_P * P_i
+            + cycle.delta_V * survival
+            + cycle.delta_NO * x_no
+            - cycle.delta_R * stress
+            - cycle.delta_m * _safe_float(primitives.get("m"))
+        )
+        rates["Q_to_G1"] = float(cycle.qbar_QG1 * cfg.sigmoid(eta_qg1))
+    elif cycle_idx == cfg.S:
+        eta_sg2m = cycle.kappa_0 - cycle.kappa_R * stress + cycle.kappa_V * survival
+        rates["S_to_G2M"] = float(cycle.qbar_SG2M * cfg.sigmoid(eta_sg2m))
+
+    for species in cfg.SPECIES:
+        key = species.lower()
+        gain = _safe_float(primitives.get(f"mu_gain_{key}"))
+        loss = _safe_float(primitives.get(f"mu_loss_{key}"))
+        if np.isfinite(gain) and gain > 0.0:
+            rates[f"gain_{species}"] = gain
+        if np.isfinite(loss) and loss > 0.0:
+            rates[f"loss_{species}"] = loss
+
+    div_logit = _safe_float(primitives.get("hazard_div_logit"))
+    age_gate = _safe_float(primitives.get("hazard_div_age_gate"))
+    death_logit = _safe_float(primitives.get("hazard_death_logit"))
+    if np.isfinite(div_logit) and np.isfinite(age_gate):
+        rates["division"] = (
+            float(params.hazard.lambda_div_ceiling * cfg.sigmoid(div_logit) * age_gate)
+            if cycle_idx == cfg.G2M
+            else 0.0
+        )
+    if np.isfinite(death_logit):
+        rates["death"] = float(params.hazard.lambda_death_ceiling * cfg.sigmoid(death_logit))
+    return rates
+
+
+def _event_propensity_column(event_name: str) -> str:
+    return {
+        "G1_to_S": "event_propensity_g1_to_s",
+        "G1_to_Q": "event_propensity_g1_to_q",
+        "Q_to_G1": "event_propensity_q_to_g1",
+        "S_to_G2M": "event_propensity_s_to_g2m",
+        "division": "event_propensity_division",
+        "death": "event_propensity_death",
+        "gain_MYC": "event_propensity_gain_myc",
+        "gain_CDK4": "event_propensity_gain_cdk4",
+        "gain_PDGFRA": "event_propensity_gain_pdgfra",
+        "loss_MYC": "event_propensity_loss_myc",
+        "loss_CDK4": "event_propensity_loss_cdk4",
+        "loss_PDGFRA": "event_propensity_loss_pdgfra",
+    }.get(event_name, "")
+
+
+def _context_values(
+    ctx: ExportContext,
+    cell: Mapping[str, Any],
+    t: float,
+    details: Mapping[str, Any] | None = None,
+) -> tuple[float, float, float, float]:
+    detail_map = details if isinstance(details, Mapping) else {}
+    D_C = _first_finite(detail_map.get("D_C"), cell.get("D_C"), cell.get("last_D_C"))
+    D_P = _first_finite(detail_map.get("D_P"), cell.get("D_P"), cell.get("last_D_P"))
+    schedules = _condition_schedules(ctx.condition)
+    astrocytic_cue = _first_finite(detail_map.get("a"), cell.get("a"), cell.get("astrocytic_cue"), schedules["a"](t))
+    mesenchymal_cue = _first_finite(detail_map.get("m"), cell.get("m"), cell.get("mesenchymal_cue"), schedules["m"](t))
+    return D_C, D_P, astrocytic_cue, mesenchymal_cue
+
+
+def _condition_schedules(condition: str) -> Mapping[str, Any]:
+    if condition in cfg.T87_CONDITION_TREATMENTS:
+        return cfg.t87_input_schedules_for_condition(condition)
+    return cfg.DEFAULT_INPUT_SCHEDULES
+
+
+def _apply_primitive_overrides(row: dict[str, Any], cell: Mapping[str, Any]) -> dict[str, Any]:
+    report = cell.get("derived_report_only", {}) if isinstance(cell, Mapping) else {}
+    if not isinstance(report, Mapping):
+        report = {}
+    for column in row:
+        value = cell.get(column, report.get(column, row[column]))
+        numeric = _safe_float(value)
+        if np.isfinite(numeric):
+            row[column] = numeric
+    return row
+
+
+def _numeric_vector(value: Any, length: int) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        array = np.asarray(value, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if array.shape != (length,) or not np.all(np.isfinite(array)):
+        return None
+    return array
+
+
+def _cycle_index(cell: Mapping[str, Any]) -> int | None:
+    raw_index = cell.get("cycle_index")
+    if raw_index is not None and pd.notna(raw_index):
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            index = None
+        else:
+            return index if 0 <= index < cfg.N_CYCLE else None
+    raw_state = cell.get("cycle_state")
+    if raw_state in cfg.CYCLE_INDEX:
+        return int(cfg.CYCLE_INDEX[str(raw_state)])
+    return None
+
+
+def _first_finite(*values: Any) -> float:
+    for value in values:
+        number = _safe_float(value)
+        if np.isfinite(number):
+            return number
+    return np.nan
 
 
 def _normalise_event_type(event_type: str) -> tuple[str, str | None]:

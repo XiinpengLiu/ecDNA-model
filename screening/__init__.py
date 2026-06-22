@@ -1,2 +1,0 @@
-"""Screening sweep components."""
-

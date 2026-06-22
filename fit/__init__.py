@@ -1,42 +1,33 @@
-"""Fit pipeline public API aligned to ``markdown/fit_method.md``."""
+"""Config-centered local ABC-SMC fit for ddPCR-constrained parameters.
 
-from fit.final_report import build_final_report_layer, materialize_method_layout, validate_final_artifacts
-from fit.full_smc import aggregate_accepted_histories, create_full_initial_particles, run_full_reconstruction, run_moment_prescreen
-from fit.manifest import build_run_manifest, load_run_manifest
-from fit.observation import calculate_ddpcr_pooled_mean, fit_observation_model, load_observation_params, validate_observation_params
-from fit.parameter_registry import build_parameter_registry, run_prior_predictive_gate
-from fit.raw import create_synthetic_raw_dataset, ingest_raw_data, load_clean_tables, load_raw_tables, standardize_raw_tables, validate_raw_tables
-from fit.stage_runner import run_pipeline_from_raw
-from fit.validation import build_validation_reports, validate_full_artifacts, validate_method_contracts
-from fit.v4_lite import fit_v4_lite_summary_posterior, load_lite_artifacts, validate_lite_artifacts
+Implements the method described in ``markdown/fit_method.md``: sequential Monte
+Carlo approximate Bayesian computation that perturbs ten positive parameters in
+log space around the reference parameterization in ``config.py``, scoring each
+candidate by the log2 ddPCR RMSE against observed bulk ddPCR trajectories.
+"""
+
+from __future__ import annotations
+
+from .engine import FitConfig, run_local_abc_fit
+from .io_utils import read_table, write_table
+from .outputs import REQUIRED_OUTPUTS, validate_outputs
+from .parameters import PARAMETER_SPECS, N_PARAMETERS, reference_phi, reference_params
+from .proposal import PROPOSAL_SCHEDULE, generate_candidates
+from .targets import load_ddpcr_targets, record_times_from_targets
 
 __all__ = [
-    "aggregate_accepted_histories",
-    "build_final_report_layer",
-    "build_parameter_registry",
-    "build_run_manifest",
-    "build_validation_reports",
-    "calculate_ddpcr_pooled_mean",
-    "create_full_initial_particles",
-    "create_synthetic_raw_dataset",
-    "fit_observation_model",
-    "fit_v4_lite_summary_posterior",
-    "ingest_raw_data",
-    "load_clean_tables",
-    "load_lite_artifacts",
-    "load_observation_params",
-    "load_raw_tables",
-    "load_run_manifest",
-    "materialize_method_layout",
-    "run_full_reconstruction",
-    "run_moment_prescreen",
-    "run_pipeline_from_raw",
-    "run_prior_predictive_gate",
-    "standardize_raw_tables",
-    "validate_full_artifacts",
-    "validate_final_artifacts",
-    "validate_lite_artifacts",
-    "validate_method_contracts",
-    "validate_observation_params",
-    "validate_raw_tables",
+    "FitConfig",
+    "N_PARAMETERS",
+    "PARAMETER_SPECS",
+    "PROPOSAL_SCHEDULE",
+    "REQUIRED_OUTPUTS",
+    "generate_candidates",
+    "load_ddpcr_targets",
+    "read_table",
+    "record_times_from_targets",
+    "reference_params",
+    "reference_phi",
+    "run_local_abc_fit",
+    "validate_outputs",
+    "write_table",
 ]
